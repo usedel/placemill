@@ -1,0 +1,12 @@
+import { listTargets } from "./harness.mjs";
+import { cdpClient } from "./cdp.mjs";
+const targets = await listTargets();
+const maps = targets.find((t) => /google\.com/.test(t.url || ""));
+const cdp = cdpClient(maps.webSocketDebuggerUrl);
+await cdp.ready;
+const pid = process.argv[2] || "";
+const expression = "(async () => { const built = window.__placemillBuildReviewsRequest(" + JSON.stringify(pid) + ", {}); if (!built.ok) return JSON.stringify({ buildFail: built }); const res = await fetch(built.url, { method: \"POST\", credentials: \"include\", headers: built.headers, body: built.body }); const text = await res.text(); const parsed = window.__placemillParseReviews(text); return JSON.stringify({ status: res.status, bytes: text.length, reviews: parsed.reviews.length, error: parsed.error, firstAuthor: parsed.reviews[0] ? parsed.reviews[0].author : null, nextTokenLen: (parsed.nextToken || \"\").length }); })()";
+const res2 = await cdp.send("Runtime.evaluate", { expression: expression, returnByValue: true, awaitPromise: true });
+const value = res2.result && res2.result.result ? res2.result.result.value : JSON.stringify(res2.result);
+console.log(String(value).slice(0, 500));
+process.exit(0);

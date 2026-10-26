@@ -1,0 +1,14 @@
+{
+  "identifier": "maps-remote",
+  "description": "Remote capabilities for Google Maps child webview",
+  "windows": ["main"],
+  "webviews": ["maps"],
+  "local": false,
+  "remote": {
+    "urls": ["https://www.google.com/**"]
+  },
+  "permissions": [
+    "core:event:allow-emit",
+    "core:event:allow-listen"
+  ]
+}

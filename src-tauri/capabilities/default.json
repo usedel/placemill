@@ -1,0 +1,15 @@
+{
+  "identifier": "default",
+  "description": "Default capabilities for main and maps webviews",
+  "windows": ["main", "maps"],
+  "permissions": [
+    "core:default",
+    "core:event:default",
+    "core:event:allow-emit",
+    "core:event:allow-listen",
+    {
+      "identifier": "opener:allow-open-url",
+      "allow": [{ "url": "https://*" }, { "url": "http://*" }]
+    }
+  ]
+}

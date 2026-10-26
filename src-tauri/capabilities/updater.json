@@ -1,0 +1,8 @@
+{
+  "identifier": "updater",
+  "description": "Auto-update commands for the main panel only — never the remote maps webview, whose content must not be able to trigger an install",
+  "windows": ["main"],
+  "permissions": [
+    "updater:default"
+  ]
+}

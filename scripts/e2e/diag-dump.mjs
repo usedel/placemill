@@ -1,0 +1,11 @@
+import { listTargets } from "./harness.mjs";
+import { cdpClient } from "./cdp.mjs";
+const targets = await listTargets();
+const maps = targets.find((t) => /google\.com/.test(t.url || ""));
+const cdp = cdpClient(maps.webSocketDebuggerUrl);
+await cdp.ready;
+const expression = "(function () { const bucket = window.APP_INITIALIZATION_STATE[3].Dg; const out = []; const scan = function (node, depth) { if (depth > 8) return; if (typeof node === \"string\") { if (node.slice(0, 4) === \")]}\x27\" && node.length > 5000) { let root = null; try { root = JSON.parse(node.slice(4)); } catch (e) { out.push({ bytes: node.length, parse: \"fail\" }); return; } const list = root[6] ? (root[6][175] ? (root[6][175][9] ? (root[6][175][9][0] ? (root[6][175][9][0][0] ? (root[6][175][9][0][0][0] ? root[6][175][9][0][0][0] : null) : null) : null) : null) : null) : null; const slots = Array.isArray(list) ? list.map(function (el) { if (el === null) return \"null\"; if (!Array.isArray(el)) return typeof el; const id = typeof el[0] === \"string\" ? el[0].slice(0, 10) : String(el[0]).slice(0, 10); const author = el[1] ? (el[1][4] ? (el[1][4][5] ? el[1][4][5][0] : null) : null) : null; return id + \"/\" + author; }) : \"not-array\"; out.push({ bytes: node.length, listLen: Array.isArray(list) ? list.length : -1, slots: slots }); } return; } if (Array.isArray(node)) { for (let i = 0; i < node.length; i++) scan(node[i], depth + 1); return; } if (node && typeof node === \"object\") { for (const k in node) scan(node[k], depth + 1); } }; scan(bucket, 0); return JSON.stringify(out); })()";
+const res = await cdp.send("Runtime.evaluate", { expression: expression, returnByValue: true });
+const value = res.result && res.result.result ? res.result.result.value : JSON.stringify(res.result);
+console.log(String(value).slice(0, 1400));
+process.exit(0);

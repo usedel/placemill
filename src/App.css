@@ -1,0 +1,2004 @@
+/* ============================================================
+   Design tokens (light / dark)
+   ============================================================ */
+
+/* UI-16: one visible focus ring for everything the antd defaults leave faint.
+   `:focus-visible` only, so a mouse click never paints a ring. */
+:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+
+:root {
+  --app-bg: #f4f6fb;
+  --panel-bg: #ffffff;
+  --panel-bg-soft: #f8fafc;
+  --panel-border: rgba(15, 23, 42, 0.07);
+  --panel-border-strong: rgba(15, 23, 42, 0.12);
+  --text-1: #1f2937;
+  --text-2: #51607a;
+  /* UI-16: #8b97a8 measured ~3.0:1 on the panel background, too weak for the
+     11px muted copy it carries. #64748b clears 4.5:1 while staying lighter
+     than --text-2, so the three-step hierarchy survives. */
+  --text-3: #64748b;
+  --accent: #2563eb;
+  --accent-soft: rgba(37, 99, 235, 0.09);
+  /* Filled accent surface that carries white text (the new-rows pill). The
+     regular `--accent` goes light in dark mode, where white would be unreadable. */
+  --accent-solid: #2563eb;
+  --row-reveal: rgba(37, 99, 235, 0.14);
+  --live: #ef4444;
+  --live-soft: rgba(239, 68, 68, 0.1);
+  --star: #f59e0b;
+  --warning: #d97706;
+  --shadow-card: 0 1px 2px rgba(16, 24, 40, 0.04), 0 1px 3px rgba(16, 24, 40, 0.05);
+  --shadow-panel: 8px 0 24px rgba(15, 23, 42, 0.06);
+}
+
+[data-theme='dark'] {
+  --app-bg: #0f1115;
+  --panel-bg: #171a21;
+  --panel-bg-soft: #1b1f27;
+  --panel-border: rgba(255, 255, 255, 0.08);
+  --panel-border-strong: rgba(255, 255, 255, 0.14);
+  --text-1: #e6eaf1;
+  --text-2: #a7b1c2;
+  --text-3: #7b8798;
+  --accent: #60a5fa;
+  --accent-soft: rgba(96, 165, 250, 0.14);
+  --accent-solid: #1d4ed8;
+  --row-reveal: rgba(96, 165, 250, 0.18);
+  --live: #f87171;
+  --live-soft: rgba(248, 113, 113, 0.14);
+  --star: #fbbf24;
+  --warning: #fbbf24;
+  --shadow-card: 0 1px 2px rgba(0, 0, 0, 0.4);
+  --shadow-panel: 8px 0 24px rgba(0, 0, 0, 0.45);
+}
+
+html,
+body,
+#root {
+  height: 100%;
+}
+
+body {
+  margin: 0;
+  padding: 0;
+  overflow: hidden;
+  background: var(--app-bg);
+  color: var(--text-1);
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC',
+    'Hiragino Sans GB', 'Microsoft YaHei', 'Noto Sans SC', Roboto, sans-serif;
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+}
+
+/* Subtle, modern scrollbars */
+::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+::-webkit-scrollbar-thumb {
+  background: var(--panel-border-strong);
+  border-radius: 8px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: var(--text-3);
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+/* ============================================================
+   Shell
+   ============================================================ */
+.app-shell {
+  position: relative;
+  height: 100vh;
+  display: flex;
+  flex-direction: column;
+  background: var(--app-bg);
+  padding-bottom: 12px;
+  overflow: hidden;
+}
+
+.app-shell::after {
+  content: '';
+  position: absolute;
+  inset: 0 0 0 auto;
+  width: 1px;
+  background: var(--panel-border);
+  box-shadow: var(--shadow-panel);
+  pointer-events: none;
+}
+
+/* ============================================================
+   Brand header
+   ============================================================ */
+.brand-bar {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 13px 16px 11px;
+  flex: 0 0 auto;
+}
+
+.brand-logo {
+  width: 34px;
+  height: 34px;
+  flex: 0 0 34px;
+  border-radius: 11px;
+  display: grid;
+  place-items: center;
+  color: #fff;
+  font-size: 17px;
+  background: linear-gradient(135deg, #2563eb 0%, #22d3ee 100%);
+  box-shadow: 0 4px 12px rgba(37, 99, 235, 0.28);
+}
+
+.brand-text {
+  min-width: 0;
+  line-height: 1.25;
+}
+
+.brand-title {
+  display: block;
+  font-size: 15px;
+  font-weight: 650;
+  letter-spacing: 0.2px;
+  white-space: nowrap;
+}
+
+.brand-sub {
+  display: block;
+  font-size: 11px;
+  color: var(--text-3);
+  white-space: nowrap;
+}
+
+.brand-spacer {
+  flex: 1;
+}
+
+.status-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  height: 26px;
+  padding: 0 10px;
+  border-radius: 999px;
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+  color: var(--text-2);
+  background: var(--panel-bg-soft);
+  border: 1px solid var(--panel-border);
+  white-space: nowrap;
+}
+
+.status-pill.is-live {
+  color: var(--live);
+  background: var(--live-soft);
+  border-color: transparent;
+  font-weight: 500;
+}
+
+.status-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: currentColor;
+  flex: 0 0 6px;
+}
+
+.status-pill.is-live .status-dot {
+  animation: pulse 1.6s ease-in-out infinite;
+}
+
+@keyframes pulse {
+  0% {
+    box-shadow: 0 0 0 0 rgba(239, 68, 68, 0.5);
+  }
+  70% {
+    box-shadow: 0 0 0 6px rgba(239, 68, 68, 0);
+  }
+  100% {
+    box-shadow: 0 0 0 0 rgba(239, 68, 68, 0);
+  }
+}
+
+.icon-btn {
+  color: var(--text-2) !important;
+}
+
+/* ============================================================
+   Metrics strip
+   ============================================================ */
+.metrics {
+  display: flex;
+  align-items: stretch;
+  margin: 0 16px 12px;
+  background: var(--panel-bg);
+  border: 1px solid var(--panel-border);
+  border-radius: 12px;
+  box-shadow: var(--shadow-card);
+  overflow: hidden;
+  flex: 0 0 auto;
+}
+
+.metric {
+  flex: 1 1 0;
+  min-width: 0;
+  padding: 9px 6px 8px;
+  text-align: center;
+}
+
+.metric + .metric {
+  border-left: 1px solid var(--panel-border);
+}
+
+.metric-value {
+  font-size: 19px;
+  font-weight: 650;
+  line-height: 1.15;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+.metric-value .star {
+  color: var(--star);
+  font-size: 13px;
+  margin-right: 3px;
+  vertical-align: 1px;
+}
+
+.metric-unit {
+  font-size: 11px;
+  color: var(--text-3);
+  margin-left: 2px;
+  font-weight: 400;
+}
+
+.metric-label {
+  margin-top: 2px;
+  font-size: 11px;
+  color: var(--text-3);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.metric-bump {
+  margin-left: 4px;
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--accent);
+  animation: bump 1.6s ease-out;
+}
+
+@keyframes bump {
+  0% {
+    opacity: 0;
+    transform: translateY(4px);
+  }
+  25% {
+    opacity: 1;
+    transform: translateY(0);
+  }
+  100% {
+    opacity: 0;
+  }
+}
+
+/* ============================================================
+   Listen card (collector switch)
+   ============================================================ */
+.listen-card {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin: 0 16px 12px;
+  padding: 11px 12px;
+  background: var(--panel-bg);
+  border: 1px solid var(--panel-border);
+  border-radius: 12px;
+  box-shadow: var(--shadow-card);
+  flex: 0 0 auto;
+}
+
+.listen-text {
+  flex: 1;
+  min-width: 0;
+}
+
+.listen-title {
+  font-size: 13px;
+  font-weight: 600;
+  line-height: 1.3;
+}
+
+.listen-hint {
+  margin-top: 2px;
+  font-size: 11px;
+  line-height: 1.45;
+  color: var(--text-3);
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+
+/* UI-09: session totals under the liveness line. No clamp — it is one short
+   line, and truncating "Added 15 · Duplicates 0" would defeat its purpose. */
+.listen-summary {
+  display: block;
+  -webkit-line-clamp: unset;
+  overflow: visible;
+  font-variant-numeric: tabular-nums;
+}
+
+/* Collecting but silent. An inset outline rather than a border swap: the card
+   keeps its box, and `--warning` already carries the light/dark variant. */
+.listen-card.is-stale {
+  outline: 1px solid var(--warning);
+  outline-offset: -1px;
+}
+
+.listen-card.is-stale .listen-title {
+  color: var(--warning);
+}
+
+/* ============================================================
+   Area collection dialog
+   ============================================================ */
+.grid-field {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  font-size: 12px;
+  color: var(--text-3);
+}
+
+/* Label row: the text on the left, the "read from map" link on the right. */
+.grid-field > span {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.grid-field-inline {
+  flex: 1;
+}
+
+.grid-coord {
+  flex: 1;
+  min-width: 0;
+}
+
+.grid-note {
+  font-size: 11px;
+  line-height: 1.5;
+  color: var(--text-3);
+}
+
+.grid-plan {
+  font-size: 12px;
+  color: var(--accent);
+}
+
+.grid-status {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.grid-status-keyword {
+  font-weight: 600;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.grid-stats {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+  font-size: 12px;
+  color: var(--text-3);
+}
+
+/* First-run guide. `.collect-body` is a full-height scroller, so the card has
+   to claim the height itself — `padding: 24px 0` left it parked under the
+   header with a screen of blank below. `box-sizing` is set explicitly: this
+   project ships no CSS reset, and on the default `content-box` the padding is
+   added *outside* `min-height: 100%`, which makes the scroller overflow. */
+.queue-empty {
+  box-sizing: border-box;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 100%;
+  padding: 24px 8px 40px;
+}
+
+.queue-empty-card {
+  box-sizing: border-box;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  /* Padding + border included (see `.queue-empty`). 450 leaves a 400px text
+     column, which is what keeps the one-line description unbroken. */
+  max-width: 450px;
+  padding: 26px 24px 20px;
+  text-align: center;
+  background: var(--panel-bg);
+  border: 1px solid var(--panel-border);
+  border-radius: 14px;
+  box-shadow: var(--shadow-card);
+}
+
+.queue-empty-icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 44px;
+  height: 44px;
+  margin-bottom: 2px;
+  border-radius: 50%;
+  background: var(--accent-soft);
+  color: var(--accent);
+  font-size: 20px;
+}
+
+.queue-empty-title {
+  font-size: 14.5px;
+  font-weight: 600;
+  color: var(--text-1);
+}
+
+.queue-empty-desc {
+  margin: 0;
+  font-size: 12.5px;
+  line-height: 1.6;
+  color: var(--text-2);
+  /* Stops a two-line sentence from leaving one orphan character behind. */
+  text-wrap: pretty;
+}
+
+/* Numbered steps: the counter keeps the list semantic without shipping three
+   styled spans per item. The divider uses the strong border because the regular
+   one is invisible as a dashed line at this width. */
+.queue-empty-steps {
+  counter-reset: queue-step;
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+  width: 100%;
+  margin: 6px 0 4px;
+  padding: 13px 0 0;
+  list-style: none;
+  border-top: 1px dashed var(--panel-border-strong);
+  text-align: left;
+}
+
+.queue-empty-steps li {
+  position: relative;
+  counter-increment: queue-step;
+  padding-left: 24px;
+  font-size: 12px;
+  line-height: 1.55;
+  color: var(--text-2);
+}
+
+.queue-empty-steps li::before {
+  content: counter(queue-step);
+  position: absolute;
+  top: 1px;
+  left: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 16px;
+  height: 16px;
+  border-radius: 50%;
+  background: var(--accent-soft);
+  color: var(--accent);
+  font-size: 10px;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+}
+
+.queue-empty .ant-btn-link {
+  height: auto;
+  padding: 0;
+  font-size: 12px;
+}
+
+/* Preset keywords: a row of secondary entry points, deliberately quieter than
+   the primary button so the card keeps a single call to action. */
+.queue-empty-presets {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 6px;
+  margin-top: 4px;
+}
+
+.queue-empty-presets-label {
+  font-size: 11px;
+  color: var(--text-3);
+}
+
+.queue-empty-chips {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: center;
+  gap: 6px;
+}
+
+.queue-empty-chip {
+  padding: 2px 10px;
+  border: 1px solid var(--panel-border-strong);
+  border-radius: 999px;
+  background: var(--panel-bg);
+  color: var(--text-2);
+  font: inherit;
+  font-size: 11.5px;
+  line-height: 1.7;
+  cursor: pointer;
+  transition: border-color 0.15s ease, color 0.15s ease, background 0.15s ease;
+}
+
+.queue-empty-chip:hover {
+  border-color: var(--accent);
+  background: var(--accent-soft);
+  color: var(--accent);
+}
+
+.queue-row {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 8px 10px;
+  border: 1px solid var(--panel-border);
+  border-radius: 8px;
+}
+
+.queue-line {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+
+.queue-keyword {
+  font-size: 13px;
+  font-weight: 600;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.queue-city {
+  font-size: 11px;
+  color: var(--text-3);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.queue-meta {
+  display: flex;
+  justify-content: space-between;
+  gap: 8px;
+  font-size: 11px;
+  color: var(--text-3);
+}
+
+.queue-actions {
+  justify-content: flex-end;
+}
+
+/* A paused job after a crash: informational, not an error. */
+.resume-banner {
+  margin-bottom: 8px;
+}
+
+/* ============================================================
+   Filter bar
+   ============================================================ */
+.filter-bar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin: 0 16px 10px;
+  flex: 0 0 auto;
+}
+
+.filter-bar .ant-select {
+  min-width: 92px;
+}
+
+/* ============================================================
+   Table region
+   ============================================================ */
+.table-wrap {
+  position: relative;
+  flex: 1 1 auto;
+  min-height: 120px;
+  margin: 0 16px;
+  background: var(--panel-bg);
+  border: 1px solid var(--panel-border);
+  border-radius: 12px;
+  box-shadow: var(--shadow-card);
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+}
+
+/* Rows that landed while the user was reading an older page. Clicking it is
+   the only thing that moves the viewport, so streaming never fights the user. */
+.new-rows-pill {
+  position: absolute;
+  right: 14px;
+  bottom: 52px;
+  z-index: 5;
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  height: 26px;
+  padding: 0 11px;
+  border: none;
+  border-radius: 999px;
+  font-size: 12px;
+  font-weight: 500;
+  font-variant-numeric: tabular-nums;
+  color: #fff;
+  background: var(--accent-solid);
+  box-shadow: 0 4px 14px rgba(37, 99, 235, 0.32);
+  cursor: pointer;
+  animation: slide-up 0.18s ease-out;
+}
+
+.new-rows-pill:hover {
+  filter: brightness(1.06);
+}
+
+.new-rows-pill:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+.empty-table {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 4px;
+  flex-wrap: wrap;
+  padding: 8px 0;
+}
+
+.table-wrap .ant-table-wrapper,
+.table-wrap .ant-spin-nested-loading,
+.table-wrap .ant-spin-container {
+  flex: 1 1 auto;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+.table-wrap .ant-table {
+  background: transparent;
+  flex: 1 1 auto;
+  min-height: 0;
+}
+
+.table-wrap .ant-table-thead > tr > th {
+  font-size: 12px;
+  font-weight: 600;
+  letter-spacing: 0.2px;
+  border-bottom: 1px solid var(--panel-border) !important;
+}
+
+.table-wrap .ant-table-tbody > tr {
+  cursor: pointer;
+}
+
+.table-wrap .ant-table-tbody > tr > td {
+  font-size: 12.5px;
+  white-space: nowrap;
+}
+
+.table-wrap .ant-table-pagination.ant-pagination {
+  margin: 8px 12px !important;
+}
+
+/* Rows revealed one by one while the collector streams in data: the cell fades
+   in and flashes a highlight, then settles into the normal row background. */
+.table-wrap .ant-table-tbody > tr.row-reveal > td {
+  --row-bar: transparent;
+  animation: row-reveal 1.4s ease-out both;
+}
+
+.table-wrap .ant-table-tbody > tr.row-reveal > td:first-child {
+  --row-bar: var(--accent);
+}
+
+@keyframes row-reveal {
+  0% {
+    opacity: 0;
+    background-color: var(--row-reveal);
+    box-shadow: inset 2px 0 0 var(--row-bar);
+  }
+  12% {
+    opacity: 1;
+  }
+  60% {
+    background-color: var(--row-reveal);
+    box-shadow: inset 2px 0 0 var(--row-bar);
+  }
+  100% {
+    opacity: 1;
+    background-color: var(--panel-bg);
+    box-shadow: inset 2px 0 0 transparent;
+  }
+}
+
+.name-cell {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+
+.name-main {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-weight: 500;
+}
+
+.name-icon {
+  flex: 0 0 auto;
+  color: var(--accent);
+  font-size: 12px;
+  opacity: 0.85;
+}
+
+.cell-muted {
+  color: var(--text-3);
+}
+
+/* T-02: the task cell is a filter shortcut, not a link. It stays plain text
+   until hovered so a table of task names does not read as a wall of buttons. */
+.task-cell {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  max-width: 100%;
+  padding: 0;
+  border: 0;
+  background: none;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+
+.task-cell:hover .task-cell-name {
+  color: var(--accent);
+  text-decoration: underline;
+}
+
+.task-cell-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.task-cell-more {
+  flex: 0 0 auto;
+  font-size: 11px;
+  color: var(--text-3);
+}
+
+/* UI-04: review counts line up under each other, so a column of them can be
+   compared at a glance instead of being read digit by digit. */
+.cell-numeric {
+  font-variant-numeric: tabular-nums;
+}
+
+/* UI-04: addresses used to be one ellipsised line, which at 140px showed half
+   a street. Two clamped lines fit ~2.5x more; the min-height pins every row
+   to two lines so the grid stays aligned (the tooltip still has the rest).
+   `white-space: normal` is required: the td rule above forces nowrap, and
+   line-clamp only engages once the text actually wraps. */
+.cell-address {
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+  white-space: normal;
+  overflow-wrap: anywhere;
+  font-size: 12px;
+  line-height: 1.35;
+  min-height: 33px;
+}
+
+/* UI-04: the header column picker. A popover rather than a dropdown menu, so
+   several boxes can be toggled without the panel closing each time. */
+.column-picker {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 132px;
+}
+
+/* UI-04: locate + ⋯ at the end of every row. */
+.row-actions {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 2px;
+}
+
+.rating-cell {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-variant-numeric: tabular-nums;
+}
+
+.rating-cell .anticon {
+  color: var(--star);
+  font-size: 11px;
+}
+
+.rating-cell.is-empty {
+  color: var(--text-3);
+}
+
+.link-icon-btn {
+  color: var(--text-3) !important;
+}
+
+.link-icon-btn:hover {
+  color: var(--accent) !important;
+}
+
+/* ============================================================
+   Bulk action bar
+   ============================================================ */
+.bulk-bar {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px;
+  padding: 7px 10px;
+  margin: 8px 16px 0;
+  border: 1px solid rgba(37, 99, 235, 0.22);
+  border-radius: 10px;
+  background: var(--accent-soft);
+  flex: 0 0 auto;
+  animation: slide-up 0.18s ease-out;
+}
+
+.bulk-link {
+  height: auto !important;
+  padding: 0 2px !important;
+  font-size: 12px;
+}
+
+.bulk-note {
+  font-size: 11.5px;
+  color: var(--text-3);
+  white-space: nowrap;
+}
+
+/* ============================================================
+   Table toolbar (count + export + clear)
+   ============================================================ */
+.table-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin: 0 16px 8px;
+  min-height: 24px;
+  flex: 0 0 auto;
+}
+
+.table-toolbar-count {
+  font-size: 12px;
+  color: var(--text-3);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* UI-02a: clear confirmation carries a count, a warning and a way out. */
+.clear-confirm {
+  max-width: 280px;
+}
+
+.clear-confirm-desc {
+  margin: 0 0 8px;
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+@keyframes slide-up {
+  from {
+    opacity: 0;
+    transform: translateY(6px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+.bulk-count {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--accent);
+  white-space: nowrap;
+}
+
+.bulk-bar .ant-btn {
+  font-size: 12px;
+}
+
+/* ============================================================
+   Empty state
+   ============================================================ */
+.empty-guide {
+  flex: 1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 24px 20px;
+}
+
+.empty-guide-inner {
+  max-width: 340px;
+  width: 100%;
+  text-align: center;
+}
+
+.empty-badge {
+  width: 52px;
+  height: 52px;
+  margin: 0 auto 14px;
+  border-radius: 16px;
+  display: grid;
+  place-items: center;
+  font-size: 24px;
+  color: var(--accent);
+  background: var(--accent-soft);
+}
+
+.empty-title {
+  font-size: 14px;
+  font-weight: 600;
+  margin-bottom: 6px;
+}
+
+.empty-desc {
+  font-size: 12px;
+  color: var(--text-3);
+  line-height: 1.6;
+  margin-bottom: 16px;
+}
+
+.empty-steps {
+  display: flex;
+  flex-direction: column;
+  gap: 9px;
+  text-align: left;
+  margin-bottom: 18px;
+}
+
+.empty-step {
+  display: flex;
+  align-items: flex-start;
+  gap: 9px;
+  font-size: 12px;
+  color: var(--text-2);
+  line-height: 1.5;
+}
+
+.empty-step-index {
+  flex: 0 0 18px;
+  width: 18px;
+  height: 18px;
+  border-radius: 50%;
+  display: grid;
+  place-items: center;
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--accent);
+  background: var(--accent-soft);
+  margin-top: 1px;
+}
+
+/* ============================================================
+   Detail drawer
+   ============================================================ */
+.detail-title {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 15px;
+  font-weight: 600;
+  padding-right: 24px;
+  /* Long names must wrap instead of squeezing the nav cluster in `extra`. */
+  min-width: 0;
+}
+
+/* UI-05: position counter + prev/next. antd renders `extra` beside the close
+   button, so the cluster needs no layout of its own. */
+.detail-nav {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+}
+
+.detail-nav-count {
+  margin-right: 4px;
+  font-size: 12px;
+  font-weight: 400;
+  font-variant-numeric: tabular-nums;
+  color: var(--text-3);
+}
+
+/* UI-05: type tags double as "show only this type" shortcuts. */
+.detail-type-tag {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  cursor: pointer;
+}
+
+.detail-type-add {
+  font-size: 9px;
+  opacity: 0.55;
+}
+
+.detail-type-tag:hover .detail-type-add {
+  opacity: 1;
+}
+
+/* UI-05: the row focus returns to after the drawer closes. Programmatic focus
+   does not raise :focus-visible, so the outline is explicit and short-lived
+   (App.tsx drops the class after ~1.6s). */
+.table-wrap .ant-table-tbody > tr.row-return-focus {
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
+}
+
+.detail-types {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+}
+
+.detail-actions {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+  padding-top: 4px;
+}
+
+/* ============================================================
+   Diagnostics drawer
+   ============================================================ */
+.diag-section + .diag-section {
+  margin-top: 18px;
+}
+
+.diag-section-title {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-3);
+  text-transform: uppercase;
+  letter-spacing: 0.6px;
+  margin-bottom: 8px;
+}
+
+.diag-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 7px 0;
+  font-size: 12.5px;
+  border-bottom: 1px dashed var(--panel-border);
+}
+
+.diag-row:last-child {
+  border-bottom: none;
+}
+
+.diag-row .diag-key {
+  color: var(--text-3);
+  flex: 0 0 auto;
+}
+
+.diag-row .diag-value {
+  text-align: right;
+  word-break: break-all;
+  font-variant-numeric: tabular-nums;
+}
+
+/* ============================================================
+   Settings bootstrap failure (no Tauri webview)
+   ============================================================ */
+.bootstrap-error {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  max-width: 560px;
+  margin: 80px auto;
+  padding: 24px;
+  font-size: 13px;
+  line-height: 1.6;
+  color: var(--text-1);
+}
+
+.bootstrap-error h1 {
+  font-size: 18px;
+  margin: 0;
+}
+
+.bootstrap-error pre {
+  margin: 0;
+  padding: 10px;
+  border-radius: 8px;
+  background: var(--panel-border);
+  white-space: pre-wrap;
+  word-break: break-all;
+  font-size: 12px;
+}
+
+/* ============================================================
+   Settings drawer
+   ============================================================ */
+.settings-section-title {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-3);
+  text-transform: uppercase;
+  letter-spacing: 0.6px;
+  margin-bottom: 8px;
+}
+
+.settings-section-title--spaced {
+  margin-top: 22px;
+}
+
+/* UI-08: the tabs carry the group titles; keep the bar tight in the narrow
+   drawer so the first rows are visible without scrolling. */
+.settings-tabs .ant-tabs-nav {
+  margin-bottom: 2px;
+}
+
+.settings-tabs .ant-tabs-tab {
+  padding: 6px 9px;
+  font-size: 12.5px;
+}
+
+.settings-tabs .ant-tabs-tab + .ant-tabs-tab {
+  margin-left: 4px;
+}
+
+.settings-tabs .ant-tabs-content-holder {
+  padding-top: 6px;
+}
+
+.settings-radio-col {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.settings-radio-col .ant-radio-wrapper {
+  font-size: 12.5px;
+  margin-inline-end: 0;
+}
+
+.settings-hint {
+  padding: 2px 0 6px;
+  font-size: 11.5px;
+  line-height: 1.5;
+  color: var(--text-3);
+}
+
+.settings-hint--warn {
+  color: var(--warning);
+}
+
+/* Long export paths must not push the buttons out of the drawer. */
+.settings-path {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 11.5px;
+  color: var(--text-2);
+}
+
+.settings-dash {
+  margin: 0 2px;
+  color: var(--text-3);
+}
+
+/* Running build version in the settings update row (G-06). */
+.settings-version {
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+  color: var(--text-2);
+}
+
+/* Release notes inside the update offer modal (G-06). */
+.update-notes {
+  margin-bottom: 12px;
+  font-size: 12.5px;
+  line-height: 1.6;
+  white-space: pre-wrap;
+  color: var(--text-2);
+}
+
+.update-notes-title {
+  margin-bottom: 4px;
+  font-weight: 600;
+  color: var(--text-1);
+}
+
+.update-installing {
+  font-size: 12.5px;
+  color: var(--text-2);
+}
+
+.update-installing .ant-progress {
+  margin-top: 8px;
+}
+
+.settings-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 8px 0;
+  font-size: 12.5px;
+  border-bottom: 1px dashed var(--panel-border);
+}
+
+.settings-row:last-of-type {
+  border-bottom: none;
+}
+
+/* ============================================================
+   Collect view (P1)
+   ============================================================ */
+.collect-view {
+  flex: 1 1 auto;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  padding: 0 16px;
+}
+
+.collect-toolbar {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 2px 0 8px;
+}
+
+.collect-count {
+  font-size: 11.5px;
+  color: var(--text-3);
+  font-variant-numeric: tabular-nums;
+}
+
+.collect-body {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+  padding-right: 2px;
+}
+
+.task-group-label {
+  font-size: 11px;
+  letter-spacing: 0.3px;
+  color: var(--text-3);
+  margin: 10px 0 6px;
+}
+
+.task-group:first-child .task-group-label {
+  margin-top: 0;
+}
+
+.task-card {
+  border: 1px solid var(--panel-border);
+  border-radius: 10px;
+  background: var(--panel-bg);
+  padding: 8px 10px;
+  margin-bottom: 8px;
+  cursor: pointer;
+  transition: border-color 0.15s ease, box-shadow 0.15s ease;
+}
+
+.task-card:hover {
+  border-color: var(--panel-border-strong);
+}
+
+.task-card:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+
+.task-card.is-running {
+  box-shadow: inset 2px 0 0 var(--accent);
+}
+
+.task-card-line {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+
+.task-dot {
+  flex: 0 0 auto;
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--panel-border-strong);
+}
+
+.task-dot.is-running {
+  background: var(--accent);
+  animation: task-pulse 1.6s ease-in-out infinite;
+}
+
+.task-dot.is-completed {
+  background: var(--text-3);
+}
+
+.task-dot.is-paused {
+  background: var(--warning);
+}
+
+.task-dot.is-failed {
+  background: var(--live);
+}
+
+@keyframes task-pulse {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.35;
+  }
+}
+
+.task-card-name {
+  flex: 1 1 auto;
+  min-width: 0;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text-1);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.task-card-status {
+  flex: 0 0 auto;
+  font-size: 11px;
+  color: var(--text-3);
+}
+
+.task-card-status.is-running {
+  color: var(--accent);
+}
+
+.task-card-status.is-paused {
+  color: var(--warning);
+}
+
+.task-card-status.is-failed {
+  color: var(--live);
+}
+
+.task-card-more {
+  flex: 0 0 auto;
+}
+
+.task-card-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 2px;
+  font-size: 11px;
+  color: var(--text-3);
+  font-variant-numeric: tabular-nums;
+}
+
+.task-card-failed {
+  color: var(--live);
+}
+
+.task-card-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 2px;
+  margin-top: 2px;
+}
+
+.task-card-actions .ant-btn {
+  padding-inline: 6px;
+  font-size: 12px;
+}
+
+/* Single-flight is a product rule: a disabled start button must still explain
+   itself, so it sits in a span the tooltip can hover. */
+.task-action-wrap {
+  display: inline-flex;
+}
+
+.task-waiting {
+  color: var(--text-3);
+}
+
+.task-single-flight {
+  margin: 8px 0 4px;
+  padding-top: 8px;
+  border-top: 1px dashed var(--panel-border);
+  font-size: 11px;
+  line-height: 1.5;
+  color: var(--text-3);
+}
+
+.task-batch-head {
+  width: 100%;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 4px;
+  border: none;
+  background: none;
+  cursor: pointer;
+  font-size: 12px;
+  color: var(--text-2);
+  text-align: left;
+}
+
+.task-batch-caret {
+  flex: 0 0 auto;
+  color: var(--text-3);
+  transition: transform 0.15s ease;
+}
+
+.task-batch-caret.is-open {
+  transform: rotate(90deg);
+}
+
+.task-batch-name {
+  flex: 1 1 auto;
+  min-width: 0;
+  font-weight: 600;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.task-batch-count {
+  flex: 0 0 auto;
+  font-size: 11px;
+  color: var(--text-3);
+}
+
+.task-batch-body {
+  padding-left: 10px;
+  border-left: 1px dashed var(--panel-border);
+}
+
+.queue-delete-confirm {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.queue-delete-note {
+  font-size: 11px;
+  color: var(--text-3);
+}
+
+/* ============================================================
+   Task detail (P1)
+   ============================================================ */
+.task-detail {
+  flex: 1 1 auto;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  padding: 0 16px;
+}
+
+.task-detail-head {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 0;
+}
+
+.task-detail-title {
+  flex: 1 1 auto;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+.task-detail-name {
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--text-1);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.task-detail-status {
+  font-size: 11px;
+  color: var(--text-3);
+}
+
+.task-detail-status.is-running {
+  color: var(--accent);
+}
+
+.task-detail-status.is-paused {
+  color: var(--warning);
+}
+
+.task-detail-status.is-failed {
+  color: var(--live);
+}
+
+.task-detail-tabs {
+  flex: 1 1 auto;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+.task-detail-tabs .ant-tabs-nav {
+  margin-bottom: 8px;
+}
+
+.task-detail-tabs .ant-tabs-content-holder {
+  overflow-y: auto;
+  padding-right: 2px;
+}
+
+.task-detail-overview {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding-bottom: 12px;
+}
+
+.task-detail-progress-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
+  font-size: 12px;
+  color: var(--text-2);
+  font-variant-numeric: tabular-nums;
+}
+
+.task-detail-muted {
+  font-size: 11px;
+  color: var(--text-3);
+}
+
+.task-detail-facts {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 6px 14px;
+  margin: 0;
+}
+
+.task-detail-facts div {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
+  font-size: 12px;
+}
+
+.task-detail-facts dt {
+  color: var(--text-3);
+}
+
+.task-detail-facts dd {
+  margin: 0;
+  color: var(--text-1);
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+
+.task-detail-note {
+  font-size: 11px;
+  color: var(--text-3);
+}
+
+/* Sits above the preview table: below it, the note was only reachable after
+   scrolling through all 50 rows. */
+.task-detail-more {
+  padding-bottom: 6px;
+  font-size: 11px;
+  color: var(--text-3);
+}
+
+.grid-field-error {
+  font-size: 11px;
+  color: var(--live);
+}
+
+.grid-plan.is-warning {
+  color: var(--warning);
+}
+
+.view-switch {
+  flex: 0 0 auto;
+}
+
+/* P2: the data view's empty state points at the collect view instead of
+   offering a collector switch that lives on another page. */
+.empty-data {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 10px;
+  padding: 32px 16px;
+  text-align: center;
+}
+
+.empty-data-note {
+  font-size: 12px;
+  color: var(--text-3);
+}
+
+/* ============================================================
+   Runs and failed cells (P2)
+   ============================================================ */
+.task-runs {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding-bottom: 12px;
+}
+
+.task-run {
+  display: flex;
+  gap: 8px;
+  padding: 8px 10px;
+  border: 1px solid var(--panel-border);
+  border-radius: 8px;
+}
+
+.task-run-index {
+  flex: 0 0 auto;
+  font-size: 11px;
+  color: var(--text-3);
+  font-variant-numeric: tabular-nums;
+}
+
+.task-run-body {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+.task-run-line {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
+  font-size: 12px;
+  color: var(--text-2);
+  font-variant-numeric: tabular-nums;
+}
+
+.task-run-status {
+  flex: 0 0 auto;
+  font-size: 11px;
+  color: var(--text-3);
+}
+
+.task-run-status.is-running {
+  color: var(--accent);
+}
+
+.task-run-status.is-paused {
+  color: var(--warning);
+}
+
+.task-run-status.is-failed {
+  color: var(--live);
+}
+
+.task-run-meta {
+  margin-top: 2px;
+  font-size: 11px;
+  color: var(--text-3);
+  font-variant-numeric: tabular-nums;
+}
+
+.task-failed {
+  border: 1px solid var(--panel-border);
+  border-radius: 8px;
+  padding: 8px 10px;
+}
+
+.task-failed-head {
+  margin-bottom: 4px;
+  font-size: 12px;
+  color: var(--warning);
+}
+
+.task-failed-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  font-size: 11.5px;
+  color: var(--text-2);
+}
+
+.task-failed-coord {
+  font-variant-numeric: tabular-nums;
+}
+
+/* A5: the short failure code sits right after the coordinates. */
+.task-failed-reason {
+  margin-left: 6px;
+  color: var(--danger, #cf1322);
+}
+
+.task-failed-coord .task-failed-reason::before {
+  content: '· ';
+  color: var(--text-3);
+}
+
+@media (max-width: 640px) {
+  .view-switch .ant-segmented-item-label {
+    padding: 0 6px;
+    font-size: 12px;
+  }
+}
+
+.settings-label {
+  color: var(--text-3);
+  flex: 0 0 auto;
+}
+
+.settings-control {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 4px;
+}
+
+.settings-footer {
+  display: flex;
+  justify-content: flex-end;
+  margin-top: 20px;
+  padding-top: 14px;
+  border-top: 1px solid var(--panel-border);
+}
+
+/* ============================================================
+   Split handle (drag to resize the panel / map)
+   ============================================================ */
+.split-handle {
+  position: absolute;
+  top: 0;
+  right: 0;
+  bottom: 0;
+  width: 6px;
+  cursor: col-resize;
+  z-index: 20;
+  background: transparent;
+  transition: background 0.15s ease;
+}
+
+.split-handle::before {
+  content: '';
+  position: absolute;
+  top: 50%;
+  right: 1px;
+  width: 3px;
+  height: 38px;
+  margin-top: -19px;
+  border-radius: 3px;
+  background: var(--panel-border-strong);
+  opacity: 0;
+  transition: opacity 0.15s ease;
+}
+
+.split-handle:hover {
+  background: var(--accent-soft);
+}
+
+.split-handle:focus-visible {
+  background: var(--accent-soft);
+  outline: none;
+}
+
+.split-handle:hover::before,
+.split-handle:focus-visible::before,
+.split-handle.is-dragging::before {
+  opacity: 1;
+  background: var(--accent);
+}
+
+/* UI-11: collapse control, centred on the drag handle. Hidden until the
+   handle is hovered or focused — a permanent arrow would fight the drag
+   affordance. */
+.split-collapse-btn {
+  position: absolute;
+  top: 50%;
+  right: 0;
+  transform: translateY(-50%);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 16px;
+  height: 28px;
+  padding: 0;
+  border: none;
+  border-radius: 4px 0 0 4px;
+  background: var(--accent-solid);
+  color: #ffffff;
+  font-size: 9px;
+  cursor: pointer;
+  opacity: 0;
+  transition: opacity 0.15s ease;
+  z-index: 1;
+}
+
+.split-handle:hover .split-collapse-btn,
+.split-collapse-btn:focus-visible {
+  opacity: 1;
+}
+
+.split-collapse-btn:hover {
+  background: var(--accent);
+}
+
+/* UI-11: restore strip while the map is collapsed. 12px wide, full height,
+   at the panel's right edge — the 1px maps webview lives behind it. */
+.map-restore-strip {
+  position: absolute;
+  top: 0;
+  right: 0;
+  bottom: 0;
+  width: 12px;
+  z-index: 20;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: var(--panel-border);
+}
+
+.map-restore-btn {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 12px;
+  height: 44px;
+  padding: 0;
+  border: none;
+  background: transparent;
+  color: var(--text-3);
+  font-size: 9px;
+  cursor: pointer;
+}
+
+.map-restore-strip:hover,
+.map-restore-btn:hover {
+  background: var(--accent-soft);
+  color: var(--accent);
+}
+
+/* ============================================================
+   Shortcut reference (UI-10)
+   ============================================================ */
+.shortcut-group + .shortcut-group {
+  margin-top: 14px;
+}
+
+.shortcut-group-title {
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--text-3);
+  margin-bottom: 4px;
+}
+
+.shortcut-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 3px 0;
+  font-size: 12px;
+}
+
+.shortcut-keys {
+  display: inline-flex;
+  gap: 3px;
+  flex-shrink: 0;
+}
+
+.shortcut-key {
+  font-family: inherit;
+  font-size: 11px;
+  line-height: 1;
+  padding: 3px 5px;
+  border: 1px solid var(--panel-border-strong);
+  border-radius: 4px;
+  background: var(--panel-bg-soft);
+  color: var(--text-2);
+  white-space: nowrap;
+}
+
+body.is-resizing {
+  cursor: col-resize !important;
+  user-select: none;
+}
+
+body.is-resizing * {
+  cursor: col-resize !important;
+}
+
+/* ============================================================
+   Responsive tweaks for a narrow panel
+   ============================================================ */
+@media (max-width: 520px) {
+  .brand-sub {
+    display: none;
+  }
+  .listen-hint {
+    display: none;
+  }
+}
+
+/* ============================================================
+   Reduced motion
+   ============================================================ */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.001ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.001ms !important;
+  }
+}

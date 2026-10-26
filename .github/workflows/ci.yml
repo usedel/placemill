@@ -1,0 +1,50 @@
+name: CI
+
+# R-36: the repository had no CI at all — `cargo check` and the TypeScript pass
+# only ever ran on the developer's machine, so a broken commit could sit on main
+# until someone tried to build a release.
+#
+# Windows is the primary target (the app ships an NSIS installer and the e2e
+# suites drive WebView2), and it is the only runner where `cargo check` needs no
+# extra system packages.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      # `tauri::generate_context!` reads dist/ at compile time, so the frontend
+      # has to exist before cargo runs.
+      - name: Type-check and bundle the frontend
+        run: npm run build
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri -> target
+
+      - name: Check the backend
+        run: cargo check --manifest-path src-tauri/Cargo.toml --all-targets
+
+      - name: Run backend tests
+        run: cargo test --manifest-path src-tauri/Cargo.toml

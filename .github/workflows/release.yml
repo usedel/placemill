@@ -1,0 +1,91 @@
+name: Release
+
+# Tag-driven publishing: push a `v*` tag and this workflow builds the NSIS
+# installer, writes the update manifest and attaches both to a GitHub Release.
+# Anyone can then install PlaceMill from the Releases page without a toolchain.
+#
+# Required repository secrets (Settings -> Secrets and variables -> Actions):
+#   TAURI_SIGNING_PRIVATE_KEY            contents of the minisign private key
+#   TAURI_SIGNING_PRIVATE_KEY_PASSWORD   its password (omit if the key has none)
+#
+# Without the private key the bundle still builds, but it gets no `.sig`
+# sidecar, `latest.json` cannot be written and the updater would reject the
+# release. The workflow fails early instead of shipping a dead-end installer.
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: windows-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri -> target
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      # Guards two failure modes that only surface after a 10-minute build:
+      # an unconfigured signing key, and a tag that disagrees with the version
+      # baked into the installer (the updater would offer the wrong build).
+      - name: Verify release preconditions
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+        run: |
+          if (-not $env:TAURI_SIGNING_PRIVATE_KEY) {
+            throw "TAURI_SIGNING_PRIVATE_KEY is not set. Add it under Settings -> Secrets and variables -> Actions."
+          }
+          $conf = Get-Content 'src-tauri\tauri.conf.json' -Raw | ConvertFrom-Json
+          $expected = "v$($conf.version)"
+          if ($env:GITHUB_REF_NAME -ne $expected) {
+            throw "Tag $env:GITHUB_REF_NAME does not match tauri.conf.json version $($conf.version). Bump the version before tagging."
+          }
+          Write-Host "Building $expected"
+
+      # `beforeBuildCommand` in tauri.conf.json runs `npm run build`, so the
+      # frontend (including the tsc pass) is built here exactly once.
+      - name: Build the NSIS installer
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: npx tauri build --bundles nsis
+
+      - name: Generate the update manifest
+        run: node scripts/release-latest-json.mjs --tag ${{ github.ref_name }}
+
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $installer = Get-ChildItem 'src-tauri\target\release\bundle\nsis\*-setup.exe' |
+            Select-Object -First 1
+          if (-not $installer) { throw 'The build produced no NSIS installer.' }
+          $manifest = 'src-tauri\target\release\bundle\latest.json'
+          if (-not (Test-Path $manifest)) { throw 'latest.json was not generated.' }
+
+          gh release create $env:GITHUB_REF_NAME `
+            --title "PlaceMill $env:GITHUB_REF_NAME" `
+            --generate-notes `
+            $installer.FullName `
+            $manifest
+
+          Write-Host "Released $($installer.Name)"

@@ -1,0 +1,11 @@
+import { listTargets } from "./harness.mjs";
+import { cdpClient } from "./cdp.mjs";
+const targets = await listTargets();
+const maps = targets.find((t) => /google\.com/.test(t.url || ""));
+const cdp = cdpClient(maps.webSocketDebuggerUrl);
+await cdp.ready;
+const expression = "(function () { const s = window.APP_INITIALIZATION_STATE; const bucket = s[3].Dg; const out = []; const sAt = function (r, path) { let v = r; for (let i = 0; i < path.length; i++) { v = v ? v[path[i]] : undefined; } return typeof v === \"string\" ? v : \"\"; }; const nAt = function (r, path) { let v = r; for (let i = 0; i < path.length; i++) { v = v ? v[path[i]] : undefined; } return typeof v === \"number\" ? v : 0; }; const scan = function (node, depth) { if (depth > 8) return; if (typeof node === \"string\") { if (node.slice(0, 4) === \")]}\x27\" && node.length > 5000) { let root = null; try { root = JSON.parse(node.slice(4)); } catch (e) { return; } const l175 = root[6] ? root[6][175] : null; const l9 = l175 ? l175[9] : null; const a = l9 ? l9[0] : null; const b = a ? a[0] : null; const list = b ? b[0] : null; if (!Array.isArray(list)) return; for (let i = 0; i < list.length; i++) { const r = list[i]; if (!r || !Array.isArray(r)) continue; const id = typeof r[0] === \"string\" ? r[0] : \"\"; if (id.length < 25 || id.charAt(0) !== \"C\") continue; if (!r[1] || !r[1][4] || !r[1][4][5]) continue; out.push({ review_id: id.slice(0, 22), place_id: sAt(r, [1, 0]), author: sAt(r, [1, 4, 5, 0]), stars: nAt(r, [2, 0, 0]), text: sAt(r, [2, 15, 0, 0]).slice(0, 60), created_us: nAt(r, [1, 2]), rel: sAt(r, [1, 6]) }); } } return; } if (Array.isArray(node)) { for (let i = 0; i < node.length; i++) scan(node[i], depth + 1); return; } if (node && typeof node === \"object\") { for (const k in node) scan(node[k], depth + 1); } }; scan(bucket, 0); return JSON.stringify(out); })()";
+const res = await cdp.send("Runtime.evaluate", { expression: expression, returnByValue: true });
+const value = res.result && res.result.result ? res.result.result.value : JSON.stringify(res.result);
+console.log(String(value).slice(0, 900));
+process.exit(0);

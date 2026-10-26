@@ -1,0 +1,10 @@
+import { listTargets } from "./harness.mjs";
+import { cdpClient } from "./cdp.mjs";
+const targets = await listTargets();
+const maps = targets.find((t) => /google\.com/.test(t.url || ""));
+const cdp = cdpClient(maps.webSocketDebuggerUrl);
+await cdp.ready;
+const click = "(function () { const labels = [\"评价\", \"Reviews\"]; const nodes = Array.from(document.querySelectorAll(\"button, [role=tab], li\")); for (const label of labels) { const hit = nodes.find(function (n) { const text = n.textContent ? n.textContent.trim() : \"\"; return text === label; }); if (hit) { hit.click(); return \"clicked:\" + label; } } return \"not-found\"; })()";
+const res = await cdp.send("Runtime.evaluate", { expression: click, returnByValue: true });
+console.log("click:", JSON.stringify(res.result && res.result.result));
+process.exit(0);
