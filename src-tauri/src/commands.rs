@@ -7,7 +7,7 @@ use crate::{
     DEFAULT_SPLIT_RATIO,
 };
 use serde::{Deserialize, Serialize};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use tauri::{Emitter, Manager};
 
@@ -27,6 +27,291 @@ pub(crate) fn encode_query(input: &str) -> String {
     out
 }
 
+// ---------------------------------------------------------------------------
+// Single-flight slots (R-01 / W-03)
+// ---------------------------------------------------------------------------
+
+/// RAII release for a single-flight slot.
+///
+/// Three commands own a slot for the lifetime of a background thread
+/// (`email_mining`, `enrich_job`, `review_fetch`), and each has several exits:
+/// a poisoned lock, an empty target list, a database error, a worker that ends
+/// normally or panics. Clearing by hand is how the miner's slot once leaked and
+/// locked the feature until the next restart (R-01); holding the release in
+/// `Drop` makes every path release by construction.
+///
+/// `enrich_businesses` acquires the slot before two fallible reads and had the
+/// same hand-written release at the end of its worker only — a database error
+/// there would keep `enrich_busy` forever (C-06).
+struct SlotGuard {
+    app: tauri::AppHandle,
+    clear: fn(&AppState),
+}
+
+impl SlotGuard {
+    fn new(app: &tauri::AppHandle, clear: fn(&AppState)) -> Self {
+        Self {
+            app: app.clone(),
+            clear,
+        }
+    }
+}
+
+impl Drop for SlotGuard {
+    fn drop(&mut self) {
+        (self.clear)(&self.app.state::<AppState>());
+    }
+}
+
+fn clear_mining_slot(state: &AppState) {
+    if let Ok(mut slot) = state.email_mining.lock() {
+        *slot = None;
+    }
+}
+
+fn clear_enrich_slot(state: &AppState) {
+    if let Ok(mut slot) = state.enrich_job.lock() {
+        *slot = None;
+    }
+    // The pane claim is part of the slot's lifetime (P2-1): releasing one without
+    // the other would leave the Maps pane owned by a runner that already ended.
+    release_pane(state, &crate::PaneOwner::Enrich);
+}
+
+fn clear_review_slot(state: &AppState) {
+    if let Ok(mut slot) = state.review_fetch.lock() {
+        *slot = false;
+    }
+    release_pane(state, &crate::PaneOwner::Reviews);
+}
+
+/// Releases the export single-flight flag on every return path, including a
+/// cancelled save dialog or a failed write.
+struct ExportGuard<'a> {
+    flag: &'a AtomicBool,
+}
+
+impl Drop for ExportGuard<'_> {
+    fn drop(&mut self) {
+        self.flag.store(false, Ordering::Release);
+    }
+}
+
+/// Claim the one export slot. `try` semantics: a second click gets a readable
+/// refusal instead of racing the first export's temp-file rename.
+fn claim_export(flag: &AtomicBool) -> Result<ExportGuard<'_>, String> {
+    if flag.swap(true, Ordering::AcqRel) {
+        return Err("export_busy".to_string());
+    }
+    Ok(ExportGuard { flag })
+}
+
+// ---------------------------------------------------------------------------
+// Maps-pane ownership (C-01 / W-02)
+// ---------------------------------------------------------------------------
+
+/// Which pane-owning states a command must respect before it touches `maps`.
+///
+/// Five commands replace the Maps document (locate, reviews, enrichment, job
+/// start, map-locale change) and every one of them used to spell the checks out
+/// on its own, which is how the reviews fetch ended up unchecked by all the
+/// others: no command knew it existed. The flags below keep the *intent* of each
+/// caller explicit while the check itself lives in exactly one place.
+#[derive(Clone, Copy)]
+pub(crate) struct PaneCheck {
+    /// A grid job is running.
+    pub job: bool,
+    /// The Tier-2 enrichment runner owns the pane.
+    pub enrich: bool,
+    /// A reviews fetch is in flight.
+    pub reviews: bool,
+    /// A collecting session is active (the switch is on).
+    pub session: bool,
+}
+
+impl PaneCheck {
+    /// A pure borrower: locate and the map-locale change.
+    pub const ALL: Self = Self {
+        job: true,
+        enrich: true,
+        reviews: true,
+        session: true,
+    };
+    /// `start_job`: it becomes the runner, so it must not refuse itself.
+    pub const BECOMING_JOB: Self = Self {
+        job: false,
+        enrich: true,
+        reviews: true,
+        session: false,
+    };
+    /// `enrich_businesses`: takes `enrich_job` right after this check.
+    pub const BECOMING_ENRICH: Self = Self {
+        job: true,
+        enrich: false,
+        reviews: true,
+        session: true,
+    };
+    /// `fetch_business_reviews`: takes `review_fetch` right after this check.
+    pub const BECOMING_REVIEWS: Self = Self {
+        job: true,
+        enrich: true,
+        reviews: false,
+        session: true,
+    };
+}
+
+/// Pure core of `check_pane`: which refusal a set of owners produces.
+///
+/// Kept apart from the locks so the priority order — and, more importantly,
+/// which owners a *becoming* caller ignores — has a test instead of only a code
+/// path. Errors carry the codes the panel parses (`map_busy:<id>`,
+/// `enrich_busy`, `reviews_busy`, `session_active`).
+fn pane_conflict(
+    running_job: Option<&str>,
+    owner: Option<&crate::PaneOwner>,
+    session: bool,
+    check: PaneCheck,
+) -> Option<String> {
+    if check.job {
+        if let Some(crate::PaneOwner::Job(id)) = owner {
+            return Some(format!("map_busy:{}", id));
+        }
+        if let Some(id) = running_job {
+            return Some(format!("map_busy:{}", id));
+        }
+    }
+    if check.enrich && matches!(owner, Some(crate::PaneOwner::Enrich)) {
+        return Some("enrich_busy".to_string());
+    }
+    if check.reviews && matches!(owner, Some(crate::PaneOwner::Reviews)) {
+        return Some("reviews_busy".to_string());
+    }
+    if check.session && session {
+        return Some("session_active".to_string());
+    }
+    None
+}
+
+/// The refusal code for a pane another operation already holds.
+fn owner_code(owner: &crate::PaneOwner) -> String {
+    match owner {
+        crate::PaneOwner::Job(id) => format!("map_busy:{}", id),
+        crate::PaneOwner::Enrich => "enrich_busy".to_string(),
+        crate::PaneOwner::Reviews => "reviews_busy".to_string(),
+    }
+}
+
+/// Refuse when another operation owns the Maps pane.
+///
+/// Borrowers only (`navigate_maps`, the map-locale change): a command that
+/// becomes an owner must use `claim_pane`, which checks and claims in one step.
+pub(crate) fn check_pane(state: &AppState, check: PaneCheck) -> Result<(), String> {
+    // The job row is read only when the caller actually respects it: a job
+    // start is the owner, and querying for "another running job" would race its
+    // own claim for no benefit.
+    let running = if check.job {
+        let conn = state.db.lock().map_err(|e| e.to_string())?;
+        db::running_job_id(&conn).map_err(|e| e.to_string())?
+    } else {
+        None
+    };
+    let owner = state.pane_owner.lock().ok().and_then(|slot| slot.clone());
+    // `switch_on`, not `session_active`: the latter answers `true` whenever the
+    // e2e fixture override is set, which would make every pane command refuse
+    // itself in the suites (C-01).
+    let session = check.session && crate::switch_on(state);
+    match pane_conflict(running.as_deref(), owner.as_ref(), session, check) {
+        Some(code) => Err(code),
+        None => Ok(()),
+    }
+}
+
+/// Claim the Maps pane for `owner`, or say who already has it (P2-1).
+///
+/// The check and the claim are one step under `pane_owner`: the old shape read
+/// `active_runner` / `enrich_job` / `review_fetch` in `check_pane` and each
+/// command claimed its own slot afterwards, so a job start and a reviews fetch
+/// could both pass the check and both navigate the pane. The three operational
+/// slots stay as they are — they hold cancellation state and the runner id —
+/// but nobody decides ownership from them any more.
+pub(crate) fn claim_pane(
+    state: &AppState,
+    check: PaneCheck,
+    owner: crate::PaneOwner,
+) -> Result<(), String> {
+    // Read the job row before taking the owner lock: no lock is held while
+    // acquiring `db` (see AppState's lock order), and a job that is about to run
+    // has already claimed the pane — `start_job` claims before it flips the
+    // status.
+    let running = if check.job {
+        let conn = state.db.lock().map_err(|e| e.to_string())?;
+        db::running_job_id(&conn).map_err(|e| e.to_string())?
+    } else {
+        None
+    };
+    let session = check.session && crate::switch_on(state);
+    let blocked = if check.job {
+        running.map(|id| format!("map_busy:{}", id))
+    } else {
+        None
+    };
+
+    let mut slot = state
+        .pane_owner
+        .lock()
+        .map_err(|_| "pane_unavailable".to_string())?;
+    claim_slot(&mut slot, blocked, session, owner)
+}
+
+/// Pure core of `claim_pane`: take the pane or explain why not.
+///
+/// The slot is the whole mutex, so two commands calling this concurrently
+/// cannot both succeed — one of them always observes `Some`.
+fn claim_slot(
+    slot: &mut Option<crate::PaneOwner>,
+    blocked: Option<String>,
+    session: bool,
+    owner: crate::PaneOwner,
+) -> Result<(), String> {
+    if let Some(existing) = slot.as_ref() {
+        return Err(owner_code(existing));
+    }
+    if let Some(code) = blocked {
+        return Err(code);
+    }
+    if session {
+        return Err("session_active".to_string());
+    }
+    *slot = Some(owner);
+    Ok(())
+}
+
+/// Release the pane if `owner` is still the one holding it.
+///
+/// The identity check matters: a paused job's runner can exit after the user
+/// already started something else, and clearing the slot blindly would hand the
+/// pane to a second operation at the same time.
+pub(crate) fn release_pane(state: &AppState, owner: &crate::PaneOwner) {
+    if let Ok(mut slot) = state.pane_owner.lock() {
+        release_pane_slot(&mut slot, owner);
+    }
+}
+
+/// Pure core of `release_pane`.
+fn release_pane_slot(slot: &mut Option<crate::PaneOwner>, owner: &crate::PaneOwner) {
+    if slot.as_ref() == Some(owner) {
+        *slot = None;
+    }
+}
+
+/// Hand the pane to `owner` without checking. Only the runner uses this, when
+/// it chains to the next queued job while already holding it.
+pub(crate) fn set_pane_owner(state: &AppState, owner: crate::PaneOwner) {
+    if let Ok(mut slot) = state.pane_owner.lock() {
+        *slot = Some(owner);
+    }
+}
+
 /// Jump the Google Maps child webview to a specific business (used by the
 /// "locate on map" action). Searching is intentionally left to the user, because
 /// driving the URL from the sidebar changes the map location.
@@ -44,25 +329,12 @@ pub async fn navigate_maps(
         return Err("Missing business name".to_string());
     }
 
-    // A running task owns the map. Navigating away would feed another search
-    // into the cell that is currently scrolling, and its rows would be
-    // attributed to the wrong tile. The panel disables the button too; this is
-    // the final guard for shortcuts and future callers.
-    {
-        let conn = state.db.lock().map_err(|e| e.to_string())?;
-        if let Some(id) = db::running_job_id(&conn).map_err(|e| e.to_string())? {
-            return Err(format!("map_busy:{}", id));
-        }
-    }
-    // The enrichment runner navigates the pane per place — same fight.
-    if state
-        .enrich_job
-        .lock()
-        .map(|slot| slot.is_some())
-        .unwrap_or(false)
-    {
-        return Err("enrich_busy".to_string());
-    }
+    // A running task, the enrichment runner, a reviews fetch and an active
+    // collecting session all own the pane. Navigating away would feed another
+    // search into the cell that is scrolling, or make a reviews/enrich sequence
+    // read a document it never loaded. The panel disables the button too; this
+    // is the final guard for shortcuts and future callers.
+    check_pane(state.inner(), PaneCheck::ALL)?;
 
     // Keep `hl`/`gl` in sync with the map pane, otherwise locating a business
     // would flip the map back to English while the panel says Chinese.
@@ -112,13 +384,20 @@ pub async fn navigate_maps(
 /// Called through invoke once the webview has intercepted data.
 ///
 /// Legacy path (the injected script emits `business-data` instead): it has no
-/// batch metadata, so the rows are stored without a source query or job id.
+/// batch metadata, so the rows are stored without a source query or job id. It
+/// is an IPC invoke rather than a page event, so it carries no epoch and is
+/// stamped with the current one — the clear guard exists for batches that were
+/// produced by the page before a clear (P1-4).
 #[tauri::command(async)]
 pub fn on_business_data(
     app: tauri::AppHandle,
     businesses: Vec<Business>,
 ) -> Result<(), String> {
-    store_businesses(&app, businesses, "", "");
+    let epoch = app
+        .state::<AppState>()
+        .collection_epoch
+        .load(Ordering::Acquire);
+    store_businesses(&app, businesses, "", "", Some(epoch));
     Ok(())
 }
 
@@ -160,24 +439,6 @@ pub struct EmailMineRequest {
 
 /// RAII holder for the `email_mining` single-flight slot (R-01).
 ///
-/// `start_email_mining` has several exits — a database error while loading the
-/// targets, the "nothing to mine" case, a worker that finishes normally or
-/// panics, even a failure of `thread::spawn` itself. Clearing the slot by hand
-/// on each path is exactly how the database-error path ended up leaking it and
-/// locking mining until the next restart. Holding the release in `Drop` makes
-/// every path release by construction.
-struct MiningSlotGuard {
-    app: tauri::AppHandle,
-}
-
-impl Drop for MiningSlotGuard {
-    fn drop(&mut self) {
-        if let Ok(mut slot) = self.app.state::<AppState>().email_mining.lock() {
-            *slot = None;
-        }
-    }
-}
-
 /// Start mining the given scope. Returns the number of distinct domains that
 /// will be visited (rows sharing a website are mined together). Single-flight:
 /// a second run is refused while one is active. `email:progress` events fire
@@ -204,7 +465,7 @@ pub async fn start_email_mining(
     }
     // The guard owns the slot from here on: every `?` below, the empty-target
     // return and the spawned worker all release it on the way out (R-01).
-    let guard = MiningSlotGuard { app: app.clone() };
+    let guard = SlotGuard::new(&app, clear_mining_slot);
 
     let rows: Vec<(String, String)> = {
         let conn = state.db.lock().map_err(|e| e.to_string())?;
@@ -226,9 +487,39 @@ pub async fn start_email_mining(
     let targets = crate::email_miner::group_by_domain(rows);
     let total = targets.len();
     if total == 0 {
-        // Nothing to do: the guard releases the slot, the caller sees 0 sites.
-        log_info!("mining: no unmined targets, slot released");
-        return Ok(0);
+        // Nothing to do — and the caller deserves to know *why*. An empty list
+        // has three different causes, and the panel used to report all of them
+        // as "no rows with a website", which is plainly wrong when the row has
+        // one and was simply mined before (C-15).
+        let filter = request
+            .filter
+            .as_ref()
+            .filter(|_| request.place_ids.is_empty())
+            .map(|request| request.filter());
+        let ids = (!request.place_ids.is_empty()).then_some(request.place_ids.as_slice());
+        let summary = {
+            let conn = state.db.lock().map_err(|e| e.to_string())?;
+            crate::db::mining_scope_summary(&conn, ids, filter.as_ref())
+                .map_err(|e| e.to_string())?
+        };
+        let code = if summary.with_website == 0 {
+            "nothing_to_mine:no_website"
+        } else if summary.already_mined == summary.with_website {
+            "nothing_to_mine:already_mined"
+        } else {
+            // The rows have websites and were never mined, yet produced no
+            // target: `site_candidates` dropped every URL (private host, bad
+            // scheme, unparsable). Worth saying out loud instead of blaming a
+            // missing website.
+            "nothing_to_mine:unusable_website"
+        };
+        log_info!(
+            "mining: no targets ({}; {} row(s) with a website, {} already mined), slot released",
+            code,
+            summary.with_website,
+            summary.already_mined
+        );
+        return Err(code.to_string());
     }
 
     let rules = state
@@ -485,20 +776,25 @@ fn tidy_spaces(value: &mut String) -> bool {
     }
 }
 
-/// Normalize a batch of rows in place: phones toward E.164, the NAP text
-/// fields whitespace-tidied. Idempotent and read-path only — the raw values
-/// stay in SQLite, every consumer (table pages, selections, all four export
-/// formats) sees the clean form, and rows collected before G-16 heal on sight.
+/// Normalize one row in place: phones toward E.164, the NAP text fields
+/// whitespace-tidied. Idempotent and read-path only — the raw values stay in
+/// SQLite, every consumer (table pages, selections, all export formats) sees
+/// the clean form, and rows collected before G-16 heal on sight.
+fn normalize_nap_row(business: &mut Business, map_region: &str) {
+    business.phone = normalize_phone_e164(&business.phone, Some(map_region));
+    tidy_spaces(&mut business.address);
+    tidy_spaces(&mut business.street);
+    tidy_spaces(&mut business.city);
+    tidy_spaces(&mut business.state);
+    tidy_spaces(&mut business.postal_code);
+    tidy_spaces(&mut business.country);
+    tidy_spaces(&mut business.borough);
+}
+
+/// The batch form, for callers that already hold the rows.
 fn normalize_nap_rows(rows: &mut [Business], map_region: &str) {
     for business in rows.iter_mut() {
-        business.phone = normalize_phone_e164(&business.phone, Some(map_region));
-        tidy_spaces(&mut business.address);
-        tidy_spaces(&mut business.street);
-        tidy_spaces(&mut business.city);
-        tidy_spaces(&mut business.state);
-        tidy_spaces(&mut business.postal_code);
-        tidy_spaces(&mut business.country);
-        tidy_spaces(&mut business.borough);
+        normalize_nap_row(business, map_region);
     }
 }
 
@@ -568,15 +864,83 @@ pub fn selected_businesses(
     Ok(rows)
 }
 
-/// Rows to export: an explicit selection, or everything matching the filters.
+/// Where an export's rows come from (P2-12).
 ///
-/// The filter path reads from SQLite in one go — export is an explicit "give me
-/// everything" action, and the panel never holds those rows.
-fn resolve_export_rows(
+/// An explicit selection is already in memory and bounded by what the panel can
+/// hold. A filter is counted before the save dialog and then *streamed* from a
+/// dedicated read-only connection: the shared `state.db` mutex is never held
+/// during the scan, so the panel and the collector keep working while a large
+/// file is written.
+enum ExportSource {
+    Rows(Vec<Business>),
+    Query {
+        request: BusinessQueryRequest,
+        db_path: std::path::PathBuf,
+        /// The `map_region` snapshot, taken before the dialog so the stream
+        /// normalizes exactly like the table does.
+        region: String,
+    },
+}
+
+impl ExportSource {
+    /// How many rows the export will write, without materializing them.
+    fn count(&self) -> Result<usize, String> {
+        match self {
+            Self::Rows(rows) => Ok(rows.len()),
+            Self::Query {
+                request, db_path, ..
+            } => {
+                let conn = db::open_read_connection(db_path)
+                    .map_err(|error| format!("Failed to open the export snapshot: {}", error))?;
+                let total = db::count_businesses_filtered(&conn, &request.filter())
+                    .map_err(|error| error.to_string())?;
+                usize::try_from(total.max(0))
+                    .map_err(|_| "the export row count does not fit this build".to_string())
+            }
+        }
+    }
+
+    /// Visit every row exactly once, in the export's order.
+    fn for_each<F>(&self, mut visit: F) -> Result<usize, String>
+    where
+        F: FnMut(&Business) -> Result<(), String>,
+    {
+        match self {
+            Self::Rows(rows) => {
+                for row in rows {
+                    visit(row)?;
+                }
+                Ok(rows.len())
+            }
+            Self::Query {
+                request,
+                db_path,
+                region,
+            } => {
+                let conn = db::open_read_connection(db_path)
+                    .map_err(|error| format!("Failed to open the export snapshot: {}", error))?;
+                db::stream_businesses_filtered(
+                    &conn,
+                    &request.filter(),
+                    &request.sort(),
+                    |mut business| {
+                        // G-16: the export heals legacy rows exactly like the
+                        // table, one row at a time.
+                        normalize_nap_row(&mut business, region);
+                        visit(&business)
+                    },
+                )
+            }
+        }
+    }
+}
+
+/// Resolve the export source: an explicit selection, or a filter to stream.
+fn prepare_export_source(
     state: &AppState,
     businesses: Vec<Business>,
     filter: Option<BusinessQueryRequest>,
-) -> Result<Vec<Business>, String> {
+) -> Result<ExportSource, String> {
     // R-35: the panel sends exactly one of the two. Preferring the rows when
     // both arrived used to be silent, which is how "export all filtered" could
     // ship a single page without anyone noticing.
@@ -589,22 +953,16 @@ fn resolve_export_rows(
         // snapshot must not leak raw values into a file.
         let mut businesses = businesses;
         normalize_nap_rows(&mut businesses, &region_for_normalization(state));
-        return Ok(businesses);
+        return Ok(ExportSource::Rows(businesses));
     }
-    let Some(filter) = filter else {
+    let Some(request) = filter else {
         return Err("Nothing to export".to_string());
     };
-    let conn = state.db.lock().map_err(|e| e.to_string())?;
-    let mut rows = db::load_businesses_filtered(&conn, &filter.filter(), &filter.sort())
-        .map_err(|e| e.to_string())?;
-    drop(conn);
-    if rows.is_empty() {
-        return Err("Nothing to export".to_string());
-    }
-    // G-16: the "everything matching" path reads straight from SQLite, so this
-    // is where legacy rows heal before any of the four writers touches them.
-    normalize_nap_rows(&mut rows, &region_for_normalization(state));
-    Ok(rows)
+    Ok(ExportSource::Query {
+        request,
+        db_path: std::path::PathBuf::from(&state.db_path),
+        region: region_for_normalization(state),
+    })
 }
 
 /// One job row, or the error the panel already understands (R-35).
@@ -704,6 +1062,17 @@ fn is_reserved_windows_name(stem: &str) -> bool {
 fn remember_export(app: &tauri::AppHandle, path: &std::path::Path) -> String {
     let absolute = path.to_string_lossy().to_string();
     let state = app.state::<AppState>();
+
+    // P2-11: this is a read-modify-write on the settings row, exactly like
+    // `update_settings`; the shared write lock keeps one from overwriting the
+    // other's fields.
+    let _write = match state.settings_write.lock() {
+        Ok(guard) => guard,
+        Err(error) => {
+            log_warn!("settings write lock unavailable after export: {}", error);
+            return absolute;
+        }
+    };
 
     let updated = {
         // R-25: the file is already on disk, so this is a degraded follow-up
@@ -1091,7 +1460,7 @@ const EXPORT_COLUMNS: [ExportColumn; 32] = [
 /// The columns an export keeps, given the panel's visible table keys.
 ///
 /// `None` (the parameter was not sent — an older panel, or a caller that does
-/// not care) exports all 28. A column whose `table_key` is `None` always
+/// not care) exports every column. A column whose `table_key` is `None` always
 /// survives; the rest survive exactly when their table column is visible.
 fn resolve_export_columns(visible_keys: Option<&[String]>) -> Vec<&'static ExportColumn> {
     match visible_keys {
@@ -1362,7 +1731,14 @@ pub async fn export_csv(
     save_as: Option<bool>,
     visible_keys: Option<Vec<String>>,
 ) -> Result<Option<String>, String> {
-    let businesses = resolve_export_rows(state.inner(), businesses, filter)?;
+    let _export = claim_export(&state.export_in_flight)?;
+    // P2-12: count now, stream after the dialog. The pre-count keeps the
+    // "nothing to export" answer ahead of a save prompt; the scan itself runs
+    // on its own read-only connection, so the shared connection stays free.
+    let source = prepare_export_source(state.inner(), businesses, filter)?;
+    if source.count()? == 0 {
+        return Err("Nothing to export".to_string());
+    }
 
     // Snapshot the settings: the dialog below blocks, and holding the lock
     // across it would stall every other settings command.
@@ -1377,9 +1753,9 @@ pub async fn export_csv(
         .map_err(|error| format!("settings_unavailable: {}", error))?;
 
     // M10: the columns the panel still shows (the hiddenColumns↔export
-    // linkage) under the preset's names. Unsent `visible_keys` = all 28.
+    // linkage) under the preset's names. Unsent `visible_keys` = every column.
     let columns = resolve_export_columns(visible_keys.as_deref());
-    let headers: Vec<&str> = columns
+    let headers: Vec<&'static str> = columns
         .iter()
         .map(|column| column_header(column, &settings.export_preset))
         .collect();
@@ -1399,53 +1775,43 @@ pub async fn export_csv(
 
     // R-04: write to a temp sibling and rename, so a failure mid-write (disk
     // full, antivirus lock, drive gone) leaves no half-written file behind —
-    // and never truncates the file the user just confirmed to replace.
+    // and never truncates the file the user just confirmed to replace. The
+    // whole write runs on the blocking pool: a 100k-row file must not stall
+    // the async runtime the panel's commands share.
     let temp_path = sibling_temp_path(&file_path);
-    let write_result: Result<(), String> = (|| {
-        // The BOM is what makes Excel read the file as UTF-8 instead of the ANSI code
-        // page, which is the whole "Chinese turns into garbage" bug. It has to be
-        // written before the csv writer takes ownership of the handle.
-        let mut file = std::fs::File::create(&temp_path).map_err(|e| e.to_string())?;
-        if csv_bom {
-            use std::io::Write;
-            file.write_all(&[0xEF, 0xBB, 0xBF])
-                .map_err(|e| e.to_string())?;
-        }
-        let mut wtr = csv::Writer::from_writer(file);
+    let write_file = file_path.clone();
+    let count = tauri::async_runtime::spawn_blocking(move || {
+        let write_result: Result<usize, String> = (|| {
+            // The BOM is what makes Excel read the file as UTF-8 instead of the ANSI code
+            // page, which is the whole "Chinese turns into garbage" bug. It has to be
+            // written before the csv writer takes ownership of the handle.
+            let mut file = std::fs::File::create(&temp_path).map_err(|e| e.to_string())?;
+            if csv_bom {
+                use std::io::Write;
+                file.write_all(&[0xEF, 0xBB, 0xBF])
+                    .map_err(|e| e.to_string())?;
+            }
+            let mut wtr = csv::Writer::from_writer(file);
+            wtr.write_record(&headers).map_err(|e| e.to_string())?;
+            let count = source.for_each(|b| {
+                let cells: Vec<String> = columns
+                    .iter()
+                    .map(|column| csv_cell(&export_value(b, column.key)))
+                    .collect();
+                wtr.write_record(cells.iter().map(String::as_str))
+                    .map_err(|e| e.to_string())
+            })?;
+            wtr.flush().map_err(|e| e.to_string())?;
+            Ok(count)
+        })();
+        finish_export(&temp_path, &write_file, may_overwrite, write_result)
+    })
+    .await
+    .map_err(|error| format!("the export task failed: {}", error))??;
 
-        wtr.write_record(&headers)
-            .map_err(|e| e.to_string())?;
-
-        for b in &businesses {
-            let cells: Vec<String> = columns
-                .iter()
-                .map(|column| csv_cell(&export_value(b, column.key)))
-                .collect();
-            wtr.write_record(cells.iter().map(String::as_str))
-                .map_err(|e| e.to_string())?;
-        }
-        wtr.flush().map_err(|e| e.to_string())?;
-        drop(wtr);
-        Ok(())
-    })();
-
-    if let Err(error) = write_result {
-        let _ = std::fs::remove_file(&temp_path);
-        if !may_overwrite {
-            // Drop the empty file `unique_export_path` claimed: a failed
-            // silent export must not leave a stub behind (R-27).
-            let _ = std::fs::remove_file(&file_path);
-        }
-        return Err(error);
-    }
-
-    std::fs::rename(&temp_path, &file_path).map_err(|e| {
-        let _ = std::fs::remove_file(&temp_path);
-        if !may_overwrite {
-            let _ = std::fs::remove_file(&file_path);
-        }
-        e.to_string()
-    })?;
+    let Some(count) = count else {
+        return Err("Nothing to export".to_string());
+    };
 
     let exported = remember_export(&app, &file_path);
     reveal_after_export(&settings, &file_path);
@@ -1454,7 +1820,7 @@ pub async fn export_csv(
         "export:completed",
         ExportCompleted {
             path: exported.clone(),
-            count: businesses.len(),
+            count,
             format: "csv".to_string(),
             // Every cell goes through `csv::Writer`, whose errors abort the
             // export instead of being skipped: nothing to report here.
@@ -1483,6 +1849,11 @@ const REVIEWS_EXPORT_HEADERS: [&str; 12] = [
     "Channel",
     "Fetched At",
 ];
+
+/// Excel's hard limit for one sheet is 1,048,576 rows, header included. A
+/// longer export used to fail cell by cell and still report the original row
+/// count; reject it before asking for a path instead.
+const EXCEL_MAX_DATA_ROWS: usize = 1_048_575;
 
 /// One reviews-export row as strings, in `REVIEWS_EXPORT_HEADERS` order.
 fn review_export_cells(row: &db::ReviewExportRow) -> Vec<String> {
@@ -1525,6 +1896,8 @@ pub async fn export_reviews_csv(
     file_name: Option<String>,
     save_as: Option<bool>,
 ) -> Result<Option<String>, String> {
+    let _export = claim_export(&state.export_in_flight)?;
+
     let rows = resolve_review_export_rows(state.inner(), place_id.as_deref())?;
     if rows.is_empty() {
         return Err("nothing_to_export".to_string());
@@ -1627,9 +2000,13 @@ pub async fn export_reviews_excel(
 ) -> Result<Option<String>, String> {
     use rust_xlsxwriter::*;
 
+    let _export = claim_export(&state.export_in_flight)?;
     let rows = resolve_review_export_rows(state.inner(), place_id.as_deref())?;
     if rows.is_empty() {
         return Err("nothing_to_export".to_string());
+    }
+    if rows.len() > EXCEL_MAX_DATA_ROWS {
+        return Err(format!("excel_row_limit:{}", rows.len()));
     }
 
     let file_name = match file_name.as_deref() {
@@ -1767,7 +2144,18 @@ pub async fn export_excel(
 ) -> Result<Option<String>, String> {
     use rust_xlsxwriter::*;
 
-    let businesses = resolve_export_rows(state.inner(), businesses, filter)?;
+    let _export = claim_export(&state.export_in_flight)?;
+    // P2-12: the pre-count applies the Excel row limit before a save dialog
+    // opens, and the sheet is then filled from the stream — the table is never
+    // materialized as a second in-memory copy of every row.
+    let source = prepare_export_source(state.inner(), businesses, filter)?;
+    let total = source.count()?;
+    if total == 0 {
+        return Err("Nothing to export".to_string());
+    }
+    if total > EXCEL_MAX_DATA_ROWS {
+        return Err(format!("excel_row_limit:{}", total));
+    }
 
     // R-25: same as the CSV path — a poisoned settings lock must abort the
     // export, not silently write the file with built-in defaults.
@@ -1780,7 +2168,7 @@ pub async fn export_excel(
     // M10: the same resolved columns and preset names the CSV path uses, so
     // the two formats can never disagree about what a column means.
     let columns = resolve_export_columns(visible_keys.as_deref());
-    let headers: Vec<&str> = columns
+    let headers: Vec<&'static str> = columns
         .iter()
         .map(|column| column_header(column, &settings.export_preset))
         .collect();
@@ -1798,104 +2186,143 @@ pub async fn export_excel(
         return Ok(None);
     };
 
-    let mut workbook = Workbook::new();
-    let worksheet = workbook.add_worksheet();
-
-    let header_format = Format::new().set_bold().set_background_color(Color::RGB(0xEFF3FF));
-    for (col, h) in headers.iter().enumerate() {
-        worksheet
-            .write_string_with_format(0, col as u16, *h, &header_format)
-            .map_err(|e| e.to_string())?;
-    }
-
-    // R-25: `write_string` rejects what Excel cannot hold (a value past the
-    // 32 767-character cell limit, a stray control character scraped from a
-    // listing). Those errors used to be discarded, so the export reported a
-    // clean file while silently missing cells. Count them and report both the
-    // row count and the first error.
-    let mut failed_cells = 0usize;
-    let mut failed_rows = 0usize;
-    let mut first_error: Option<String> = None;
-
-    for (row, b) in businesses.iter().enumerate() {
-        let r = (row + 1) as u32;
-        let mut row_failed = false;
-        for (col, column) in columns.iter().enumerate() {
-            // The numeric columns are the four values the app produces, not
-            // scraped text — `write_number` keeps them right-aligned. Every
-            // other cell is a string — `write_string` writes a real string
-            // cell, which Excel never re-evaluates, so the CSV
-            // formula-injection escaping does not apply here (R-03).
-            let cell = export_value(b, column.key);
-            let written = if column.numeric {
-                match cell.parse::<f64>() {
-                    Ok(number) => worksheet.write_number(r, col as u16, number).map(|_| ()),
-                    Err(_) => worksheet.write_string(r, col as u16, &cell).map(|_| ()),
-                }
-            } else {
-                worksheet.write_string(r, col as u16, &cell).map(|_| ())
-            };
-            if let Err(error) = written {
-                failed_cells += 1;
-                row_failed = true;
-                if first_error.is_none() {
-                    first_error = Some(format!("row {}, column {}: {}", r + 1, col + 1, error));
-                }
-            }
-        }
-        if row_failed {
-            failed_rows += 1;
-        }
-    }
-
-    // Column widths travel with the column key, not the position: after the
-    // hiddenColumns linkage drops columns, the fixed indices would dress the
-    // wrong headers.
-    const COLUMN_WIDTHS: [(&str, f64); 10] = [
-        ("name", 32.0),
-        ("address", 46.0),
-        ("phone", 20.0),
-        ("website", 32.0),
-        ("place_id", 34.0),
-        ("collected_at", 17.0),
-        ("source_query", 24.0),
-        ("emails", 28.0),
-        ("socials", 28.0),
-        ("email_source_url", 30.0),
-    ];
-    for (col, column) in columns.iter().enumerate() {
-        if let Some((_, width)) = COLUMN_WIDTHS.iter().find(|(key, _)| *key == column.key) {
-            let _ = worksheet.set_column_width(col as u16, *width);
-        }
-    }
-    worksheet.set_freeze_panes(1, 0).map_err(|e| e.to_string())?;
-
-    // R-04: same temp-then-rename as the CSV writer — a failed `save` must
-    // not leave a corrupt workbook, and must not destroy the file the user
-    // confirmed to replace before the new content is complete.
+    // The workbook is built and saved on the blocking pool: filling a large
+    // sheet is CPU-bound and must not occupy an async-runtime worker.
     let temp_path = sibling_temp_path(&file_path);
-    if let Err(error) = workbook.save(&temp_path).map_err(|e| e.to_string()) {
-        let _ = std::fs::remove_file(&temp_path);
-        if !may_overwrite {
-            let _ = std::fs::remove_file(&file_path);
-        }
-        return Err(error);
-    }
-    std::fs::rename(&temp_path, &file_path).map_err(|e| {
-        let _ = std::fs::remove_file(&temp_path);
-        if !may_overwrite {
-            let _ = std::fs::remove_file(&file_path);
-        }
-        e.to_string()
-    })?;
+    let write_file = file_path.clone();
+    let (count, failed_cells, failed_rows, first_error) =
+        tauri::async_runtime::spawn_blocking(move || {
+            let mut workbook = Workbook::new();
+
+            // R-25: `write_string` rejects what Excel cannot hold (a value past
+            // the 32 767-character cell limit, a stray control character
+            // scraped from a listing). Those errors used to be discarded, so
+            // the export reported a clean file while silently missing cells.
+            // Count them and report both the row count and the first error.
+            let mut failed_cells = 0usize;
+            let mut failed_rows = 0usize;
+            let mut first_error: Option<String> = None;
+
+            let write_result: Result<usize, String> = (|| {
+                // The worksheet borrow ends with this block so the workbook can
+                // be saved below; keeping it alive across `save` is a double
+                // mutable borrow.
+                let count = {
+                    let worksheet = workbook.add_worksheet();
+
+                    let header_format = Format::new()
+                        .set_bold()
+                        .set_background_color(Color::RGB(0xEFF3FF));
+                    for (col, h) in headers.iter().enumerate() {
+                        worksheet
+                            .write_string_with_format(0, col as u16, *h, &header_format)
+                            .map_err(|e| e.to_string())?;
+                    }
+
+                    let mut rows_written = 0usize;
+                    let count = source.for_each(|b| {
+                        // The pre-count and the scan are not one transaction: a
+                        // collector batch can land in between. Stop at Excel's
+                        // own limit instead of writing rows the format rejects.
+                        if rows_written >= EXCEL_MAX_DATA_ROWS {
+                            return Err(format!("excel_row_limit:{}", rows_written + 1));
+                        }
+                        let r = (rows_written + 1) as u32;
+                        rows_written += 1;
+                        let mut row_failed = false;
+                        for (col, column) in columns.iter().enumerate() {
+                            // The numeric columns are the four values the app
+                            // produces, not scraped text — `write_number` keeps
+                            // them right-aligned. Every other cell is a string —
+                            // `write_string` writes a real string cell, which
+                            // Excel never re-evaluates, so the CSV
+                            // formula-injection escaping does not apply here
+                            // (R-03).
+                            let cell = export_value(b, column.key);
+                            let written = if column.numeric {
+                                match cell.parse::<f64>() {
+                                    Ok(number) => {
+                                        worksheet.write_number(r, col as u16, number).map(|_| ())
+                                    }
+                                    Err(_) => {
+                                        worksheet.write_string(r, col as u16, &cell).map(|_| ())
+                                    }
+                                }
+                            } else {
+                                worksheet.write_string(r, col as u16, &cell).map(|_| ())
+                            };
+                            if let Err(error) = written {
+                                failed_cells += 1;
+                                row_failed = true;
+                                if first_error.is_none() {
+                                    first_error = Some(format!(
+                                        "row {}, column {}: {}",
+                                        r + 1,
+                                        col + 1,
+                                        error
+                                    ));
+                                }
+                            }
+                        }
+                        if row_failed {
+                            failed_rows += 1;
+                        }
+                        Ok(())
+                    })?;
+
+                    // Column widths travel with the column key, not the
+                    // position: after the hiddenColumns linkage drops columns,
+                    // the fixed indices would dress the wrong headers.
+                    const COLUMN_WIDTHS: [(&str, f64); 10] = [
+                        ("name", 32.0),
+                        ("address", 46.0),
+                        ("phone", 20.0),
+                        ("website", 32.0),
+                        ("place_id", 34.0),
+                        ("collected_at", 17.0),
+                        ("source_query", 24.0),
+                        ("emails", 28.0),
+                        ("socials", 28.0),
+                        ("email_source_url", 30.0),
+                    ];
+                    for (col, column) in columns.iter().enumerate() {
+                        if let Some((_, width)) =
+                            COLUMN_WIDTHS.iter().find(|(key, _)| *key == column.key)
+                        {
+                            let _ = worksheet.set_column_width(col as u16, *width);
+                        }
+                    }
+                    worksheet.set_freeze_panes(1, 0).map_err(|e| e.to_string())?;
+                    count
+                };
+
+                // R-04: same temp-then-rename as the CSV writer — a failed
+                // `save` must not leave a corrupt workbook, and must not
+                // destroy the file the user confirmed to replace.
+                workbook.save(&temp_path).map_err(|e| e.to_string())?;
+                Ok(count)
+            })();
+
+            let settled = finish_export(&temp_path, &write_file, may_overwrite, write_result);
+            match settled {
+                Ok(count) => Ok((count, failed_cells, failed_rows, first_error)),
+                Err(error) => Err(error),
+            }
+        })
+        .await
+        .map_err(|error| format!("the export task failed: {}", error))??;
+
+    let Some(count) = count else {
+        return Err("Nothing to export".to_string());
+    };
 
     // R-25: a workbook with holes must leave a trace where the user can find it
     // (diagnostics drawer) and in the event, not only in the terminal.
     if failed_cells > 0 {
         let note = format!(
             "Excel export wrote {} of {} row(s); {} cell(s) were rejected (first: {})",
-            businesses.len().saturating_sub(failed_rows),
-            businesses.len(),
+            count.saturating_sub(failed_rows),
+            count,
             failed_cells,
             first_error.unwrap_or_else(|| "unknown error".to_string())
         );
@@ -1910,7 +2337,7 @@ pub async fn export_excel(
         "export:completed",
         ExportCompleted {
             path: exported.clone(),
-            count: businesses.len(),
+            count,
             format: "xlsx".to_string(),
             failed_rows,
         },
@@ -1919,30 +2346,46 @@ pub async fn export_excel(
     Ok(Some(exported))
 }
 
-/// R-04 tail shared by the JSON writers: move the temp file into place the
-/// way the CSV path does — a failure mid-write or mid-rename leaves no
-/// half-written file behind, and never destroys the file the user confirmed
-/// to replace before the new content was complete.
-fn commit_temp_file(
+/// R-04 / P2-12 tail shared by the streaming writers: move the temp file into
+/// place, or clean up after a failed or empty scan.
+///
+/// A failure mid-write or mid-rename leaves no half-written file behind, and
+/// never destroys the file the user confirmed to replace before the new content
+/// was complete. `Ok(None)` means the scan produced zero rows (a clear or a
+/// filter change landed between the pre-count and the scan): the temp file is
+/// dropped and, for a silent export, so is the placeholder `unique_export_path`
+/// claimed — but an existing file from the dialog stays untouched.
+fn finish_export(
     temp_path: &std::path::Path,
     file_path: &std::path::Path,
     may_overwrite: bool,
-    write_result: Result<(), String>,
-) -> Result<(), String> {
-    if let Err(error) = write_result {
+    write_result: Result<usize, String>,
+) -> Result<Option<usize>, String> {
+    let count = match write_result {
+        Ok(count) => count,
+        Err(error) => {
+            let _ = std::fs::remove_file(temp_path);
+            if !may_overwrite {
+                let _ = std::fs::remove_file(file_path);
+            }
+            return Err(error);
+        }
+    };
+    if count == 0 {
         let _ = std::fs::remove_file(temp_path);
         if !may_overwrite {
             let _ = std::fs::remove_file(file_path);
         }
-        return Err(error);
+        return Ok(None);
     }
-    std::fs::rename(temp_path, file_path).map_err(|e| {
+    std::fs::rename(temp_path, file_path).map_err(|error| {
         let _ = std::fs::remove_file(temp_path);
         if !may_overwrite {
             let _ = std::fs::remove_file(file_path);
         }
-        e.to_string()
-    })
+        error.to_string()
+    })?;
+    Ok(Some(count))
 }
 
 /// Export to JSON (M10 / G-11): an array of row objects, keys under the
@@ -1958,7 +2401,12 @@ pub async fn export_json(
     save_as: Option<bool>,
     visible_keys: Option<Vec<String>>,
 ) -> Result<Option<String>, String> {
-    let businesses = resolve_export_rows(state.inner(), businesses, filter)?;
+    let _export = claim_export(&state.export_in_flight)?;
+    let source = prepare_export_source(state.inner(), businesses, filter)?;
+    let expected = source.count()?;
+    if expected == 0 {
+        return Err("Nothing to export".to_string());
+    }
 
     let settings = state
         .settings
@@ -1980,26 +2428,39 @@ pub async fn export_json(
         return Ok(None);
     };
 
-    // R-04: same temp-then-rename as the CSV writer — and deliberately no
-    // BOM: strict JSON parsers reject one. The array streams row by row, so
-    // the rows never materialize as one giant string.
+    // R-04 / P2-12: same temp-then-rename as the CSV writer — and deliberately
+    // no BOM: strict JSON parsers reject one. Rows are streamed straight into
+    // the serializer on the blocking pool, so neither the whole table nor one
+    // giant string is ever resident.
     let temp_path = sibling_temp_path(&file_path);
-    let write_result = (|| {
-        use serde::ser::{SerializeSeq, Serializer};
-        let file = std::fs::File::create(&temp_path).map_err(|e| e.to_string())?;
-        let mut serializer = serde_json::Serializer::pretty(file);
-        let mut seq = serializer
-            .serialize_seq(Some(businesses.len()))
-            .map_err(|e| e.to_string())?;
-        for b in &businesses {
-            let object = export_row_object(b, &columns, &settings.export_preset);
-            seq.serialize_element(&object).map_err(|e| e.to_string())?;
-        }
-        seq.end().map_err(|e| e.to_string())?;
-        Ok(())
-    })();
+    let write_file = file_path.clone();
+    let preset = settings.export_preset.clone();
+    let count = tauri::async_runtime::spawn_blocking(move || {
+        let write_result: Result<usize, String> = (|| {
+            use serde::ser::{SerializeSeq, Serializer};
+            let file = std::fs::File::create(&temp_path).map_err(|e| e.to_string())?;
+            let mut serializer = serde_json::Serializer::pretty(file);
+            // The pre-count is a capacity hint only: a row added between the
+            // count and the scan still serializes, and a row removed does not
+            // leave a hole.
+            let mut seq = serializer
+                .serialize_seq(Some(expected))
+                .map_err(|e| e.to_string())?;
+            let count = source.for_each(|b| {
+                let object = export_row_object(b, &columns, &preset);
+                seq.serialize_element(&object).map_err(|e| e.to_string())
+            })?;
+            seq.end().map_err(|e| e.to_string())?;
+            Ok(count)
+        })();
+        finish_export(&temp_path, &write_file, may_overwrite, write_result)
+    })
+    .await
+    .map_err(|error| format!("the export task failed: {}", error))??;
 
-    commit_temp_file(&temp_path, &file_path, may_overwrite, write_result)?;
+    let Some(count) = count else {
+        return Err("Nothing to export".to_string());
+    };
 
     let exported = remember_export(&app, &file_path);
     reveal_after_export(&settings, &file_path);
@@ -2008,7 +2469,7 @@ pub async fn export_json(
         "export:completed",
         ExportCompleted {
             path: exported.clone(),
-            count: businesses.len(),
+            count,
             format: "json".to_string(),
             // serde_json errors abort the export, nothing is skipped.
             failed_rows: 0,
@@ -2031,7 +2492,11 @@ pub async fn export_jsonl(
     save_as: Option<bool>,
     visible_keys: Option<Vec<String>>,
 ) -> Result<Option<String>, String> {
-    let businesses = resolve_export_rows(state.inner(), businesses, filter)?;
+    let _export = claim_export(&state.export_in_flight)?;
+    let source = prepare_export_source(state.inner(), businesses, filter)?;
+    if source.count()? == 0 {
+        return Err("Nothing to export".to_string());
+    }
 
     let settings = state
         .settings
@@ -2053,21 +2518,32 @@ pub async fn export_jsonl(
         return Ok(None);
     };
 
+    // P2-12: one row in, one line out — the stream never holds more than the
+    // row being written, and the whole loop runs off the async runtime.
     let temp_path = sibling_temp_path(&file_path);
-    let write_result = (|| {
-        use std::io::Write as _;
-        let file = std::fs::File::create(&temp_path).map_err(|e| e.to_string())?;
-        let mut writer = std::io::BufWriter::new(file);
-        for b in &businesses {
-            let object = export_row_object(b, &columns, &settings.export_preset);
-            serde_json::to_writer(&mut writer, &object).map_err(|e| e.to_string())?;
-            writer.write_all(b"\n").map_err(|e| e.to_string())?;
-        }
-        writer.flush().map_err(|e| e.to_string())?;
-        Ok(())
-    })();
+    let write_file = file_path.clone();
+    let preset = settings.export_preset.clone();
+    let count = tauri::async_runtime::spawn_blocking(move || {
+        let write_result: Result<usize, String> = (|| {
+            use std::io::Write as _;
+            let file = std::fs::File::create(&temp_path).map_err(|e| e.to_string())?;
+            let mut writer = std::io::BufWriter::new(file);
+            let count = source.for_each(|b| {
+                let object = export_row_object(b, &columns, &preset);
+                serde_json::to_writer(&mut writer, &object).map_err(|e| e.to_string())?;
+                writer.write_all(b"\n").map_err(|e| e.to_string())
+            })?;
+            writer.flush().map_err(|e| e.to_string())?;
+            Ok(count)
+        })();
+        finish_export(&temp_path, &write_file, may_overwrite, write_result)
+    })
+    .await
+    .map_err(|error| format!("the export task failed: {}", error))??;
 
-    commit_temp_file(&temp_path, &file_path, may_overwrite, write_result)?;
+    let Some(count) = count else {
+        return Err("Nothing to export".to_string());
+    };
 
     let exported = remember_export(&app, &file_path);
     reveal_after_export(&settings, &file_path);
@@ -2076,7 +2552,7 @@ pub async fn export_jsonl(
         "export:completed",
         ExportCompleted {
             path: exported.clone(),
-            count: businesses.len(),
+            count,
             format: "jsonl".to_string(),
             failed_rows: 0,
         },
@@ -2106,24 +2582,72 @@ pub fn clear_data(
     // user just emptied — and the job's own counts would silently disagree with
     // the rows. Pausing is the supported way to stop a task; the panel offers
     // "resume" on the card.
-    let paused = {
-        let conn = state.db.lock().map_err(|e| e.to_string())?;
-        let running = db::running_job_id(&conn).map_err(|e| e.to_string())?;
-        if let Some(id) = running {
-            db::set_job_status(&conn, &id, "paused").map_err(|e| e.to_string())?;
-            // The runner may be mid-tile; put it back so resume redoes it.
-            db::reset_running_tiles(&conn, &id).map_err(|e| e.to_string())?;
-            Some(id)
-        } else {
-            None
-        }
-    };
+    //
+    // P1-4: the switch goes off *before* the snapshot, and the epoch is bumped
+    // in the same breath. That ordering matters: while the switch was still on
+    // (and for the 3 s grace after it), a batch that had already been parsed was
+    // admitted and written into the table that had just been emptied. The page
+    // learns the new epoch from the same eval that stops it, so anything it
+    // produced earlier is refused by `store_businesses` instead of landing here.
+    let epoch = state
+        .collection_epoch
+        .fetch_add(1, Ordering::AcqRel)
+        .wrapping_add(1);
+    log_info!("clear: collection epoch -> {}", epoch);
+    if let Err(error) = apply_listening(&app, state.inner(), false) {
+        log_warn!("clear_data: could not stop the collector switch: {}", error);
+    }
 
-    let captured = {
+    // C-05: the pause and the snapshot share one lock on purpose. Split across
+    // two, a `start_job` that flipped a job to `running` between them survived
+    // the clear and kept collecting into the emptied table.
+    let (paused, queued, captured) = {
         let conn = state.db.lock().map_err(|e| e.to_string())?;
-        crate::db::snapshot_for_clear(&conn)
-            .map_err(|e| format!("Failed to snapshot before clearing: {}", e))?
+        let paused = match db::running_job_id(&conn).map_err(|e| e.to_string())? {
+            Some(id) => {
+                db::set_job_status(&conn, &id, "paused").map_err(|e| e.to_string())?;
+                // The runner may be mid-tile; put it back so resume redoes it.
+                db::reset_running_tiles(&conn, &id).map_err(|e| e.to_string())?;
+                Some(id)
+            }
+            None => None,
+        };
+        // P1-4: a queued job is a promise to keep collecting. The worker chains
+        // to it as soon as the current one reaches a terminal state, which
+        // re-arms the switch and refills the table — so the queue is paused with
+        // the same lock that pauses the running job.
+        let queued = db::pause_queued_jobs(&conn).map_err(|e| e.to_string())?;
+        let captured = crate::db::snapshot_for_clear(&conn)
+            .map_err(|e| format!("Failed to snapshot before clearing: {}", e))?;
+        (paused, queued, captured)
     };
+    if queued > 0 {
+        log_info!("clear: {} queued job(s) paused too", queued);
+    }
+    // A probe run belongs to the job that was just paused; keeping the flag
+    // would pause that job again after its very first tile on resume.
+    if let Ok(mut slot) = state.probe_limit.lock() {
+        *slot = None;
+    }
+
+    // C-04: clearing also stops the work that writes without owning the runner.
+    // The enrichment runner would keep navigating the maps pane for minutes
+    // (one page load per place), and the miner would keep hitting websites only
+    // to update rows that no longer exist — both then reporting finds the table
+    // does not contain (C-03 covers the counting side).
+    //
+    // A reviews fetch needs no flag: it owns no rows of its own (the reviews
+    // table is not part of the clear) and its sequence ends by itself.
+    if let Ok(slot) = state.email_mining.lock() {
+        if let Some(cancel) = slot.as_ref() {
+            cancel.store(true, Ordering::Relaxed);
+        }
+    }
+    if let Ok(slot) = state.enrich_job.lock() {
+        if let Some(cancel) = slot.as_ref() {
+            cancel.store(true, Ordering::Relaxed);
+        }
+    }
     if let Ok(mut slot) = state.clear_backup.lock() {
         // An empty table leaves nothing to undo: keeping a snapshot would let a
         // later `undo_clear` report a success that restored zero rows.
@@ -2133,15 +2657,17 @@ pub fn clear_data(
         });
     }
     state.reset_stats();
+    // C-12: the "this session" filter and the header clock start over with the
+    // table — the rows they described are gone.
+    if let Ok(mut started) = state.session_started_at.lock() {
+        *started = None;
+    }
 
     // `clear` is not an idle cell: the scheduler must not treat it as one. The
-    // switch itself is turned off through the single writer, so the page flag,
-    // the localStorage mirror, `state.listening` and the panel all agree —
-    // writing only the in-memory flag used to leave the mirror at '1', and the
-    // next page load resumed collecting into the emptied table.
-    if let Err(error) = apply_listening(&app, state.inner(), false) {
-        log_warn!("clear_data: could not stop the collector switch: {}", error);
-    }
+    // switch was turned off through the single writer before the snapshot, so
+    // the page flag, the localStorage mirror, `state.listening` and the panel
+    // all agree — writing only the in-memory flag used to leave the mirror at
+    // '1', and the next page load resumed collecting into the emptied table.
     if let Some(id) = paused {
         collector::emit_progress(&app, &id);
     }
@@ -2160,33 +2686,47 @@ pub fn undo_clear(
     state: tauri::State<'_, AppState>,
     app: tauri::AppHandle,
 ) -> Result<usize, String> {
-    let backup = {
+    // Read the permit without consuming it: a failed restore must leave the
+    // in-memory undo window usable, otherwise the preserved backup tables are
+    // unreachable and the user's only retry path is gone. The permit is
+    // consumed only after the restore commits.
+    let permit = {
         let mut slot = state.clear_backup.lock().map_err(|e| e.to_string())?;
-        let fresh = slot
-            .as_ref()
-            .map(|backup| backup.cleared_at.elapsed() <= UNDO_CLEAR_WINDOW)
-            .unwrap_or(false);
-        if fresh {
-            slot.take()
-        } else {
-            // Expired or already consumed: drop it so a later call cannot
-            // resurrect stale rows.
-            *slot = None;
-            None
+        match slot.as_ref() {
+            Some(backup) if backup.cleared_at.elapsed() <= UNDO_CLEAR_WINDOW => {
+                Some(backup.clone())
+            }
+            _ => {
+                // Expired or already consumed: drop it so a later call cannot
+                // resurrect stale rows.
+                *slot = None;
+                None
+            }
         }
     };
-    if backup.is_none() {
+    let Some(permit) = permit else {
         return Err(format!(
             "Nothing to undo: the clear window ({} s) has passed",
             UNDO_CLEAR_WINDOW.as_secs()
         ));
-    }
+    };
 
     let restored = {
         let conn = state.db.lock().map_err(|e| e.to_string())?;
         crate::db::restore_clear_snapshot(&conn)
             .map_err(|e| format!("Failed to restore the cleared rows: {}", e))?
     };
+    // Compare the timestamp before clearing: a new clear that landed while the
+    // restore was running owns its own snapshot and must not be dropped here.
+    if let Ok(mut slot) = state.clear_backup.lock() {
+        if slot
+            .as_ref()
+            .map(|backup| backup.cleared_at == permit.cleared_at)
+            .unwrap_or(false)
+        {
+            *slot = None;
+        }
+    }
     // The panel refresh rides the same event as a live batch, but the payload
     // is empty: the rows were never in Rust memory (R-13), and the listener
     // treats an empty batch as "refresh the page" (App.tsx scheduleRefresh).
@@ -2229,6 +2769,13 @@ pub fn set_listening(
     state: tauri::State<'_, AppState>,
     enabled: bool,
 ) -> Result<(), String> {
+    // C-14: turning collection ON is the runner's job (`start_job` arms the
+    // switch). This entry point exists for the e2e fixtures, which run debug
+    // builds; in a release build a free-form enable would start the scroll loop
+    // with no job behind it and fight whichever operation owns the pane.
+    if enabled && !cfg!(debug_assertions) {
+        return Err("listening is runner-owned in release builds".to_string());
+    }
     apply_listening(&app, state.inner(), enabled)?;
 
     if !enabled {
@@ -2271,17 +2818,25 @@ pub(crate) fn apply_listening(
     // asserts the switch (`collector_settings_script`), so the runner's own
     // navigation is what starts collecting, without a stray round on whatever
     // search happened to be open.
-    let js = if enabled {
-        "window.__placemillEnabled = true; try { localStorage.setItem('__placemillEnabled', '1'); } catch (e) {}"
-    } else {
-        "window.__placemillEnabled = false; try { localStorage.setItem('__placemillEnabled', '0'); } catch (e) {} try { window.__placemillAutoScroll.stop('settings'); } catch (e) {} try { window.__placemillSetTileContext(null); } catch (e) {}"
-    };
+    // P1-4: the epoch is asserted together with the switch. Turning the switch
+    // off after a clear must also move the page to the new epoch, or a batch
+    // produced in the next few milliseconds would still carry the old one.
+    let epoch = state.collection_epoch.load(Ordering::Acquire);
+    let js = format!(
+        "window.__placemillEpoch = {}; {}",
+        epoch,
+        if enabled {
+            "window.__placemillEnabled = true; try { localStorage.setItem('__placemillEnabled', '1'); } catch (e) {}"
+        } else {
+            "window.__placemillEnabled = false; try { localStorage.setItem('__placemillEnabled', '0'); } catch (e) {} try { window.__placemillAutoScroll.stop('settings'); } catch (e) {} try { window.__placemillSetTileContext(null); } catch (e) {}"
+        }
+    );
 
     // Best effort: `eval` fails only when the webview is gone (the window is
     // closing). The bookkeeping below is authoritative and must still land.
     match app.get_webview("maps") {
         Some(maps) => {
-            if let Err(error) = maps.eval(js) {
+            if let Err(error) = maps.eval(&js) {
                 log_warn!("apply_listening: eval failed: {}", error);
             }
         }
@@ -2435,6 +2990,22 @@ pub fn plan_grid(
     })
 }
 
+static JOB_ID_SEQ: AtomicU64 = AtomicU64::new(0);
+
+/// A job id that cannot collide with another submit in the same millisecond.
+/// The old `job-{now_ms}-{index}` scheme made two `create_jobs`/`duplicate_job`
+/// calls in the same millisecond hit the primary key and abort a half-inserted
+/// batch (P2-14). The process id keeps two app instances apart; the sequence
+/// keeps calls within one process apart.
+fn next_job_id() -> String {
+    format!(
+        "job-{}-{}-{}",
+        now_ms(),
+        std::process::id(),
+        JOB_ID_SEQ.fetch_add(1, Ordering::Relaxed)
+    )
+}
+
 /// Insert one job per keyword/centre pair, all `queued`.
 ///
 /// The caller starts the first job; the worker then chains through the rest, so
@@ -2477,7 +3048,7 @@ pub fn create_jobs(
         String::new()
     };
     let mut planned = Vec::new();
-    for (index, entry) in request.entries.iter().enumerate() {
+    for entry in &request.entries {
         let keyword = entry.keyword.trim().to_string();
         if keyword.is_empty() {
             return Err("keyword_required".to_string());
@@ -2494,40 +3065,47 @@ pub fn create_jobs(
         } else {
             format!("{} · {} · {}", keyword, city, name_stamp)
         };
-        planned.push((format!("job-{}-{}", stamp, index), keyword, name, plan));
+        planned.push((next_job_id(), keyword, name, plan));
+    }
+
+    // Build the whole batch before touching the database, then insert it in one
+    // transaction. A failure on the N-th row now leaves no jobs behind instead
+    // of a half-created queue.
+    let mut batch: Vec<(db::NewJob<'_>, Vec<db::NewTile>)> = Vec::with_capacity(planned.len());
+    for (index, (id, keyword, name, plan)) in planned.iter().enumerate() {
+        let entry = &request.entries[index];
+        let job = db::NewJob {
+            id,
+            name,
+            batch_id: &batch_id,
+            keyword,
+            city: entry.city.trim(),
+            center_lat: entry.center_lat,
+            center_lng: entry.center_lng,
+            radius_km: request.radius_km,
+            cell_km: plan.cell_km,
+            split_threshold,
+            locale: &locale_query,
+        };
+        let tiles: Vec<db::NewTile> = plan
+            .tiles
+            .iter()
+            .map(|tile| db::NewTile {
+                id: format!("{}-{}", id, tile.id),
+                seq: tile.seq,
+                lat: tile.lat,
+                lng: tile.lng,
+                zoom: tile.zoom,
+            })
+            .collect();
+        batch.push((job, tiles));
     }
 
     let mut created = Vec::new();
     {
         let conn = state.db.lock().map_err(|e| e.to_string())?;
-        for (index, (id, keyword, name, plan)) in planned.iter().enumerate() {
-            let entry = &request.entries[index];
-            let job = db::NewJob {
-                id,
-                name,
-                batch_id: &batch_id,
-                keyword,
-                city: entry.city.trim(),
-                center_lat: entry.center_lat,
-                center_lng: entry.center_lng,
-                radius_km: request.radius_km,
-                cell_km: plan.cell_km,
-                split_threshold,
-                locale: &locale_query,
-            };
-            let tiles: Vec<db::NewTile> = plan
-                .tiles
-                .iter()
-                .map(|tile| db::NewTile {
-                    id: format!("{}-{}", id, tile.id),
-                    seq: tile.seq,
-                    lat: tile.lat,
-                    lng: tile.lng,
-                    zoom: tile.zoom,
-                })
-                .collect();
-
-            db::insert_job(&conn, &job, &tiles).map_err(|e| e.to_string())?;
+        db::insert_jobs(&conn, &batch).map_err(|e| e.to_string())?;
+        for (id, _, _, _) in &planned {
             if let Some(row) = db::load_job(&conn, id).map_err(|e| e.to_string())? {
                 created.push(row);
             }
@@ -2597,17 +3175,18 @@ pub fn start_job(
     // re-collected.
     probe: Option<bool>,
 ) -> Result<db::JobRow, String> {
-    // The enrichment runner owns the maps pane for its whole batch; a job
-    // started under it would navigate the pane out from under the runner.
-    if state
-        .enrich_job
-        .lock()
-        .map(|slot| slot.is_some())
-        .unwrap_or(false)
-    {
-        return Err("enrich_busy".to_string());
-    }
+    // The enrichment runner owns the maps pane for its whole batch, and a
+    // reviews fetch is mid-sequence: a job started under either would navigate
+    // the pane out from under it. (This command becomes the job owner, so it
+    // does not check the job/session slots itself.) P2-1: the claim is what
+    // makes the check atomic with the next command's claim.
+    claim_pane(
+        state.inner(),
+        PaneCheck::BECOMING_JOB,
+        crate::PaneOwner::Job(id.clone()),
+    )?;
     if !claim_runner_with_grace(state.inner(), &id) {
+        release_pane(state.inner(), &crate::PaneOwner::Job(id.clone()));
         return Err("job_running".to_string());
     }
     // Arm the probe BEFORE the runner can look at it. A plain start (and a
@@ -2887,8 +3466,7 @@ pub fn duplicate_job(
         source.cell_km,
     )?;
 
-    let stamp = now_ms();
-    let new_id = format!("job-{}-0", stamp);
+    let new_id = next_job_id();
     let city = source.city.trim();
     let name = if city.is_empty() {
         format!("{} · {}", source.keyword, chrono::Local::now().format("%m-%d %H:%M"))
@@ -3035,7 +3613,7 @@ const CLICK_REVIEWS_JS: &str = "(function () { \
 /// M9: ask the maps page for a business's reviews.
 ///
 /// The featured-review payload is **server-rendered into the place page**
-/// (`docs/parser.md`): it only exists once the maps pane is actually
+/// (field-index-map.md §6.6): it only exists once the maps pane is actually
 /// ON that place. So the flow is: navigate the pane to the place page (a full
 /// reload — `navigate_maps`'s mechanism), wait for the load and the injected
 /// script, then eval the fetch, whose state_cache channel reads the payload
@@ -3056,33 +3634,38 @@ pub fn fetch_business_reviews(
         db::business_review_sources(&conn, &place_id).map_err(|e| e.to_string())?
     };
 
-    // A running task owns the map (same guard as `navigate_maps`): navigating
-    // away would feed another search into the cell that is scrolling.
+    // A running task, the enrichment runner, another reviews fetch or an active
+    // collecting session owns the pane. This command navigates it and then
+    // reads whatever document is loaded ~8 s later, so it must have the pane to
+    // itself for the whole sequence: a page it did not load has another place's
+    // reviews in its state (C-01). P2-1: the claim below is what keeps two
+    // rapid clicks — or a click and a job start — from both passing.
+    claim_pane(
+        state.inner(),
+        PaneCheck::BECOMING_REVIEWS,
+        crate::PaneOwner::Reviews,
+    )?;
+
+    // Take the slot here, before the navigation. The pane claim above already
+    // excludes a concurrent fetch; this flag is what the fetch thread releases.
     {
-        let conn = state.db.lock().map_err(|e| e.to_string())?;
-        if let Some(id) = db::running_job_id(&conn).map_err(|e| e.to_string())? {
-            return Err(format!("map_busy:{}", id));
+        let mut slot = match state.review_fetch.lock() {
+            Ok(slot) => slot,
+            Err(_) => {
+                release_pane(state.inner(), &crate::PaneOwner::Reviews);
+                return Err("reviews_unavailable".to_string());
+            }
+        };
+        if *slot {
+            drop(slot);
+            release_pane(state.inner(), &crate::PaneOwner::Reviews);
+            return Err("reviews_busy".to_string());
         }
+        *slot = true;
     }
-
-    // So does an active collecting session: the fetch would yank the map pane
-    // off the page the user is collecting from, and the reload would drop any
-    // batch that was still in flight. Reviews can wait; the session cannot be
-    // rewound.
-    if crate::session_active(state.inner()) {
-        return Err("session_active".to_string());
-    }
-
-    // Tier-2: the enrichment runner owns the maps pane for its whole batch —
-    // a reviews fetch would navigate it away mid-batch.
-    if state
-        .enrich_job
-        .lock()
-        .map(|slot| slot.is_some())
-        .unwrap_or(false)
-    {
-        return Err("enrich_busy".to_string());
-    }
+    // Released by the fetch thread when the sequence ends, or from this stack
+    // frame if a step below fails before the thread starts.
+    let guard = SlotGuard::new(&app, clear_review_slot);
 
     let locale_query = state
         .settings
@@ -3104,27 +3687,30 @@ pub fn fetch_business_reviews(
     let data_json = serde_json::to_string(&data_id).map_err(|e| e.to_string())?;
     let link_json = serde_json::to_string(&reviews_link).map_err(|e| e.to_string())?;
 
-    let emit = format!(
-        "(function (payload) {{ \
-            if (window.__TAURI__ && window.__TAURI__.event) {{ \
-                window.__TAURI__.event.emit('business-reviews', payload); \
-            }} else if (window.__TAURI_INTERNALS__) {{ \
-                window.__TAURI_INTERNALS__.invoke('plugin:event|emit', {{ event: 'business-reviews', payload: payload }}); \
-            }} \
-        }})({{ channel: r.channel, reviews: r.reviews || [], error: r.error || null, linkNote: r.linkNote || null, placeId: {place_json}, dataId: {data_json} }})"
-    );
+    // The sequence runs ~8 s after the navigation, so the document it lands on
+    // is whatever owns the pane *then*. Check the place first: reading the
+    // bootstrap state of another place — or of a search page — would store its
+    // reviews under this place's id. A page that cannot report an id (the
+    // parser returns nothing on a search page) is let through, because the
+    // Rust side validates the rows it actually receives (C-02); an explicit
+    // mismatch aborts without a payload the store path could mistake for data.
     let fetch_js = format!(
-        "(window.__placemillFetchReviews({place_json}, {link_json}, {{ dataId: {data_json} }}) \
-            .then(function (r) {{ try {{ {emit} }} catch (e) {{}} }}) \
-            .catch(function (e) {{ try {{ \
-                (function (payload) {{ \
-                    if (window.__TAURI__ && window.__TAURI__.event) {{ \
-                        window.__TAURI__.event.emit('business-reviews', payload); \
-                    }} else if (window.__TAURI_INTERNALS__) {{ \
-                        window.__TAURI_INTERNALS__.invoke('plugin:event|emit', {{ event: 'business-reviews', payload: payload }}); \
-                    }} \
-                }})({{ channel: 'error', reviews: [], error: String(e && e.message || e), placeId: {place_json}, dataId: {data_json} }}); \
-            }} catch (e2) {{}} }}), 'requested')"
+        "(function () {{ \
+            var emit = function (payload) {{ \
+                if (window.__TAURI__ && window.__TAURI__.event) {{ window.__TAURI__.event.emit('business-reviews', payload); }} \
+                else if (window.__TAURI_INTERNALS__) {{ window.__TAURI_INTERNALS__.invoke('plugin:event|emit', {{ event: 'business-reviews', payload: payload }}); }} \
+            }}; \
+            var want = {place_json}; \
+            var got = ''; \
+            try {{ var s = window.__placemillParsePlaceState(); got = (s && s.placeId) || ''; }} catch (e) {{}} \
+            if (got && got !== want) {{ \
+                try {{ emit({{ channel: 'aborted', error: 'place-mismatch:' + got, placeId: want, dataId: {data_json} }}); }} catch (e) {{}} \
+                return; \
+            }} \
+            window.__placemillFetchReviews(want, {link_json}, {{ dataId: {data_json} }}) \
+                .then(function (r) {{ try {{ emit({{ channel: r.channel, reviews: r.reviews || [], error: r.error || null, linkNote: r.linkNote || null, placeId: want, dataId: {data_json} }}); }} catch (e) {{}} }}) \
+                .catch(function (e) {{ try {{ emit({{ channel: 'error', reviews: [], error: String(e && e.message || e), placeId: want, dataId: {data_json} }}); }} catch (e2) {{}} }}); \
+        }})()"
     );
 
     let webview = app
@@ -3145,6 +3731,10 @@ pub fn fetch_business_reviews(
     // rows land through the event either way; a duplicate retry just replaces
     // the same rows (INSERT OR REPLACE).
     std::thread::spawn(move || {
+        // The slot lives until the last eval and the retry are done: releasing
+        // it before the sequence ends would let a job start mid-way and hand
+        // the remaining evals a page they never navigated to.
+        let _guard = guard;
         std::thread::sleep(std::time::Duration::from_millis(4_500));
         if let Some(webview) = app.get_webview("maps") {
             let _ = webview.eval(CLICK_REVIEWS_JS);
@@ -3234,8 +3824,24 @@ fn enrich_sanitize(
     )
 }
 
+/// Enrichment is one place per ~35 s, all while owning the whole Maps pane.
+/// A 500-row selection would hold it for hours; cap the batch and drop
+/// duplicates before the slot is claimed (P2-13).
+const MAX_ENRICH_TARGETS: usize = 200;
+
+fn normalize_enrich_targets(place_ids: Vec<String>) -> Vec<String> {
+    let mut seen = std::collections::HashSet::new();
+    place_ids
+        .into_iter()
+        .map(|id| id.trim().to_string())
+        .filter(|id| !id.is_empty())
+        .filter(|id| seen.insert(id.clone()))
+        .take(MAX_ENRICH_TARGETS)
+        .collect()
+}
+
 /// Tier-2: enrich the given places by visiting each place page and reading
-/// the detail payload out of the bootstrap state (see `docs/parser.md`).
+/// the detail payload out of the bootstrap state (field-index-map §6.8).
 ///
 /// One hard navigation per place — the same mechanism the collector's tile
 /// loop uses, which is the only navigation that rebuilds the state (an SPA
@@ -3251,38 +3857,52 @@ pub fn enrich_businesses(
     state: tauri::State<'_, AppState>,
     place_ids: Vec<String>,
 ) -> Result<(), String> {
-    let targets: Vec<String> = place_ids
-        .into_iter()
-        .map(|id| id.trim().to_string())
-        .filter(|id| !id.is_empty())
-        .collect();
+    let mut targets = normalize_enrich_targets(place_ids);
     if targets.is_empty() {
         return Err("Nothing to enrich".to_string());
     }
 
-    // A running task owns the map (same guard as navigate_maps / reviews).
-    {
-        let conn = state.db.lock().map_err(|e| e.to_string())?;
-        if let Some(id) = db::running_job_id(&conn).map_err(|e| e.to_string())? {
-            return Err(format!("map_busy:{}", id));
-        }
-    }
-    // So does an active collecting session.
-    if crate::session_active(state.inner()) {
-        return Err("session_active".to_string());
-    }
+    // A running task, a reviews fetch or an active collecting session owns the
+    // pane; the enrichment runner claims it right below (P2-1: claim, not just
+    // check, so a concurrent job start cannot slip in between).
+    claim_pane(
+        state.inner(),
+        PaneCheck::BECOMING_ENRICH,
+        crate::PaneOwner::Enrich,
+    )?;
 
     // Single-flight: take the slot or refuse.
     let cancel = Arc::new(AtomicBool::new(false));
     {
-        let mut slot = state
-            .enrich_job
-            .lock()
-            .map_err(|e| format!("enrich_unavailable: {}", e))?;
+        let mut slot = match state.enrich_job.lock() {
+            Ok(slot) => slot,
+            Err(error) => {
+                release_pane(state.inner(), &crate::PaneOwner::Enrich);
+                return Err(format!("enrich_unavailable: {}", error));
+            }
+        };
         if slot.is_some() {
+            // Only reachable if a runner was left behind without the pane claim;
+            // giving the pane back keeps the refusal honest instead of leaving
+            // the pane owned by a run that never started.
+            drop(slot);
+            release_pane(state.inner(), &crate::PaneOwner::Enrich);
             return Err("enrich_busy".to_string());
         }
         *slot = Some(cancel.clone());
+    }
+    // Owns the slot from here on. The two fallible reads below, the spawned
+    // worker's normal exit and its panic all release it; the old code cleared
+    // the slot only at the very end of the worker, so a database error between
+    // the claim and the spawn left `enrich_busy` set until restart (C-06).
+    let guard = SlotGuard::new(&app, clear_enrich_slot);
+
+    // C-13: drop a payload left over from a cancelled run. Its sequence number
+    // (also starting at 1) would be taken as this run's answer for whatever
+    // place shares that number, fail the identity check, and cost that place
+    // its full 35 s deadline before being counted as failed.
+    if let Ok(mut slot) = state.enrich_payload.lock() {
+        *slot = None;
     }
 
     // Fresh copies of the rows: the hex `data_id` is the second identity
@@ -3301,6 +3921,21 @@ pub fn enrich_businesses(
         .map(|row| (row.place_id.clone(), row.data_id.clone()))
         .collect();
 
+    // P2-13: a deleted row or a stale selection id used to burn the full 35 s
+    // deadline. Keep only ids that still exist.
+    let requested = targets.len();
+    targets.retain(|id| known_by_id.contains_key(id));
+    if targets.len() < requested {
+        log_info!(
+            "enrich: {} of {} target(s) no longer exist and were skipped",
+            requested - targets.len(),
+            requested
+        );
+    }
+    if targets.is_empty() {
+        return Err("Nothing to enrich".to_string());
+    }
+
     let total = targets.len();
     let _ = app.emit(
         "enrich:progress",
@@ -3318,6 +3953,8 @@ pub fn enrich_businesses(
     // (navigate → poll → store) runs on its own thread, like the reviews
     // fetch. The panel keeps working; only the maps pane is occupied.
     std::thread::spawn(move || {
+        // Holds the slot for the whole batch, and releases it on a panic too.
+        let _guard = guard;
         let state = app.state::<AppState>();
         let mut ok = 0usize;
         let mut failed = 0usize;
@@ -3428,6 +4065,10 @@ pub fn enrich_businesses(
                             rating,
                             photos,
                         );
+                        // C-03: a write that matched no row (the business was
+                        // cleared or deleted while this batch ran) is a failed
+                        // place, not an ok one — the count must not claim a
+                        // detail that is not in the table.
                         let stored = state
                             .db
                             .lock()
@@ -3443,7 +4084,8 @@ pub fn enrich_businesses(
                                 )
                                 .ok()
                             })
-                            .is_some();
+                            .unwrap_or(0)
+                            > 0;
                         succeeded = stored;
                         if !stored {
                             log_warn!("enrich write failed for {}", place_id);
@@ -3489,9 +4131,6 @@ pub fn enrich_businesses(
             "enrich:completed",
             serde_json::json!({ "ok": ok, "failed": failed, "cancelled": cancelled }),
         );
-        if let Ok(mut slot) = state.enrich_job.lock() {
-            *slot = None;
-        };
     });
 
     Ok(())
@@ -3607,10 +4246,20 @@ fn push_to_maps(app: &tauri::AppHandle, settings: &Settings, reload: bool) {
         .lock()
         .map(|value| *value)
         .unwrap_or(false);
+    let epoch = app
+        .state::<AppState>()
+        .collection_epoch
+        .load(Ordering::Acquire);
     // A live settings push (no reload) must not restart the scroll loop; when
     // it does navigate, the new document starts from its own page load.
-    let script =
-        crate::collector_settings_script(settings, field_map.as_ref(), url.as_deref(), enabled, false);
+    let script = crate::collector_settings_script(
+        settings,
+        field_map.as_ref(),
+        url.as_deref(),
+        enabled,
+        false,
+        epoch,
+    );
 
     if let Some(url) = url.as_deref() {
         log_debug!("reloading maps: {}", url);
@@ -3664,13 +4313,10 @@ fn commit_settings(
     let maps_locale_changed =
         next.map_language != current.map_language || next.map_region != current.map_region;
     if maps_locale_changed {
-        let running = {
-            let conn = state.db.lock().map_err(|e| e.to_string())?;
-            db::running_job_id(&conn).map_err(|e| e.to_string())?
-        };
-        if let Some(id) = running {
-            return Err(format!("map_busy:{}", id));
-        }
+        // The push below reloads the pane, so every pane owner must be clear —
+        // not just a running job. A reviews fetch or an enrichment poll would
+        // otherwise read a document that was replaced under it (C-08).
+        check_pane(state, PaneCheck::ALL)?;
     }
 
     {
@@ -3732,6 +4378,14 @@ pub fn update_settings(
 ) -> Result<Settings, String> {
     validate_patch(&patch)?;
 
+    // P2-11: serialize the whole snapshot→merge→save sequence. Without this a
+    // `remember_export` finishing at the same time could write a stale settings
+    // snapshot over this update (or the other way round).
+    let _write = state
+        .settings_write
+        .lock()
+        .map_err(|e| format!("settings_write_unavailable: {}", e))?;
+
     // Snapshot first and drop the lock: the DB write below must not happen while
     // the settings lock is held (see the lock-order note on `AppState`).
     let current = state
@@ -3769,6 +4423,12 @@ pub fn reset_settings(
     app: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
 ) -> Result<Settings, String> {
+    // Same write serialization as `update_settings`: a reset must not race an
+    // export-completion write of `last_export_*`.
+    let _write = state
+        .settings_write
+        .lock()
+        .map_err(|e| format!("settings_write_unavailable: {}", e))?;
     let current = state
         .settings
         .lock()
@@ -3784,6 +4444,185 @@ pub fn reset_settings(
         Settings::default().normalized(),
         false,
     )
+}
+
+#[cfg(test)]
+mod pane_conflict_tests {
+    use super::*;
+
+    /// C-01: every borrower must refuse while another owner holds the pane.
+    #[test]
+    fn every_owner_is_reported_to_a_borrower() {
+        assert_eq!(
+            pane_conflict(Some("job-1"), None, false, PaneCheck::ALL),
+            Some("map_busy:job-1".to_string())
+        );
+        assert_eq!(
+            pane_conflict(None, Some(&crate::PaneOwner::Job("job-1".into())), false, PaneCheck::ALL),
+            Some("map_busy:job-1".to_string())
+        );
+        assert_eq!(
+            pane_conflict(None, Some(&crate::PaneOwner::Enrich), false, PaneCheck::ALL),
+            Some("enrich_busy".to_string())
+        );
+        assert_eq!(
+            pane_conflict(None, Some(&crate::PaneOwner::Reviews), false, PaneCheck::ALL),
+            Some("reviews_busy".to_string())
+        );
+        assert_eq!(
+            pane_conflict(None, None, true, PaneCheck::ALL),
+            Some("session_active".to_string())
+        );
+        assert_eq!(pane_conflict(None, None, false, PaneCheck::ALL), None);
+    }
+
+    /// A borrower that becomes an owner must not refuse itself, but still
+    /// refuses the owners it cannot share the pane with.
+    #[test]
+    fn a_caller_never_refuses_itself() {
+        assert_eq!(
+            pane_conflict(Some("job-1"), None, true, PaneCheck::BECOMING_JOB),
+            None
+        );
+        assert_eq!(
+            pane_conflict(None, Some(&crate::PaneOwner::Enrich), false, PaneCheck::BECOMING_JOB),
+            Some("enrich_busy".to_string())
+        );
+        assert_eq!(
+            pane_conflict(None, Some(&crate::PaneOwner::Enrich), false, PaneCheck::BECOMING_ENRICH),
+            None
+        );
+        assert_eq!(
+            pane_conflict(None, Some(&crate::PaneOwner::Reviews), false, PaneCheck::BECOMING_REVIEWS),
+            None
+        );
+    }
+
+    /// The gap the whole check exists for: a reviews fetch used to be invisible
+    /// to job start and enrichment.
+    #[test]
+    fn a_reviews_fetch_blocks_the_other_owners() {
+        for check in [
+            PaneCheck::ALL,
+            PaneCheck::BECOMING_JOB,
+            PaneCheck::BECOMING_ENRICH,
+        ] {
+            assert_eq!(
+                pane_conflict(None, Some(&crate::PaneOwner::Reviews), false, check),
+                Some("reviews_busy".to_string())
+            );
+        }
+        assert_eq!(
+            pane_conflict(
+                None,
+                Some(&crate::PaneOwner::Enrich),
+                false,
+                PaneCheck::BECOMING_JOB
+            ),
+            Some("enrich_busy".to_string()),
+            "the first owner in the priority order wins"
+        );
+    }
+
+    /// P2-1: checking and claiming must be one step. Reading three slots and
+    /// then claiming one let a job start and a reviews fetch both proceed.
+    #[test]
+    fn a_pane_can_only_be_claimed_once() {
+        let mut slot: Option<crate::PaneOwner> = None;
+        claim_slot(&mut slot, None, false, crate::PaneOwner::Job("job-1".into()))
+            .expect("the first claim wins");
+
+        // Any later claimant is refused with the code of whoever holds it —
+        // including the same job claiming again, which is how two rapid clicks
+        // used to start the same work twice.
+        assert_eq!(
+            claim_slot(&mut slot, None, false, crate::PaneOwner::Reviews).unwrap_err(),
+            "map_busy:job-1"
+        );
+        assert_eq!(
+            claim_slot(&mut slot, None, false, crate::PaneOwner::Job("job-1".into())).unwrap_err(),
+            "map_busy:job-1"
+        );
+        assert_eq!(
+            slot,
+            Some(crate::PaneOwner::Job("job-1".into())),
+            "a refused claim must not overwrite the owner"
+        );
+
+        // Released, the pane is claimable again — and the release only drops the
+        // owner it was given, so a stale runner cannot clear a newer claim.
+        release_pane_slot(&mut slot, &crate::PaneOwner::Job("job-2".into()));
+        assert!(slot.is_some(), "a different owner must not release it");
+        release_pane_slot(&mut slot, &crate::PaneOwner::Job("job-1".into()));
+        assert!(slot.is_none());
+        claim_slot(&mut slot, None, false, crate::PaneOwner::Reviews).expect("re-claim");
+    }
+
+    /// A collecting session or a job row that is already running blocks a claim
+    /// even when the owner slot is empty (the job row is written by recovery
+    /// and by the runner before it exits).
+    #[test]
+    fn a_running_job_or_session_blocks_a_claim() {
+        let mut slot = None;
+        assert_eq!(
+            claim_slot(
+                &mut slot,
+                Some("map_busy:job-9".into()),
+                false,
+                crate::PaneOwner::Enrich
+            )
+            .unwrap_err(),
+            "map_busy:job-9"
+        );
+        assert_eq!(
+            claim_slot(&mut slot, None, true, crate::PaneOwner::Enrich).unwrap_err(),
+            "session_active"
+        );
+        assert!(slot.is_none(), "a refused claim leaves the pane free");
+    }
+
+    /// P2-14: ids minted in the same millisecond (or the same `create_jobs`
+    /// request) must not collide.
+    #[test]
+    fn job_ids_are_unique_within_one_millisecond() {
+        let mut ids = std::collections::HashSet::new();
+        for _ in 0..1_000 {
+            assert!(ids.insert(next_job_id()), "duplicate job id");
+        }
+    }
+
+    /// P2-12: two exports must not write the same file; the guard releases on
+    /// every return path (including a cancelled dialog).
+    #[test]
+    fn exports_are_single_flight_and_release_on_drop() {
+        let flag = AtomicBool::new(false);
+        let first = claim_export(&flag).expect("first export");
+        assert_eq!(
+            claim_export(&flag).err(),
+            Some("export_busy".to_string())
+        );
+        drop(first);
+        assert!(claim_export(&flag).is_ok(), "the slot must be reusable");
+    }
+
+    /// P2-13: enrichment targets are trimmed, deduplicated and capped before
+    /// the pane slot is claimed.
+    #[test]
+    fn enrich_targets_are_trimmed_deduped_and_capped() {
+        let mut input = vec![
+            " a ".to_string(),
+            "a".to_string(),
+            String::new(),
+            "b".to_string(),
+        ];
+        input.extend((0..MAX_ENRICH_TARGETS + 5).map(|index| format!("extra{index}")));
+        let out = normalize_enrich_targets(input);
+        assert_eq!(out.len(), MAX_ENRICH_TARGETS);
+        assert_eq!(out[0], "a");
+        assert_eq!(out[1], "b");
+        let unique: std::collections::HashSet<&String> = out.iter().collect();
+        assert_eq!(unique.len(), out.len());
+    }
 }
 
 #[cfg(test)]
@@ -3989,7 +4828,7 @@ mod tests {
     /// M10 / G-11: the hiddenColumns↔export linkage. "Hide what you see
     /// hidden" — a column with a table counterpart drops when the panel hides
     /// it; a column with none (identifiers, structured address parts) always
-    /// exports; an unsent list exports all 28.
+    /// exports; an unsent list exports every column.
     #[test]
     fn visible_keys_drop_only_their_own_columns() {
         let all = resolve_export_columns(None);
@@ -4267,6 +5106,104 @@ mod tests {
         let second = unique_export_path(&dir, "leads.csv").expect("second");
         assert_eq!(second, dir.join("leads-1.csv"));
         assert!(second.is_file());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// P2-12: the filtered path counts without loading, then streams from its
+    /// own read-only connection — the shared `state.db` mutex is never held —
+    /// and each row is normalized on the way out, exactly like the table.
+    #[test]
+    fn filtered_exports_stream_from_a_read_connection() {
+        let dir = temp_dir("stream");
+        let db_path = dir.join("placemill.db");
+        let conn = db::init_database(&db_path).expect("db");
+
+        let mut dental = business();
+        dental.place_id = "p1".into();
+        dental.name = "Dental One".into();
+        dental.address = "  1  Main   St., ".into();
+        dental.phone = "(415) 555-0123".into();
+        dental.website = "https://one.example".into();
+
+        let mut plumber = business();
+        plumber.place_id = "p2".into();
+        plumber.name = "Plumber".into();
+        plumber.phone = "+1 444".into();
+        plumber.website = "https://two.example".into();
+
+        db::insert_businesses(&conn, &[dental, plumber], "dentist", "", false).expect("insert");
+        drop(conn);
+
+        let filtered = ExportSource::Query {
+            request: BusinessQueryRequest {
+                query: "dental".into(),
+                ..Default::default()
+            },
+            db_path: db_path.clone(),
+            region: "US".into(),
+        };
+        assert_eq!(filtered.count().expect("count"), 1);
+
+        let mut seen = Vec::new();
+        assert_eq!(
+            filtered
+                .for_each(|row| {
+                    seen.push((row.name.clone(), row.address.clone(), row.phone.clone()));
+                    Ok(())
+                })
+                .expect("stream"),
+            1
+        );
+        // Whitespace tidied and the phone pushed to E.164, like the table.
+        assert_eq!(seen[0].0, "Dental One");
+        assert_eq!(seen[0].1, "1 Main St.,");
+        assert_eq!(seen[0].2, "+14155550123");
+
+        // The unfiltered source sees every row, in the export's sort order.
+        let all = ExportSource::Query {
+            request: BusinessQueryRequest::default(),
+            db_path,
+            region: String::new(),
+        };
+        assert_eq!(all.count().expect("count"), 2);
+        let mut names = Vec::new();
+        all.for_each(|row| {
+            names.push(row.name.clone());
+            Ok(())
+        })
+        .expect("stream");
+        assert_eq!(names, vec!["Dental One", "Plumber"]);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// P2-12: a scan that ends with zero rows leaves no empty file behind, and
+    /// never deletes a file the save dialog confirmed for replacement.
+    #[test]
+    fn an_empty_stream_leaves_no_file_behind() {
+        let dir = temp_dir("empty");
+        let target = dir.join("out.csv");
+        let temp = dir.join("out.csv.1.tmp");
+
+        // Auto export: `unique_export_path` claimed an empty placeholder.
+        std::fs::write(&temp, b"Name\r\n").expect("temp");
+        std::fs::write(&target, b"").expect("placeholder");
+        assert!(finish_export(&temp, &target, false, Ok(0))
+            .expect("settle")
+            .is_none());
+        assert!(!temp.exists());
+        assert!(!target.exists());
+
+        // Dialog export: the existing file was confirmed for replacement, so an
+        // empty stream leaves it exactly as it was.
+        std::fs::write(&temp, b"Name\r\n").expect("temp");
+        std::fs::write(&target, b"keep me").expect("existing");
+        assert!(finish_export(&temp, &target, true, Ok(0))
+            .expect("settle")
+            .is_none());
+        assert!(!temp.exists());
+        assert_eq!(std::fs::read_to_string(&target).expect("read"), "keep me");
 
         let _ = std::fs::remove_dir_all(&dir);
     }

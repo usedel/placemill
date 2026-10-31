@@ -12,10 +12,12 @@
  *   J-04c  progress counts leaf tiles: after a split the job has 4 tiles, not 5,
  *          so the bar cannot jump backwards
  *
- * The split has to be triggered by a genuinely dense search — a synthetic batch
- * proves the plumbing but cannot prove the threshold fires on a real cap. This
- * suite therefore hits Google once (`dentist` in downtown LA, ~120 rows) and is
- * network-dependent in the same way as `e2e:real`.
+ * The dense cell is fed synthetically (`business-data` with distinct place ids,
+ * attributed to the running tile). A real search is used for the *empty* half
+ * only: Google now returns ~40 places per viewport, so a real neighbourhood can
+ * sit below the product's own minimum threshold (20) and the suite would report
+ * a regression that is really the weather. `e2e:real` is the suite that proves
+ * a real payload becomes rows.
  *
  * Usage:
  *   npm run e2e:split
@@ -26,9 +28,11 @@ import {
   backupDatabase,
   check,
   devLog,
+  evalMaps,
   launchApp,
   note,
   openPanel,
+  pollMaps,
   pollValue,
   preflight,
   printSummary,
@@ -150,14 +154,54 @@ async function main() {
     );
 
     // ---- J-04a: a dense cell splits into four ----------------------------
-    // 3 km radius at an 8 km cell is a single tile (radius + half a cell is
-    // 7 km, so the four neighbours at 8 km fall outside), and `zoom_for_cell`
-    // floors 8 km to zoom 14. Cell 10 km would floor to zoom 13, and that wide
-    // a viewport measurably changes what Google returns for the same keyword
-    // (36 vs ~60 places inside 3 km), so the suite stays on the tighter cell.
-    // Downtown LA keeps ~56 rows inside 3 km, which clears `THRESHOLD`.
-    const [splitJob] = await create('dentist', 3, 8);
+    // The density is fed synthetically, and deliberately so: a real Google
+    // search now hands one viewport ~40 places (measured: 40 seen, 21 inside a
+    // 3 km circle), while the product's threshold range starts at 20 — a real
+    // neighbourhood may simply never reach it, which made this suite report a
+    // regression whenever Google returned a thin list. The threshold arithmetic
+    // and the runner's reaction are what this half tests, and both are
+    // deterministic. "A real payload becomes rows" is `e2e:real`'s job.
+    //
+    // 2 km radius at a 5 km cell is a single tile (radius + half a cell is
+    // 4.5 km, so the four neighbours at 5 km fall outside).
+    const [splitJob] = await create('dentist', 2, 5);
     await call('start_job', { id: splitJob.id });
+
+    // The tile context exists once the runner has begun the tile and the page
+    // has stored it, which is also when the batch can be attributed.
+    const contextRaw = await pollMaps(
+      `sessionStorage.getItem('placemill.tileContext')`,
+      90_000,
+    );
+    let tileContext = null;
+    try {
+      tileContext = JSON.parse(contextRaw);
+    } catch {
+      tileContext = null;
+    }
+
+    if (tileContext?.tileId) {
+      const rows = Array.from({ length: THRESHOLD + 5 }, (_, index) => ({
+        name: `E2E Split ${index}`,
+        address: `1 Split Street ${index}`,
+        phone: '',
+        rating: 4 + (index % 10) / 10,
+        reviews_total: 10 + index,
+        // Spread inside the 2 km circle: ~50 m per step stays well within it.
+        lat: CENTER.lat + index * 0.0005,
+        lng: CENTER.lng + index * 0.0005,
+        place_id: `E2E_SPLIT_${RUN}_${index}`,
+        website: '',
+        types: ['dentist'],
+      }));
+      await evalMaps(
+        `window.__TAURI__.event.emit('business-data', {
+           businesses: ${JSON.stringify(rows)},
+           sourceQuery: 'dentist',
+           tileId: ${JSON.stringify(tileContext.tileId)}
+         })`,
+      ).catch(() => {});
+    }
 
     const splitTiles = await pollValue(
       panel,
@@ -173,11 +217,23 @@ async function main() {
     const parent = splitTiles?.find((tile) => tile.status === 'split');
     if (!parent) {
       // A timeout here is either "Google returned fewer rows than the threshold"
-      // or a real regression; the tile row tells the two apart.
+      // or a real regression; the tile row tells the two apart. `errorReason`
+      // carries the page's own end reason (`drift` / `max-scrolls` / `no-feed`),
+      // and the diagnostics counters say how much the feed delivered before the
+      // filters ran.
       const current = await call('get_job_tiles', { id: splitJob.id });
       const diagnostic =
-        current.map((tile) => `${tile.id}:${tile.status}/${tile.resultCount}`).join(',') ||
-        'no tiles';
+        current
+          .map(
+            (tile) =>
+              `${tile.id}:${tile.status}/${tile.resultCount}/${tile.errorReason || '-'}`,
+          )
+          .join(',') || 'no tiles';
+      const counters = await call('get_diagnostics');
+      note(
+        `feed: ${counters.records} row(s) seen, ${counters.dropped} dropped ` +
+          `(ingress/phone/radius) — threshold is ${THRESHOLD}`,
+      );
       check('a cell at the result cap splits', false, diagnostic);
     } else {
       check(

@@ -12,6 +12,12 @@ pub fn init_database(db_path: &PathBuf) -> Result<Connection> {
         std::fs::create_dir_all(parent).ok();
     }
     let conn = Connection::open(db_path)?;
+    // R-15/R-06: the busy handler must exist before `journal_mode = WAL`,
+    // because switching the journal needs a brief exclusive lock. Setting it
+    // afterwards left that first statement unprotected: a second instance, a
+    // backup tool or an antivirus scan could make it fail with SQLITE_BUSY,
+    // which the startup path used to mistake for a corrupt database.
+    conn.execute_batch("PRAGMA busy_timeout = 5000;")?;
     // R-15: the mining threads write while the panel reads through the same
     // connection mutex. WAL lets those writers commit without blocking the
     // readers' snapshots, busy_timeout absorbs the residual contention on the
@@ -21,10 +27,7 @@ pub fn init_database(db_path: &PathBuf) -> Result<Connection> {
     // reality instead of assuming — an in-memory or legacy journal would say so.
     let journal_mode: String =
         conn.query_row("PRAGMA journal_mode = WAL;", [], |row| row.get(0))?;
-    conn.execute_batch(
-        "PRAGMA busy_timeout = 5000;
-         PRAGMA synchronous = NORMAL;",
-    )?;
+    conn.execute_batch("PRAGMA synchronous = NORMAL;")?;
     // Explicitly on: the tile rows are deleted with their job, and relying on
     // SQLite's default (off) would silently leave orphans behind.
     conn.execute_batch("PRAGMA foreign_keys = ON;")?;
@@ -62,8 +65,12 @@ pub fn open_with_recovery(
 ) -> std::result::Result<(Connection, Option<PathBuf>), String> {
     match init_database(db_path) {
         Ok(conn) => Ok((conn, None)),
-        Err(error) => {
-            log_error!("database init failed: {}", error);
+        // Only a file that SQLite says is malformed/not a database is renamed.
+        // A lock, a permission problem or a full disk is an environment issue:
+        // rebuilding cannot fix it, and renaming a healthy database would make
+        // the app start empty while the user's rows sit in a `.corrupt-*` file.
+        Err(error) if is_corruption_error(&error) => {
+            log_error!("database init failed (corrupt): {}", error);
             let backup = backup_broken_database(db_path);
             match &backup {
                 Some(path) => log_info!(
@@ -82,7 +89,26 @@ pub fn open_with_recovery(
             })?;
             Ok((conn, backup))
         }
+        Err(error) => {
+            log_error!("database init failed (not corruption, not rebuilding): {}", error);
+            Err(format!("database init failed: {}", error))
+        }
     }
+}
+
+/// Whether an init failure is a malformed database rather than an environment
+/// problem. `SQLITE_BUSY`, `SQLITE_PERM`, `SQLITE_CANTOPEN`, `SQLITE_IOERR` and
+/// a full disk must not trigger the rename-and-rebuild path: the file may be
+/// perfectly healthy and merely unreachable for the moment.
+fn is_corruption_error(error: &rusqlite::Error) -> bool {
+    matches!(
+        error,
+        rusqlite::Error::SqliteFailure(code, _)
+            if matches!(
+                code.code,
+                rusqlite::ErrorCode::DatabaseCorrupt | rusqlite::ErrorCode::NotADatabase
+            )
+    )
 }
 
 /// Move an unusable database file aside under `<name>.corrupt-<timestamp>` (R-06).
@@ -458,7 +484,7 @@ fn migrate_v1_to_v2(conn: &Connection) -> Result<()> {
 /// applied migration would never reach an installed database — the write
 /// would fail with "no such column" and every batch would be lost (R-06).
 /// The fields are the ones the index probe confirmed as filled in the search
-/// payload (`docs/parser.md`). `about` and `open_hours` hold JSON
+/// payload (`docs/field-index-map.md` §2). `about` and `open_hours` hold JSON
 /// arrays, like `types` and `emails` do; a row collected before this
 /// migration keeps them empty.
 fn migrate_v2_to_v3(conn: &Connection) -> Result<()> {
@@ -946,6 +972,26 @@ fn map_tile(row: &rusqlite::Row<'_>) -> Result<TileRow> {
 /// finished queue entry and never run.
 pub fn insert_job(conn: &Connection, job: &NewJob, tiles: &[NewTile]) -> Result<()> {
     let tx = write_tx(conn)?;
+    insert_job_in_tx(&tx, job, tiles)?;
+    tx.commit()
+}
+
+/// Insert several jobs in one transaction (P2-14). `create_jobs` validates the
+/// whole request before writing, but a database error on the N-th row used to
+/// leave the first N-1 jobs behind; the caller reported a failure while half a
+/// batch sat in the queue.
+pub fn insert_jobs(conn: &Connection, jobs: &[(NewJob<'_>, Vec<NewTile>)]) -> Result<()> {
+    if jobs.is_empty() {
+        return Ok(());
+    }
+    let tx = write_tx(conn)?;
+    for (job, tiles) in jobs {
+        insert_job_in_tx(&tx, job, tiles)?;
+    }
+    tx.commit()
+}
+
+fn insert_job_in_tx(tx: &Transaction<'_>, job: &NewJob, tiles: &[NewTile]) -> Result<()> {
     tx.execute(
         "INSERT INTO search_jobs
             (id, name, batch_id, keyword, city, center_lat, center_lng, radius_km, cell_km,
@@ -982,7 +1028,7 @@ pub fn insert_job(conn: &Connection, job: &NewJob, tiles: &[NewTile]) -> Result<
             ])?;
         }
     }
-    tx.commit()
+    Ok(())
 }
 
 pub fn list_jobs(conn: &Connection) -> Result<Vec<JobRow>> {
@@ -1107,6 +1153,32 @@ pub fn refresh_job_counts(conn: &Connection, job_id: &str, status: Option<&str>)
     Ok(())
 }
 
+/// Move a job to a terminal status only while it is still `running` (C-07).
+///
+/// The tile loop and the user race on this row: `cancel_job` / `pause_job` can
+/// land between the last tile and `finish_job`, and the old unconditional
+/// `refresh_job_counts(..., Some(status))` overwrote the user's choice with
+/// `completed`, so a cancelled task showed up as finished. Returns whether the
+/// row was actually updated; the counters are refreshed separately either way.
+pub fn set_job_status_if_running(conn: &Connection, id: &str, status: &str) -> Result<usize> {
+    conn.execute(
+        "UPDATE search_jobs SET status = ?2, updated_at = CURRENT_TIMESTAMP
+          WHERE id = ?1 AND status = 'running'",
+        rusqlite::params![id, status],
+    )
+}
+
+/// Claim a queued job for the worker. Returns 0 when the row is no longer
+/// `queued` (the user cancelled or paused it after `next_queued_job` read it),
+/// which is what stops the queue from reviving a cancelled task.
+pub fn set_job_status_if_queued(conn: &Connection, id: &str, status: &str) -> Result<usize> {
+    conn.execute(
+        "UPDATE search_jobs SET status = ?2, updated_at = CURRENT_TIMESTAMP
+          WHERE id = ?1 AND status = 'queued'",
+        rusqlite::params![id, status],
+    )
+}
+
 /// Subdivide a dense tile in one transaction (roadmap M4 / J-04a).
 ///
 /// The parent becomes `split`, the pending queue shifts by `children.len()` and
@@ -1188,6 +1260,18 @@ pub fn reset_running_tiles(conn: &Connection, job_id: &str) -> Result<usize> {
     )
 }
 
+/// Park every queued job (P1-4). `clear_data` uses this so a job that was
+/// waiting its turn cannot be chained right after the running one is paused —
+/// the worker's `set_job_status_if_queued` claim then finds nothing, and the
+/// cleared table stays empty. Returns how many rows were parked.
+pub fn pause_queued_jobs(conn: &Connection) -> Result<usize> {
+    conn.execute(
+        "UPDATE search_jobs SET status = 'paused', updated_at = CURRENT_TIMESTAMP
+         WHERE status = 'queued'",
+        [],
+    )
+}
+
 /// Startup recovery: a `running` job cannot still be running, the process that
 /// owned it is gone. Downgrade to `paused` so the panel can offer "resume".
 pub fn recover_interrupted_jobs(conn: &Connection) -> Result<usize> {
@@ -1255,35 +1339,41 @@ pub fn delete_job(
 /// A missing row is normal (first launch). A corrupt row is not: it is reported
 /// back so the caller can surface it in the diagnostics drawer, instead of
 /// silently resetting every preference with no trace.
-pub fn load_settings(conn: &Connection) -> (Settings, Option<String>) {
+///
+/// P2-11: only `QueryReturnedNoRows` means "first launch". A busy database, an
+/// I/O error or a missing table must be returned as `Err`: continuing with
+/// defaults would let the next save overwrite the user's real settings row with
+/// those defaults, and the warning would be the only trace.
+pub fn load_settings(conn: &Connection) -> Result<(Settings, Option<String>), String> {
     let raw = conn
         .query_row("SELECT value FROM settings WHERE key = 'app'", [], |row| {
             row.get::<_, String>(0)
         })
-        .ok();
+        .optional()
+        .map_err(|error| format!("Could not read the settings row: {}", error))?;
 
     let Some(raw) = raw else {
-        return (Settings::default().normalized(), None);
+        return Ok((Settings::default().normalized(), None));
     };
 
     let mut value = match serde_json::from_str::<serde_json::Value>(&raw) {
         Ok(value) => value,
         Err(e) => {
-            return (
+            return Ok((
                 Settings::default().normalized(),
                 Some(format!("Corrupted settings row, falling back to defaults: {}", e)),
-            )
+            ))
         }
     };
 
     migrate(&mut value);
 
     match serde_json::from_value::<Settings>(value) {
-        Ok(settings) => (settings.normalized(), None),
-        Err(e) => (
+        Ok(settings) => Ok((settings.normalized(), None)),
+        Err(e) => Ok((
             Settings::default().normalized(),
             Some(format!("Failed to parse stored settings: {}", e)),
-        ),
+        )),
     }
 }
 
@@ -1383,6 +1473,11 @@ fn parse_u32_array(raw: Option<String>) -> Vec<u32> {
 /// Persist one place's Tier-2 detail enrichment. Only the four detail columns
 /// are touched — a re-collection (duplicate-strategy update) keeps them, and a
 /// second enrichment simply replaces them.
+///
+/// Returns the number of rows written (C-03). Zero means the business row is
+/// gone — cleared, deleted or never existed — and the caller must count the
+/// place as failed. Returning `Ok(())` here made the runner report "ok" for
+/// writes that changed nothing.
 pub fn update_business_details(
     conn: &Connection,
     place_id: &str,
@@ -1390,7 +1485,7 @@ pub fn update_business_details(
     description: &str,
     reviews_per_rating: &[u32],
     photos: &[String],
-) -> Result<()> {
+) -> Result<usize> {
     let rating_json =
         serde_json::to_string(reviews_per_rating).unwrap_or_else(|_| "[]".to_string());
     let photos_json = serde_json::to_string(photos).unwrap_or_else(|_| "[]".to_string());
@@ -1402,10 +1497,12 @@ pub fn update_business_details(
              photos            = ?5
          WHERE place_id = ?1",
         rusqlite::params![place_id, plus_code, description, rating_json, photos_json],
-    )?;
-    Ok(())
+    )
 }
 
+/// Returns how many business rows were written (C-03): a site whose rows were
+/// cleared or deleted while the miner was fetching it matched nothing, and the
+/// caller must count that as a failure instead of a find.
 pub fn update_email_mining(
     conn: &Connection,
     place_ids: &[String],
@@ -1413,9 +1510,10 @@ pub fn update_email_mining(
     socials: &[String],
     source_url: &str,
     status: &str,
-) -> Result<()> {
+) -> Result<usize> {
     let emails_json = serde_json::to_string(emails).unwrap_or_else(|_| "[]".to_string());
     let socials_json = serde_json::to_string(socials).unwrap_or_else(|_| "[]".to_string());
+    let mut written = 0usize;
     let tx = write_tx(conn)?;
     {
         let mut stmt = tx.prepare(
@@ -1431,7 +1529,7 @@ pub fn update_email_mining(
              WHERE place_id = ?6",
         )?;
         for place_id in place_ids {
-            stmt.execute(rusqlite::params![
+            written += stmt.execute(rusqlite::params![
                 emails_json,
                 socials_json,
                 source_url,
@@ -1442,7 +1540,90 @@ pub fn update_email_mining(
         }
     }
     tx.commit()?;
-    Ok(())
+    Ok(written)
+}
+
+/// The scope half of every mining query: explicit ids, or the browse filter.
+///
+/// Shared by `mining_targets` (what to visit) and `mining_scope_summary` (what
+/// an empty result was made of), so the two can never disagree about which rows
+/// are in scope.
+fn mining_scope_clause(
+    ids: Option<&[String]>,
+    filter: Option<&BusinessFilter>,
+    values: &mut Vec<Value>,
+) -> Vec<String> {
+    let mut conditions: Vec<String> = Vec::new();
+
+    if let Some(ids) = ids {
+        if ids.is_empty() {
+            // An explicit empty scope matches nothing. Without this, the loop
+            // below produced `WHERE ()` — valid Rust, invalid SQL (P3-12).
+            conditions.push("0".to_string());
+        } else {
+            // Chunked OR-groups keep the bound-variable count comfortably below
+            // SQLITE_MAX_VARIABLE_NUMBER even for "select everything" runs.
+            let mut groups: Vec<String> = Vec::new();
+            for chunk in ids.chunks(400) {
+                let marks = vec!["?"; chunk.len()].join(", ");
+                for id in chunk {
+                    values.push(Value::Text(id.clone()));
+                }
+                groups.push(format!("place_id IN ({})", marks));
+            }
+            conditions.push(format!("({})", groups.join(" OR ")));
+        }
+    }
+    if let Some(filter) = filter {
+        let clause = build_where(filter, values);
+        let trimmed = clause.trim_start_matches(" WHERE ").trim().to_string();
+        if !trimmed.is_empty() {
+            conditions.push(trimmed);
+        }
+    }
+    conditions
+}
+
+/// What a mining scope contains, for the "nothing to mine" message.
+///
+/// The panel used to report every empty target list as "no rows with a
+/// website", which is wrong — and confusing — when the rows do have one and
+/// were simply mined before. `email_status` is the marker the miner itself
+/// uses to skip a row, so it is the one that decides which message is honest.
+#[derive(Debug, Clone, Copy, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MiningScopeSummary {
+    /// Rows in scope that carry a non-empty website.
+    pub with_website: i64,
+    /// Of those, rows whose `email_status` is already set.
+    pub already_mined: i64,
+}
+
+pub fn mining_scope_summary(
+    conn: &Connection,
+    ids: Option<&[String]>,
+    filter: Option<&BusinessFilter>,
+) -> Result<MiningScopeSummary> {
+    let mut values: Vec<Value> = Vec::new();
+    let mut conditions = mining_scope_clause(ids, filter, &mut values);
+    conditions.push("website <> ''".to_string());
+    let where_sql = format!(" WHERE {}", conditions.join(" AND "));
+    conn.query_row(
+        &format!(
+            "SELECT COUNT(*),
+                    COALESCE(SUM(CASE WHEN email_status IS NULL OR email_status = ''
+                                      THEN 0 ELSE 1 END), 0)
+               FROM businesses{}",
+            where_sql
+        ),
+        rusqlite::params_from_iter(values.iter()),
+        |row| {
+            Ok(MiningScopeSummary {
+                with_website: row.get(0)?,
+                already_mined: row.get(1)?,
+            })
+        },
+    )
 }
 
 /// `(place_id, website)` pairs the miner should visit (M7).
@@ -1457,29 +1638,8 @@ pub fn mining_targets(
     filter: Option<&BusinessFilter>,
     force: bool,
 ) -> Result<Vec<(String, String)>> {
-    let mut conditions: Vec<String> = Vec::new();
     let mut values: Vec<Value> = Vec::new();
-
-    if let Some(ids) = ids {
-        // Chunked OR-groups keep the bound-variable count comfortably below
-        // SQLITE_MAX_VARIABLE_NUMBER even for "select everything" runs.
-        let mut groups: Vec<String> = Vec::new();
-        for chunk in ids.chunks(400) {
-            let marks = vec!["?"; chunk.len()].join(", ");
-            for id in chunk {
-                values.push(Value::Text(id.clone()));
-            }
-            groups.push(format!("place_id IN ({})", marks));
-        }
-        conditions.push(format!("({})", groups.join(" OR ")));
-    }
-    if let Some(filter) = filter {
-        let clause = build_where(filter, &mut values);
-        let trimmed = clause.trim_start_matches(" WHERE ").trim().to_string();
-        if !trimmed.is_empty() {
-            conditions.push(trimmed);
-        }
-    }
+    let mut conditions = mining_scope_clause(ids, filter, &mut values);
     if !force {
         conditions.push("(email_status IS NULL OR email_status = '')".to_string());
     }
@@ -1709,17 +1869,16 @@ pub fn snapshot_for_clear(conn: &Connection) -> Result<usize> {
 /// instead of keeping its newer copy. The links side uses OR IGNORE (see the
 /// inline note). Returns how many business rows were written.
 ///
-/// Missing backup tables mean "nothing was captured" (an empty clear, or a
-/// restart already dropped them): an honest zero, not an error — the undo
-/// window itself is in-memory, so a restart never gets here anyway.
+/// Errors are propagated, and the backup tables are dropped only after the
+/// restore has succeeded. The old silent-zero behaviour could report success
+/// while destroying the only copy of the cleared rows — the one outcome an
+/// undo path must never produce.
 pub fn restore_clear_snapshot(conn: &Connection) -> Result<usize> {
     let tx = write_tx(conn)?;
-    let restored = tx
-        .execute(
-            "INSERT OR REPLACE INTO businesses SELECT * FROM businesses_backup",
-            [],
-        )
-        .unwrap_or(0);
+    let restored = tx.execute(
+        "INSERT OR REPLACE INTO businesses SELECT * FROM businesses_backup",
+        [],
+    )?;
     // OR IGNORE, not OR REPLACE: a job deleted during the undo window makes
     // its links violate the FK, and IGNORE skips those rows one by one —
     // exactly what the old per-row `is_ok()` loop did. OR REPLACE would fail
@@ -1727,8 +1886,7 @@ pub fn restore_clear_snapshot(conn: &Connection) -> Result<usize> {
     tx.execute(
         "INSERT OR IGNORE INTO job_businesses SELECT * FROM job_businesses_backup",
         [],
-    )
-    .ok();
+    )?;
     tx.execute_batch(
         "DROP TABLE IF EXISTS businesses_backup;
          DROP TABLE IF EXISTS job_businesses_backup;",
@@ -1905,7 +2063,7 @@ pub fn mark_job_exported(conn: &Connection, id: &str, at: i64) -> Result<usize> 
 
 /// Filters accepted by the panel. Unknown values fall through as "no filter"
 /// rather than erroring: a stale frontend must not be able to break browsing.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct BusinessFilter {
     pub query: String,
     /// `all`, `none`, or a rating step as shown in the UI (`30` ..= `50`).
@@ -1971,13 +2129,37 @@ pub struct TypeCount {
     pub count: i64,
 }
 
+/// Wrap a user search term in `%…%` for a LIKE query, escaping the characters
+/// that LIKE reserves. Without this a literal `%` or `_` silently changed the
+/// meaning of the search.
+fn like_pattern(needle: &str) -> String {
+    let mut pattern = String::with_capacity(needle.len() + 2);
+    pattern.push('%');
+    for ch in needle.chars() {
+        if matches!(ch, '\\' | '%' | '_') {
+            pattern.push('\\');
+        }
+        pattern.push(ch);
+    }
+    pattern.push('%');
+    pattern
+}
+
 fn build_where(filter: &BusinessFilter, values: &mut Vec<Value>) -> String {
     let mut clauses: Vec<String> = Vec::new();
 
     let needle = filter.query.trim();
     if !needle.is_empty() {
-        clauses.push("(name LIKE ? OR address LIKE ? OR phone LIKE ? OR website LIKE ?)".into());
-        let like = format!("%{}%", needle);
+        // P2-8: `%` and `_` are LIKE wildcards. A search for "50% off" or a
+        // literal underscore used to match unrelated rows (an underscore
+        // matched every single-character position). Escape them, and name the
+        // escape character explicitly in every LIKE.
+        clauses.push(
+            "(name LIKE ? ESCAPE '\\' OR address LIKE ? ESCAPE '\\' \
+             OR phone LIKE ? ESCAPE '\\' OR website LIKE ? ESCAPE '\\')"
+                .into(),
+        );
+        let like = like_pattern(needle);
         for _ in 0..4 {
             values.push(Value::Text(like.clone()));
         }
@@ -2091,6 +2273,10 @@ const BUSINESS_COLUMNS: &str = "place_id, name, address, phone, rating, reviews_
 #[derive(Default)]
 pub struct DashboardCache {
     entry: Option<(u64, i64, Vec<TypeCount>)>,
+    /// The filtered aggregate (P2-8). Same write counter key plus the filter
+    /// itself: the query, rating, contact, type, job and time dimensions all
+    /// change the result, and a page turn repeats the *same* filter.
+    filtered: Option<(u64, BusinessFilter, i64, f64, i64, i64)>,
 }
 
 impl DashboardCache {
@@ -2105,6 +2291,28 @@ impl DashboardCache {
 
     fn put(&mut self, writes: u64, all: i64, types: Vec<TypeCount>) {
         self.entry = Some((writes, all, types));
+    }
+
+    fn get_filtered(
+        &self,
+        writes: u64,
+        filter: &BusinessFilter,
+    ) -> Option<(i64, f64, i64, i64)> {
+        let (cached_writes, cached_filter, total, avg, rated, phone) = self.filtered.as_ref()?;
+        (*cached_writes == writes && cached_filter == filter)
+            .then(|| (*total, *avg, *rated, *phone))
+    }
+
+    fn put_filtered(
+        &mut self,
+        writes: u64,
+        filter: &BusinessFilter,
+        total: i64,
+        avg: f64,
+        rated: i64,
+        phone: i64,
+    ) {
+        self.filtered = Some((writes, filter.clone(), total, avg, rated, phone));
     }
 }
 
@@ -2129,25 +2337,43 @@ pub fn query_businesses(
 ) -> Result<BusinessPage> {
     let mut values = Vec::new();
     let where_sql = build_where(filter, &mut values);
+    let writes = total_changes(conn);
 
     // One scan for the filtered total and the three aggregates: they used to
-    // be two separate passes over the same filtered set (R-14).
-    let (total, avg_rating, rated, with_phone): (i64, f64, i64, i64) = conn.query_row(
-        &format!(
-            "SELECT COUNT(*),
-                    COALESCE(AVG(CASE WHEN rating > 0 THEN rating END), 0),
-                    COALESCE(SUM(CASE WHEN rating > 0 THEN 1 ELSE 0 END), 0),
-                    COALESCE(SUM(CASE WHEN phone <> '' THEN 1 ELSE 0 END), 0)
-             FROM businesses{}",
-            where_sql
-        ),
-        params_from_iter(values.iter()),
-        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
-    )?;
+    // be two separate passes over the same filtered set (R-14). P2-8: the
+    // result is cached under the write counter + filter, so turning a page no
+    // longer re-scans 100k rows for the same `COUNT/AVG/SUM`.
+    let aggregate = |conn: &Connection| -> Result<(i64, f64, i64, i64)> {
+        conn.query_row(
+            &format!(
+                "SELECT COUNT(*),
+                        COALESCE(AVG(CASE WHEN rating > 0 THEN rating END), 0),
+                        COALESCE(SUM(CASE WHEN rating > 0 THEN 1 ELSE 0 END), 0),
+                        COALESCE(SUM(CASE WHEN phone <> '' THEN 1 ELSE 0 END), 0)
+                 FROM businesses{}",
+                where_sql
+            ),
+            params_from_iter(values.iter()),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+    };
+    let (total, avg_rating, rated, with_phone): (i64, f64, i64, i64) = match cache {
+        Some(shared) => {
+            let mut guard = shared.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            match guard.get_filtered(writes, filter) {
+                Some(hit) => hit,
+                None => {
+                    let fresh = aggregate(conn)?;
+                    guard.put_filtered(writes, filter, fresh.0, fresh.1, fresh.2, fresh.3);
+                    fresh
+                }
+            }
+        }
+        None => aggregate(conn)?,
+    };
 
     // The filter-independent pair comes from the cache when the connection has
     // not written since it was filled (R-14); a write invalidates it.
-    let writes = total_changes(conn);
     let (all, types) = match cache {
         Some(shared) => {
             let mut guard = shared.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -2229,27 +2455,72 @@ fn load_job_refs(conn: &Connection, rows: &[Business]) -> Result<Vec<BusinessJob
     mapped.collect()
 }
 
-/// Export path: every row matching the filters, no pagination. Reached only when
-/// the user explicitly asks for "all filtered rows", never while browsing.
-pub fn load_businesses_filtered(
+/// A second, read-only connection for long reads (P2-12).
+///
+/// Exports used to scan the table while holding the shared `state.db` mutex, so
+/// every panel query and every collector write queued behind a 100k-row export.
+/// WAL gives a separate reader its own consistent snapshot without blocking the
+/// writer. Two flags matter: no `CREATE` (a mistyped or not-yet-created path
+/// must fail instead of silently producing an empty file) and `query_only`
+/// (this connection can never write, whatever the caller does).
+pub fn open_read_connection(db_path: &std::path::Path) -> Result<Connection> {
+    let conn = Connection::open_with_flags(
+        db_path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )?;
+    conn.execute_batch("PRAGMA busy_timeout = 5000; PRAGMA query_only = ON;")?;
+    Ok(conn)
+}
+
+/// How many rows a filtered export will write, without materializing them.
+///
+/// The pre-scan lets the panel's "nothing to export" answer and Excel's row
+/// limit be decided before the save dialog opens.
+pub fn count_businesses_filtered(conn: &Connection, filter: &BusinessFilter) -> Result<i64> {
+    let mut values = Vec::new();
+    let where_sql = build_where(filter, &mut values);
+    conn.query_row(
+        &format!("SELECT COUNT(*) FROM businesses{}", where_sql),
+        params_from_iter(values.iter()),
+        |row| row.get(0),
+    )
+}
+
+/// Stream every row matching the filters, one at a time (P2-12).
+///
+/// The visitor owns each row, so a writer can normalize it in place and drop it
+/// as soon as it is on disk: export memory stays flat instead of holding the
+/// whole table. Returns the number of rows visited. A visitor error aborts the
+/// scan immediately; cleaning up the partial output is the writer's job.
+pub fn stream_businesses_filtered<F>(
     conn: &Connection,
     filter: &BusinessFilter,
     sort: &BusinessSort,
-) -> Result<Vec<Business>> {
+    mut visit: F,
+) -> std::result::Result<usize, String>
+where
+    F: FnMut(Business) -> std::result::Result<(), String>,
+{
     let mut values = Vec::new();
     let where_sql = build_where(filter, &mut values);
-    let mut stmt = conn.prepare(&format!(
-        "SELECT {} FROM businesses{}{}",
-        BUSINESS_COLUMNS,
-        where_sql,
-        order_by(sort)
-    ))?;
-    let rows = stmt.query_map(params_from_iter(values.iter()), row_to_business)?;
-    let mut out = Vec::new();
-    for row in rows {
-        out.push(row?);
+    let mut stmt = conn
+        .prepare(&format!(
+            "SELECT {} FROM businesses{}{}",
+            BUSINESS_COLUMNS,
+            where_sql,
+            order_by(sort)
+        ))
+        .map_err(|error| error.to_string())?;
+    let mut rows = stmt
+        .query(params_from_iter(values.iter()))
+        .map_err(|error| error.to_string())?;
+    let mut count = 0usize;
+    while let Some(row) = rows.next().map_err(|error| error.to_string())? {
+        let business = row_to_business(row).map_err(|error| error.to_string())?;
+        visit(business)?;
+        count += 1;
     }
-    Ok(out)
+    Ok(count)
 }
 
 /// Fresh copies of specific rows, by `place_id` (R-23).
@@ -2393,6 +2664,124 @@ mod tests {
             )
             .expect("row b");
         assert_eq!(status_b, "none-found");
+    }
+
+    /// C-03: a write that matches no row must be visible to the caller — a
+    /// clear or a job deletion during an enrichment/mining run otherwise gets
+    /// counted as a successful find.
+    #[test]
+    fn writes_report_the_rows_they_changed() {
+        let conn = setup();
+        conn.execute(
+            "INSERT INTO businesses (place_id, name, types) VALUES ('a', 'A', '[]')",
+            [],
+        )
+        .expect("seed row a");
+
+        let changed = update_business_details(&conn, "a", "PC", "desc", &[1, 2], &[])
+            .expect("detail write");
+        assert_eq!(changed, 1);
+        let missing = update_business_details(&conn, "gone", "PC", "desc", &[], &[])
+            .expect("detail write for a missing row");
+        assert_eq!(missing, 0);
+
+        let mined = update_email_mining(&conn, &["a".to_string()], &[], &[], "", "none-found")
+            .expect("mine");
+        assert_eq!(mined, 1);
+        let orphan = update_email_mining(&conn, &["gone".to_string()], &[], &[], "", "none-found")
+            .expect("mine for a missing row");
+        assert_eq!(orphan, 0);
+    }
+
+    /// C-07: the tile loop's terminal write must not overwrite a cancel or a
+    /// pause that landed between the last tile and the finish.
+    #[test]
+    fn finishing_a_job_does_not_overwrite_a_user_stop() {
+        let conn = setup();
+        add_job(&conn, "job-a", "dentist", 1);
+
+        set_job_status(&conn, "job-a", "running").expect("running");
+        assert_eq!(
+            set_job_status_if_running(&conn, "job-a", "completed").expect("finish"),
+            1
+        );
+        let status: String = conn
+            .query_row("SELECT status FROM search_jobs WHERE id = 'job-a'", [], |row| {
+                row.get(0)
+            })
+            .expect("status");
+        assert_eq!(status, "completed");
+
+        // The user cancelled first: the loop's write changes nothing.
+        set_job_status(&conn, "job-a", "cancelled").expect("cancelled");
+        assert_eq!(
+            set_job_status_if_running(&conn, "job-a", "completed").expect("finish"),
+            0
+        );
+        let status: String = conn
+            .query_row("SELECT status FROM search_jobs WHERE id = 'job-a'", [], |row| {
+                row.get(0)
+            })
+            .expect("status");
+        assert_eq!(status, "cancelled");
+    }
+
+    /// C-15: an empty mining scope must be explainable. "Has a website but was
+    /// already mined" is not "no rows with a website", and the panel used to
+    /// report both the same way.
+    #[test]
+    fn mining_scope_summary_separates_mined_from_website_less() {
+        let conn = setup();
+        conn.execute(
+            "INSERT INTO businesses (place_id, name, types, website, email_status)
+             VALUES ('a', 'A', '[]', 'https://a.example', '')",
+            [],
+        )
+        .expect("row a");
+        conn.execute(
+            "INSERT INTO businesses (place_id, name, types, website, email_status)
+             VALUES ('b', 'B', '[]', 'https://b.example', 'found')",
+            [],
+        )
+        .expect("row b");
+        conn.execute(
+            "INSERT INTO businesses (place_id, name, types, website)
+             VALUES ('c', 'C', '[]', '')",
+            [],
+        )
+        .expect("row c");
+
+        let all = vec!["a".to_string(), "b".to_string(), "c".to_string()];
+        let summary = mining_scope_summary(&conn, Some(&all), None).expect("summary");
+        assert_eq!(summary.with_website, 2);
+        assert_eq!(summary.already_mined, 1);
+
+        // Only the mined row in scope: the honest answer is "already mined".
+        let mined = vec!["b".to_string()];
+        let only_mined = mining_scope_summary(&conn, Some(&mined), None).expect("summary b");
+        assert_eq!(only_mined.with_website, 1);
+        assert_eq!(only_mined.already_mined, 1);
+
+        // Only the website-less row: "no rows with a website".
+        let bare = vec!["c".to_string()];
+        let none = mining_scope_summary(&conn, Some(&bare), None).expect("summary c");
+        assert_eq!(none.with_website, 0);
+        assert_eq!(none.already_mined, 0);
+    }
+
+    /// P3-12: an explicit empty id list must be valid SQL and match nothing,
+    /// not produce `WHERE ()`.
+    #[test]
+    fn an_explicit_empty_mining_scope_is_sql_safe() {
+        let conn = setup();
+        let empty: Vec<String> = Vec::new();
+        let summary =
+            mining_scope_summary(&conn, Some(&empty), None).expect("empty summary");
+        assert_eq!(summary.with_website, 0);
+        assert_eq!(summary.already_mined, 0);
+        assert!(mining_targets(&conn, Some(&empty), None, false)
+            .expect("empty targets")
+            .is_empty());
     }
 
     #[test]
@@ -2634,6 +3023,68 @@ mod tests {
         assert_eq!(next.id, "job-b");
     }
 
+    /// P2-4: the worker may only start a job that is still queued. A cancel
+    /// that lands after `next_queued_job` read the row must win.
+    #[test]
+    fn a_cancelled_job_cannot_be_claimed_by_the_worker() {
+        let conn = setup();
+        add_job(&conn, "job-a", "dentist", 1);
+        add_job(&conn, "job-b", "plumber", 1);
+
+        assert_eq!(
+            set_job_status_if_queued(&conn, "job-a", "running").expect("claim"),
+            1
+        );
+        assert_eq!(
+            set_job_status_if_queued(&conn, "job-a", "running").expect("second claim"),
+            0,
+            "an already-running job is not queued any more"
+        );
+
+        set_job_status(&conn, "job-b", "cancelled").expect("cancel");
+        assert_eq!(
+            set_job_status_if_queued(&conn, "job-b", "running").expect("cancelled claim"),
+            0
+        );
+        let status: String = conn
+            .query_row("SELECT status FROM search_jobs WHERE id = 'job-b'", [], |row| {
+                row.get(0)
+            })
+            .expect("status");
+        assert_eq!(status, "cancelled");
+    }
+
+    /// P1-4: clearing must park the queue, not only the running job — otherwise
+    /// the worker chains to the next queued task and refills the emptied table.
+    #[test]
+    fn clearing_parks_every_queued_job() {
+        let conn = setup();
+        add_job(&conn, "job-a", "dentist", 1);
+        add_job(&conn, "job-b", "plumber", 1);
+        add_job(&conn, "job-c", "bakery", 1);
+        set_job_status(&conn, "job-a", "running").expect("running");
+
+        assert_eq!(pause_queued_jobs(&conn).expect("park"), 2);
+        // The running job is the caller's business: `clear_data` pauses it in
+        // the same lock, and this function must not touch it.
+        assert_eq!(
+            load_job(&conn, "job-a").expect("load").map(|job| job.status),
+            Some("running".to_string())
+        );
+        for id in ["job-b", "job-c"] {
+            assert_eq!(
+                load_job(&conn, id).expect("load").map(|job| job.status),
+                Some("paused".to_string())
+            );
+        }
+        // Nothing left to chain to.
+        assert!(next_queued_job(&conn).expect("next").is_none());
+        assert_eq!(
+            set_job_status_if_queued(&conn, "job-b", "running").expect("claim"),
+            0
+        );
+    }
+
     #[test]
     fn inserted_rows_accumulate() {
         let conn = setup();
@@ -2642,6 +3093,66 @@ mod tests {
         bump_job_inserted(&conn, "job-a", 3).expect("bump");
         let job = load_job(&conn, "job-a").expect("load").expect("job");
         assert_eq!(job.inserted, 10);
+    }
+
+    /// P2-14: a failure on the N-th job must roll back the jobs already
+    /// inserted in the same `create_jobs` request.
+    #[test]
+    fn insert_jobs_rolls_back_the_whole_batch() {
+        let conn = setup();
+        let tiles = |id: &str| {
+            vec![NewTile {
+                id: format!("{id}-t0"),
+                seq: 0,
+                lat: 1.0,
+                lng: 2.0,
+                zoom: 16,
+            }]
+        };
+        let batch = vec![
+            (
+                NewJob {
+                    id: "job-dup",
+                    name: "dup",
+                    batch_id: "batch-1",
+                    keyword: "dentist",
+                    city: "",
+                    center_lat: 1.0,
+                    center_lng: 2.0,
+                    radius_km: 1.0,
+                    cell_km: 1.0,
+                    split_threshold: 100,
+                    locale: "hl=en",
+                },
+                tiles("job-dup"),
+            ),
+            // Same primary key: the second insert aborts the transaction.
+            (
+                NewJob {
+                    id: "job-dup",
+                    name: "dup",
+                    batch_id: "batch-1",
+                    keyword: "dentist",
+                    city: "",
+                    center_lat: 1.0,
+                    center_lng: 2.0,
+                    radius_km: 1.0,
+                    cell_km: 1.0,
+                    split_threshold: 100,
+                    locale: "hl=en",
+                },
+                tiles("job-dup-2"),
+            ),
+        ];
+        assert!(insert_jobs(&conn, &batch).is_err(), "duplicate id must fail");
+        let jobs: i64 = conn
+            .query_row("SELECT COUNT(*) FROM search_jobs", [], |row| row.get(0))
+            .expect("jobs");
+        let tiles: i64 = conn
+            .query_row("SELECT COUNT(*) FROM search_tiles", [], |row| row.get(0))
+            .expect("tiles");
+        assert_eq!(jobs, 0, "the first job must be rolled back too");
+        assert_eq!(tiles, 0, "its tiles must be rolled back too");
     }
 
     fn quadrants(parent_seq: i64) -> Vec<ChildTile> {
@@ -2879,6 +3390,38 @@ mod tests {
         assert!(types.iter().any(|entry| entry.label == "shoe store" && entry.count == 1));
     }
 
+    /// P2-8: `%` and `_` in the search box are literals, not LIKE wildcards.
+    #[test]
+    fn search_escapes_like_wildcards() {
+        let conn = setup();
+        add_job(&conn, "job-a", "dentist", 1);
+        let rows = vec![
+            sample("p1", "50% off dental", "", 4.0, &["dentist"]),
+            sample("p2", "50X off dental", "", 4.0, &["dentist"]),
+            sample("p3", "a_b dental", "", 4.0, &["dentist"]),
+            sample("p4", "acb dental", "", 4.0, &["dentist"]),
+        ];
+        insert_businesses(&conn, &rows, "dentist", "job-a", false).expect("insert");
+
+        let percent = BusinessFilter {
+            query: "50%".to_string(),
+            ..Default::default()
+        };
+        let page =
+            query_businesses(&conn, &percent, &BusinessSort::default(), 1, 50, None).expect("q");
+        assert_eq!(page.total, 1, "a literal percent must not match 50X");
+        assert_eq!(page.rows[0].place_id, "p1");
+
+        let underscore = BusinessFilter {
+            query: "a_b".to_string(),
+            ..Default::default()
+        };
+        let page =
+            query_businesses(&conn, &underscore, &BusinessSort::default(), 1, 50, None).expect("q");
+        assert_eq!(page.total, 1, "a literal underscore must not match acb");
+        assert_eq!(page.rows[0].place_id, "p3");
+    }
+
     #[test]
     fn sorts_are_whitelisted_and_direction_aware() {
         let conn = setup();
@@ -2999,18 +3542,11 @@ mod tests {
         assert_eq!(page.total, 1);
     }
 
-    /// Perf gate for roadmap M6: 100k rows, filter + sort + paginate.
-    ///
-    /// Ignored by default because a debug build (unoptimized SQLite + rusqlite)
-    /// is roughly an order of magnitude slower than the shipped binary. Run it
-    /// with:
-    ///   cargo test --release --lib queries_stay_under_300ms -- --ignored
-    #[test]
-    #[ignore = "perf: 100k rows, run with --ignored in release"]
-    fn queries_stay_under_300ms_at_100k_rows() {
-        let conn = setup();
+    /// Seed `rows` businesses for the query gates: enough variety that the
+    /// filter and the sort both have to do real work.
+    fn seed_query_gate_rows(conn: &Connection, rows: usize) {
+        let tx = write_tx(conn).expect("tx");
         {
-            let tx = write_tx(&conn).expect("tx");
             let mut stmt = tx
                 .prepare(
                     "INSERT INTO businesses
@@ -3019,7 +3555,7 @@ mod tests {
                      VALUES (?1, ?2, ?3, ?4, ?5, ?6, 1.0, 2.0, ?7, ?8, 'dentist', 'job-a')",
                 )
                 .expect("prepare");
-            for index in 0..100_000 {
+            for index in 0..rows {
                 let types = if index % 10 == 0 {
                     r#"["dentist","orthodontist"]"#
                 } else {
@@ -3030,17 +3566,26 @@ mod tests {
                     format!("Dental Practice {:06}", index),
                     format!("{} Market Street", index),
                     if index % 3 == 0 { "" } else { "+1 555 0100" },
-                    f64::from(index % 50) / 10.0,
+                    f64::from(index as u32 % 50) / 10.0,
                     index,
                     "https://example.com",
                     types,
                 ])
                 .expect("insert");
             }
-            drop(stmt);
-            tx.commit().expect("commit");
         }
+        tx.commit().expect("commit");
+    }
 
+    /// `(cold, p95, median, samples)` for `samples` page queries sharing one
+    /// dashboard cache. The first call is the cold one: it pays for the
+    /// filtered aggregate and the type census; every later call should be
+    /// served by the cache and only run the page query.
+    ///
+    /// R-14: the real panel reuses one cache for the whole browsing session
+    /// (AppState), so the gates measure the warm steady state a user actually
+    /// experiences, not a cold cache per page.
+    fn query_gate_timings(conn: &Connection, samples: usize) -> (u64, u64, u64, Vec<u64>) {
         let filter = BusinessFilter {
             query: "Dental".to_string(),
             rating: "40".to_string(),
@@ -3052,21 +3597,90 @@ mod tests {
             direction: "desc".to_string(),
         };
 
-        let mut timings = Vec::new();
-        // R-14: the real panel reuses one dashboard cache for the whole
-        // browsing session (AppState), so the gate measures the warm steady
-        // state a user actually experiences, not a cold cache per page.
         let cache = std::sync::Mutex::new(DashboardCache::new());
-        for _ in 0..20 {
+        let mut timings = Vec::with_capacity(samples);
+        for _ in 0..samples {
             let started = std::time::Instant::now();
-            let page = query_businesses(&conn, &filter, &sort, 3, 50, Some(&cache)).expect("query");
+            let page = query_businesses(conn, &filter, &sort, 3, 50, Some(&cache)).expect("query");
             timings.push(started.elapsed().as_millis() as u64);
             assert_eq!(page.rows.len(), 50);
         }
-        timings.sort_unstable();
-        let p95 = timings[(timings.len() as f64 * 0.95).ceil() as usize - 1];
-        println!("100k rows: p95={}ms samples={:?}", p95, timings);
+        let cold = timings[0];
+        let mut sorted = timings.clone();
+        sorted.sort_unstable();
+        let p95 = sorted[(sorted.len() as f64 * 0.95).ceil() as usize - 1];
+        let median = sorted[sorted.len() / 2];
+        (cold, p95, median, timings)
+    }
+
+    /// P2-8: the CI-runnable gate. Same filter + sort + paginate shape as the
+    /// 100k benchmark, at a size a debug build can afford.
+    ///
+    /// Two assertions, because an absolute wall-clock bound alone is either
+    /// flaky or meaningless:
+    /// - `p95 < 250 ms` catches a catastrophic regression (a cross join, a
+    ///   query per returned row). Locally this p95 is ~1 ms, so the bound is
+    ///   deliberately loose: debug builds and shared runners are noisy.
+    /// - the warm median must be far below the cold call. That encodes P2-8's
+    ///   actual property — paging must not recompute the filtered aggregate —
+    ///   and scales with the machine, so it is the assertion that stays
+    ///   meaningful on slow CI runners. The guard skips it when the cold call
+    ///   is too fast to measure reliably (millisecond resolution).
+    ///
+    /// The 300 ms / 100k release target stays available as the ignored
+    /// benchmark below.
+    #[test]
+    fn queries_stay_responsive_at_20k_rows() {
+        let conn = setup();
+        seed_query_gate_rows(&conn, 20_000);
+        let (cold, p95, median, timings) = query_gate_timings(&conn, 40);
+        println!(
+            "20k rows (debug): cold={}ms p95={}ms median={}ms samples={:?}",
+            cold, p95, median, timings
+        );
+        assert!(
+            p95 < 250,
+            "p95 was {} ms at 20k rows; samples {:?}",
+            p95,
+            timings
+        );
+        if cold >= 20 {
+            assert!(
+                median.saturating_mul(8) <= cold,
+                "warm median {} ms vs cold {} ms: the filtered aggregate cache is not saving work; samples {:?}",
+                median,
+                cold,
+                timings
+            );
+        }
+    }
+
+    /// Release benchmark for roadmap M6: 100k rows, filter + sort + paginate.
+    ///
+    /// Ignored by default because a debug build (unoptimized SQLite + rusqlite)
+    /// is roughly an order of magnitude slower than the shipped binary. Run it
+    /// with:
+    ///   cargo test --release --lib queries_stay_under_300ms -- --ignored --nocapture
+    #[test]
+    #[ignore = "perf: 100k rows, run with --ignored in release"]
+    fn queries_stay_under_300ms_at_100k_rows() {
+        let conn = setup();
+        seed_query_gate_rows(&conn, 100_000);
+        let (cold, p95, median, timings) = query_gate_timings(&conn, 20);
+        println!(
+            "100k rows: cold={}ms p95={}ms median={}ms samples={:?}",
+            cold, p95, median, timings
+        );
         assert!(p95 < 300, "p95 was {} ms", p95);
+        if cold >= 20 {
+            assert!(
+                median.saturating_mul(8) <= cold,
+                "warm median {} ms vs cold {} ms: the filtered aggregate cache is not saving work; samples {:?}",
+                median,
+                cold,
+                timings
+            );
+        }
     }
 
     #[test]
@@ -3284,11 +3898,11 @@ mod tests {
         assert_eq!(rows[0].stars, 1);
         assert_eq!(rows[0].created_at_us, 1_567_179_139_665_570);
         assert_eq!(rows[0].owner_reply, "Dawei，感谢您的反馈。");
-        assert!(
+        assert_eq!(
             list_reviews(&conn, "some-other-place")
                 .expect("list")
-                .is_empty(),
-            "another place must not see these reviews"
+                .len(),
+            0
         );
 
         // A refetch replaces the row wholesale (same review id).
@@ -3433,6 +4047,76 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// P1-5: only a malformed file may trigger the rename-and-rebuild path.
+    /// The other codes describe an environment problem (lock, permissions,
+    /// missing path, disk) that a rebuild cannot fix.
+    #[test]
+    fn only_malformed_database_errors_trigger_recovery() {
+        let error = |code| {
+            rusqlite::Error::SqliteFailure(rusqlite::ffi::Error::new(code), None)
+        };
+        assert!(is_corruption_error(&error(rusqlite::ffi::SQLITE_CORRUPT)));
+        assert!(is_corruption_error(&error(rusqlite::ffi::SQLITE_NOTADB)));
+        assert!(!is_corruption_error(&error(rusqlite::ffi::SQLITE_BUSY)));
+        assert!(!is_corruption_error(&error(rusqlite::ffi::SQLITE_PERM)));
+        assert!(!is_corruption_error(&error(rusqlite::ffi::SQLITE_CANTOPEN)));
+        assert!(!is_corruption_error(&error(rusqlite::ffi::SQLITE_IOERR)));
+        assert!(!is_corruption_error(&error(rusqlite::ffi::SQLITE_FULL)));
+    }
+
+    /// P1-5: the busy handler must be in place before WAL is switched, so a
+    /// transient lock at startup waits instead of surfacing as an error.
+    #[test]
+    fn busy_timeout_is_configured_and_wal_is_enabled() {
+        let dir = std::env::temp_dir().join(format!(
+            "placemill-pragmas-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let db_path = dir.join("placemill.db");
+
+        let conn = init_database(&db_path).expect("init file database");
+        let timeout: i64 = conn
+            .query_row("PRAGMA busy_timeout", [], |row| row.get(0))
+            .expect("busy_timeout");
+        let journal: String = conn
+            .query_row("PRAGMA journal_mode", [], |row| row.get(0))
+            .expect("journal_mode");
+        assert_eq!(timeout, 5000);
+        assert_eq!(journal.to_ascii_lowercase(), "wal");
+
+        drop(conn);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// P2-11: only a missing row is "first launch"; a read failure must not be
+    /// mistaken for defaults, because the next save would overwrite the real
+    /// settings row.
+    #[test]
+    fn settings_read_errors_are_not_first_launch() {
+        let conn = setup();
+        conn.execute("DELETE FROM settings", []).expect("empty");
+        let (settings, warning) = load_settings(&conn).expect("first launch");
+        assert_eq!(settings.page_size, 50);
+        assert!(warning.is_none());
+
+        conn.execute(
+            "INSERT INTO settings (key, value) VALUES ('app', 'not json')",
+            [],
+        )
+        .expect("corrupt row");
+        let (_settings, warning) = load_settings(&conn).expect("corrupt row is a warning");
+        assert!(warning.is_some(), "a corrupt row must be reported");
+
+        conn.execute("DROP TABLE settings", []).expect("drop table");
+        assert!(
+            load_settings(&conn).is_err(),
+            "a missing table is a read failure, not a first launch"
+        );
+    }
+
     /// R-16: schema v2 prunes the redundant place_id index and adds the
     /// access paths the panel filters and the miner were full-scanning.
     #[test]
@@ -3554,9 +4238,59 @@ mod tests {
             .expect("links");
         assert_eq!(links, 1, "task links are restored too");
 
-        // The snapshot is consumed: a second restore has nothing to write.
-        let again = restore_clear_snapshot(&conn).expect("second restore");
-        assert_eq!(again, 0);
+        // The snapshot is consumed by the successful restore; a second call
+        // has no backup tables and must fail loudly rather than report an
+        // "honest zero" while the caller believes the rows came back.
+        assert!(
+            restore_clear_snapshot(&conn).is_err(),
+            "a consumed snapshot has no backup tables"
+        );
+    }
+
+    /// P1-3: a failed restore must leave both backup tables in place, so the
+    /// user can fix the cause and retry instead of losing the only copy.
+    #[test]
+    fn a_failed_restore_keeps_the_snapshot() {
+        let conn = setup();
+        add_job(&conn, "job-a", "dentist", 1);
+        let rows = vec![sample("p1", "Kept Dental", "+1 555 0100", 4.5, &["dentist"])];
+        insert_businesses(&conn, &rows, "dentist", "job-a", false).expect("insert");
+        assert_eq!(snapshot_for_clear(&conn).expect("snapshot"), 1);
+
+        // Make the restore fail after the backup copy has been taken. The
+        // trigger fires for the first INSERT ... SELECT and aborts the whole
+        // transaction, which is exactly the failure the old `unwrap_or(0)`
+        // turned into a successful "restored 0".
+        conn.execute_batch(
+            "CREATE TRIGGER fail_restore BEFORE INSERT ON businesses
+             BEGIN SELECT RAISE(ABORT, 'restore blocked'); END;",
+        )
+        .expect("failure trigger");
+        let error = restore_clear_snapshot(&conn).expect_err("restore must fail");
+        assert!(
+            error.to_string().contains("restore blocked"),
+            "unexpected error: {error}"
+        );
+
+        let backups: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master
+                 WHERE type = 'table'
+                   AND name IN ('businesses_backup', 'job_businesses_backup')",
+                [],
+                |row| row.get(0),
+            )
+            .expect("backup tables");
+        assert_eq!(backups, 2, "a failed restore must not drop the snapshot");
+
+        // Removing the obstacle lets the same snapshot be restored.
+        conn.execute_batch("DROP TRIGGER fail_restore;")
+            .expect("drop trigger");
+        assert_eq!(restore_clear_snapshot(&conn).expect("retry"), 1);
+        let rows: i64 = conn
+            .query_row("SELECT COUNT(*) FROM businesses", [], |row| row.get(0))
+            .expect("rows");
+        assert_eq!(rows, 1);
     }
 
     /// R-13: a clear with nothing to capture reports zero and leaves no
@@ -3647,6 +4381,52 @@ mod tests {
         .expect("uncached query");
         assert_eq!(uncached.all, 2);
         assert_eq!(uncached.types.len(), 2);
+    }
+
+    /// P2-8: the filtered aggregate is cached per filter, and a write
+    /// invalidates it just like the unfiltered pair.
+    #[test]
+    fn filtered_aggregates_are_cached_per_filter() {
+        let conn = setup();
+        add_job(&conn, "job-a", "dentist", 1);
+        insert_businesses(
+            &conn,
+            &[
+                sample("p1", "Dental One", "+1 555 0100", 4.0, &["dentist"]),
+                sample("p2", "Ortho Two", "+1 555 0200", 3.0, &["orthodontist"]),
+            ],
+            "dentist",
+            "job-a",
+            false,
+        )
+        .expect("insert");
+        let cache = std::sync::Mutex::new(DashboardCache::new());
+        let page_for = |query: &str| {
+            let filter = BusinessFilter {
+                query: query.to_string(),
+                ..Default::default()
+            };
+            query_businesses(&conn, &filter, &BusinessSort::default(), 1, 50, Some(&cache))
+                .expect("filtered query")
+        };
+
+        let dental = page_for("Dental");
+        assert_eq!(dental.total, 1);
+        assert_eq!(dental.with_phone, 1);
+        // A different filter must not reuse the first result.
+        assert_eq!(page_for("Ortho").total, 1);
+        // Same filter again: the cached aggregate still matches the table.
+        assert_eq!(page_for("Dental").total, 1);
+
+        insert_businesses(
+            &conn,
+            &[sample("p3", "Dental Three", "+1 555 0300", 4.5, &["dentist"])],
+            "dentist",
+            "job-a",
+            false,
+        )
+        .expect("insert");
+        assert_eq!(page_for("Dental").total, 2, "the write invalidated the cache");
     }
 
     #[test]

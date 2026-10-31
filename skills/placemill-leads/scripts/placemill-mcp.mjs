@@ -41,7 +41,7 @@ import process from 'node:process';
 import { createInterface } from 'node:readline';
 
 const SERVER_NAME = 'placemill';
-const SERVER_VERSION = '0.1.0';
+const SERVER_VERSION = '0.1.1';
 const PROTOCOL_VERSION = '2025-06-18';
 const MAX_LIMIT = 100;
 /// `export` paginates differently: it writes a file, not a chat payload, so

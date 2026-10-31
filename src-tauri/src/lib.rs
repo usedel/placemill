@@ -80,7 +80,7 @@ pub struct Business {
     // ===== M8 / J-08c =====
     //
     // The fields the index probe confirmed as filled in the *search* payload
-    // (`docs/parser.md`). They arrive from the script and get
+    // (`docs/field-index-map.md` §2). They arrive from the script and get
     // their own columns; a row collected before the migration keeps them
     // empty.
     /// Street part of the structured address.
@@ -117,7 +117,7 @@ pub struct Business {
     pub open_hours: Vec<OpenHoursDay>,
     // ===== Tier-2 detail enrichment (2026-10-26) =====
     //
-    // The fields the search payload never fills (see `docs/parser.md`); the
+    // The fields the search payload never fills (field-index-map §6.8); the
     // enrichment runner writes them after a place-page visit. Empty on rows
     // that were never enriched — the search path keeps them untouched.
     /// Open Location Code, e.g. "74GC+2V San Jose, California".
@@ -140,6 +140,7 @@ pub struct Business {
 /// this record only says a snapshot exists, how big it was, and when it was
 /// taken — the 10 s window is checked against `cleared_at`, and the snapshot
 /// dies with the process exactly like the memory-based one did.
+#[derive(Clone)]
 pub struct ClearBackup {
     pub row_count: usize,
     pub cleared_at: std::time::Instant,
@@ -230,6 +231,23 @@ impl BatchWindow {
     }
 }
 
+/// Who currently owns the Maps pane (P2-1).
+///
+/// Five commands replace the Maps document, and they must not do it at the same
+/// time. The three that own the pane for a while (a grid job, the enrichment
+/// runner, a reviews fetch) used to check three separate slots and then claim
+/// their own — two different commands could both pass the check and both
+/// navigate the pane. `claim_pane` makes the check and the claim one step.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PaneOwner {
+    /// A grid job, by id.
+    Job(String),
+    /// The Tier-2 enrichment runner.
+    Enrich,
+    /// A reviews fetch.
+    Reviews,
+}
+
 pub struct AppState {
     pub db: Mutex<rusqlite::Connection>,
     /// Persisted preferences. The single source of truth: the frontend and the
@@ -238,6 +256,14 @@ pub struct AppState {
     /// Lock order: never hold this lock while acquiring `db` or `stats`.
     /// Clone the value out first (see `update_settings`).
     pub settings: Mutex<Settings>,
+    /// Serializes read-modify-write sequences on `settings` (`update_settings`,
+    /// `reset_settings`, `remember_export`). The commands take this before
+    /// snapshotting so a concurrent export cannot write a stale copy over a
+    /// setting change (P2-11).
+    pub settings_write: Mutex<()>,
+    /// One export at a time (P2-12). Two concurrent exports could resolve the
+    /// same `-1` path and the later rename would truncate the earlier file.
+    pub export_in_flight: AtomicBool,
     pub split_ratio: Mutex<f64>,
     /// Maps pane collapsed to 1px (UI-11). Independent of `split_ratio`:
     /// restoring brings back the ratio the user dragged to.
@@ -279,6 +305,22 @@ pub struct AppState {
     /// pane for the whole batch, so a second `enrich_businesses` is refused
     /// until the flag is cleared.
     pub enrich_job: Mutex<Option<Arc<AtomicBool>>>,
+    /// The single owner of the Maps pane (P2-1). Every claim and every refusal
+    /// reads this slot; `active_runner` / `enrich_job` / `review_fetch` stay as
+    /// the operational state of each owner.
+    pub pane_owner: Mutex<Option<PaneOwner>>,
+    /// Set while a reviews fetch owns the maps pane (M9 / C-01).
+    ///
+    /// The fetch is a hard navigation plus a timed sequence of evals
+    /// (~12 s) running on its own thread; for that whole window the document
+    /// can be replaced by any other pane-owning command, and the sequence
+    /// would then read *that* page's state and store its reviews under the
+    /// place id it was asked for. This flag is what lets the other four
+    /// entry points refuse instead (see `commands::check_pane`).
+    ///
+    /// A plain flag rather than a cancel token: the sequence is short and has
+    /// no cancellation UI, so there is nothing for a token to interrupt.
+    pub review_fetch: Mutex<bool>,
     /// Latest `enrich:payload` answer from the maps page (Tier-2), keyed by
     /// the request sequence the runner stamped on its eval. The page can only
     /// answer through an event (webview `eval` returns nothing), so the
@@ -309,6 +351,15 @@ pub struct AppState {
     /// by the runner itself when it honours it — so a later resume continues
     /// with the full grid. One slot: the runner is single-flight anyway.
     pub probe_limit: Mutex<Option<String>>,
+    /// Last time a blocking `maps:health` state (consent/captcha) paused the
+    /// running task (P1-2). The page reports every state *change*, so a page
+    /// flapping between two states would otherwise pause on each report.
+    pub health_blocked_at: Mutex<Option<std::time::Instant>>,
+    /// Bumped by `clear_data` (P1-4). The page stamps every batch it sends with
+    /// the epoch it was collecting under; a batch produced before the clear is
+    /// refused even though it arrives while the 3 s switch-off grace is still
+    /// open. Without it, "cleared" could mean "cleared, then grew three rows".
+    pub collection_epoch: std::sync::atomic::AtomicU64,
 }
 
 /// How many query timings the p95 window keeps. 50 covers a page of browsing
@@ -407,6 +458,12 @@ pub fn apply_split_layout(app: &tauri::AppHandle) -> Result<(), String> {
         .get_window("main")
         .ok_or_else(|| "main window not found".to_string())?;
     let size = window.inner_size().map_err(|e| e.to_string())?;
+    // P3-10: a minimized window can report a 0×0 inner size; setting the
+    // webviews to zero is undefined in WebView2 and contradicts the "never 0"
+    // rule that `COLLAPSED_MAP_WIDTH` exists for.
+    if size.width < 2 || size.height < 2 {
+        return Ok(());
+    }
 
     let (main_w, maps_w) = if collapsed {
         (
@@ -467,6 +524,7 @@ pub fn collector_settings_script(
     reload_url: Option<&str>,
     enabled: bool,
     start_scroll: bool,
+    epoch: u64,
 ) -> String {
     let mut payload = settings.collector_payload();
     if let (Some(remote), Some(object)) = (field_map, payload.as_object_mut()) {
@@ -497,6 +555,11 @@ pub fn collector_settings_script(
         "window.__placemillEnabled = {enabled}; try {{ localStorage.setItem('__placemillEnabled', '{}'); }} catch (e) {{}} if ({enabled} && {start_scroll}) {{ try {{ window.__placemillAutoScroll.start(); }} catch (e) {{}} }} if (!{enabled}) {{ try {{ window.__placemillAutoScroll.stop('boot'); }} catch (e) {{}} }}",
         if enabled { "1" } else { "0" }
     ));
+    // P1-4: the clear epoch travels with every document. A batch is stamped with
+    // this value when it is *produced*, and `store_businesses` refuses a batch
+    // whose epoch is no longer current — which is what keeps a batch that was
+    // already in flight from landing in a table the user just emptied.
+    script.push_str(&format!(" window.__placemillEpoch = {epoch};"));
     if let Some(url) = reload_url {
         // Serialize instead of interpolating: a stray quote would break the script.
         let quoted = serde_json::to_string(url)
@@ -541,7 +604,17 @@ fn push_collector_settings(app: &tauri::AppHandle) {
             .unwrap_or(false);
         // A late field-map push lands in an already-loaded document: re-assert
         // the switch, never start or stop the loop under the runner's feet.
-        let script = collector_settings_script(&settings, field_map.as_ref(), None, enabled, false);
+        let epoch = state
+            .collection_epoch
+            .load(std::sync::atomic::Ordering::Acquire);
+        let script = collector_settings_script(
+            &settings,
+            field_map.as_ref(),
+            None,
+            enabled,
+            false,
+            epoch,
+        );
         if let Some(maps) = app.get_webview("maps") {
             if let Err(error) = maps.eval(&script) {
                 log_warn!("push_collector_settings failed: {}", error);
@@ -557,6 +630,10 @@ fn push_collector_settings(app: &tauri::AppHandle) {
 /// Ceilings for one batch. The injected script sends ~20 rows; these numbers
 /// exist to bound a hostile or broken producer, not normal traffic.
 const MAX_BATCH_ROWS: usize = 500;
+/// One reviews payload is much smaller than a search batch, but it is still
+/// page-controlled. The cap keeps a hostile/broken response from allocating an
+/// unbounded vector before the store path's own rate window sees it.
+const MAX_REVIEW_ROWS: usize = 2_000;
 const MAX_NAME_CHARS: usize = 200;
 const MAX_ADDRESS_CHARS: usize = 300;
 const MAX_PHONE_CHARS: usize = 60;
@@ -628,8 +705,11 @@ fn clamp_chars(value: &mut String, max: usize) -> bool {
     touched
 }
 
-/// A Google place id is `ChIJ…`-shaped base64url: ASCII alphanumerics plus
-/// `-`, `_` and occasionally `.`. Anything else came from a script, not Maps.
+/// A place id is Google's opaque key. Real Maps ids are `ChIJ…`-shaped
+/// base64url (ASCII alphanumerics plus `-`, `_`, occasionally `.`), but the
+/// e2e fixtures and some older payloads use other ASCII shapes, so this guard
+/// enforces the conservative wire shape (non-empty ASCII, bounded length)
+/// rather than a `ChIJ` prefix.
 fn is_valid_place_id(id: &str) -> bool {
     !id.is_empty()
         && id.len() <= MAX_PLACE_ID_CHARS
@@ -765,23 +845,94 @@ pub fn sanitize_batch(businesses: &mut Vec<Business>) -> IngressReport {
     report
 }
 
+/// Parse the `businesses` array from a page event.
+///
+/// P2-7: the cap and the per-row tolerance both matter here. The old code
+/// cloned the whole array and used one `from_value::<Vec<Business>>`, so a
+/// payload of 100k rows was parsed before `sanitize_batch` truncated it, and a
+/// single row missing `name`/`website` dropped the other 499. Rows past the cap
+/// are reported, not parsed; malformed rows are skipped and counted.
+fn parse_business_batch(
+    value: &serde_json::Value,
+) -> Result<(Vec<Business>, usize, usize), String> {
+    let array = value
+        .as_array()
+        .ok_or_else(|| "businesses is not an array".to_string())?;
+    let over_cap = array.len().saturating_sub(MAX_BATCH_ROWS);
+    let mut rows = Vec::with_capacity(array.len().min(MAX_BATCH_ROWS));
+    let mut invalid = 0usize;
+    for item in array.iter().take(MAX_BATCH_ROWS) {
+        match serde_json::from_value::<Business>(item.clone()) {
+            Ok(row) => rows.push(row),
+            Err(_) => invalid += 1,
+        }
+    }
+    Ok((rows, over_cap, invalid))
+}
+
+/// The reviews counterpart of `parse_business_batch`: bounded, tolerant of one
+/// malformed row, and never a reason to drop the rows that did parse.
+fn parse_review_batch(
+    value: &serde_json::Value,
+) -> Result<(Vec<db::ReviewRow>, usize, usize), String> {
+    let array = value
+        .as_array()
+        .ok_or_else(|| "reviews is not an array".to_string())?;
+    let over_cap = array.len().saturating_sub(MAX_REVIEW_ROWS);
+    let mut rows = Vec::with_capacity(array.len().min(MAX_REVIEW_ROWS));
+    let mut invalid = 0usize;
+    for item in array.iter().take(MAX_REVIEW_ROWS) {
+        match serde_json::from_value::<db::ReviewRow>(item.clone()) {
+            Ok(row) => rows.push(row),
+            Err(_) => invalid += 1,
+        }
+    }
+    Ok((rows, over_cap, invalid))
+}
+
 /// How long after the switch goes off a batch may still land: it was already
 /// parsed and in flight when the user stopped. `intercept.js` checks the flag
 /// before parsing (R-08), so anything older than one IPC round trip belongs to
 /// a page that should not be collecting any more.
 const SWITCH_OFF_GRACE: Duration = Duration::from_secs(3);
+/// How rarely a consent/captcha report may pause a task (P1-2). The injected
+/// probe emits on every state change, and a page that alternates between two
+/// blocking states must not turn each report into another pause attempt.
+const HEALTH_PAUSE_COOLDOWN: Duration = Duration::from_secs(60);
+/// The switch itself: on, or off for less than `SWITCH_OFF_GRACE`.
+///
+/// Pure and fixture-free, so both the write gate and pane ownership can share
+/// one definition of "collecting" while only the write gate honours the e2e
+/// override.
+fn switch_gate(listening: bool, since_off: Option<Duration>) -> bool {
+    listening
+        || since_off
+            .map(|elapsed| elapsed < SWITCH_OFF_GRACE)
+            .unwrap_or(false)
+}
 
 /// Whether a batch may be written, given the switch and how long ago it went
 /// off. Pure so the rule has a test instead of only a code path: the grace is
 /// what keeps a stop from eating the batch that was already on the wire.
 fn session_gate(listening: bool, since_off: Option<Duration>, fixture: bool) -> bool {
-    if fixture {
-        return true;
+    fixture || switch_gate(listening, since_off)
+}
+
+/// Whether a batch produced under `epoch` may be written while the table is at
+/// `expected` (P1-4).
+///
+/// Pure so the rule has a test: the epoch is what separates "already on the
+/// wire when the user cleared" from "belongs to the session that was cleared".
+///
+/// A payload that *declares* an epoch is always judged on it — the exemption for
+/// the e2e fixtures only covers the absence of the field, so the rule can still
+/// be exercised end to end. The injected script always sends one; a declared
+/// value that no longer matches can only be a batch from before the clear.
+fn epoch_admits(epoch: Option<u64>, expected: u64, fixture: bool) -> bool {
+    match epoch {
+        Some(epoch) => epoch == expected,
+        None => fixture,
     }
-    listening
-        || since_off
-            .map(|elapsed| elapsed < SWITCH_OFF_GRACE)
-            .unwrap_or(false)
 }
 
 /// Debug-build fixture switch, same shape as `PLACE_MILL_ALLOW_PRIVATE_TARGETS`.
@@ -815,6 +966,24 @@ fn session_active(state: &AppState) -> bool {
     session_gate(listening, since_off, fixture_batches_allowed())
 }
 
+/// Whether the collector switch is on, ignoring the e2e fixture override.
+///
+/// `session_active` answers `true` whenever fixtures are allowed, so a suite can
+/// seed batches with no session behind them. That override must not reach pane
+/// ownership: a suite that seeds rows off-session would otherwise see every
+/// pane-owning command refused with `session_active` — which is exactly what
+/// `e2e:pane` caught (C-01).
+pub(crate) fn switch_on(state: &AppState) -> bool {
+    let listening = state.listening.lock().map(|value| *value).unwrap_or(false);
+    let since_off = state
+        .switch_off_at
+        .lock()
+        .ok()
+        .and_then(|at| *at)
+        .map(|at| at.elapsed());
+    switch_gate(listening, since_off)
+}
+
 #[cfg(test)]
 mod session_tests {
     use super::*;
@@ -840,14 +1009,86 @@ mod session_tests {
     fn fixtures_may_write_without_a_session() {
         assert!(session_gate(false, None, true));
     }
+
+    /// P1-4: a batch produced before the last clear is refused even while the
+    /// switch-off grace would otherwise admit it.
+    #[test]
+    fn a_batch_from_before_the_clear_is_refused() {
+        assert!(
+            epoch_admits(Some(0), 0, false),
+            "a fresh app accepts its own epoch"
+        );
+        assert!(epoch_admits(Some(3), 3, false));
+        assert!(
+            !epoch_admits(Some(3), 4, false),
+            "a batch produced under the cleared epoch must not land in the emptied table"
+        );
+        assert!(
+            !epoch_admits(Some(0), 1, false),
+            "the first clear bumps 0 -> 1"
+        );
+        // A payload without the field comes from the e2e fixtures; the
+        // exemption covers only its absence, never a declared mismatch.
+        assert!(epoch_admits(None, 7, true));
+        assert!(!epoch_admits(None, 7, false));
+        assert!(!epoch_admits(Some(0), 7, true));
+    }
+
+    /// The fixture override belongs to the write gate only. Pane ownership asks
+    /// `switch_on`, which must stay honest inside the suites — otherwise every
+    /// pane command refuses itself with `session_active` (C-01).
+    #[test]
+    fn the_fixture_override_does_not_turn_the_switch_on() {
+        assert!(!switch_gate(false, None));
+        assert!(switch_gate(false, Some(Duration::from_secs(1))));
+        assert!(!switch_gate(false, Some(Duration::from_secs(4))));
+        assert!(session_gate(false, None, true));
+    }
+}
+
+#[cfg(test)]
+mod review_place_tests {
+    use super::*;
+
+    fn review(own_place: &str) -> db::ReviewRow {
+        db::ReviewRow {
+            review_id: "r1".to_string(),
+            payload_place_id: own_place.to_string(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn rows_of_another_place_are_dropped() {
+        // The hex tail is the part both shapes share; a review whose own field
+        // names a different tail is another place's row.
+        let mut rows = vec![
+            review("0x0:0xabc123"),
+            review("0x0:0xdef456"),
+            review(""),
+        ];
+        let dropped = retain_reviews_of_place(&mut rows, "0x8848:0xabc123");
+        assert_eq!(dropped, 1);
+        assert_eq!(rows.len(), 2);
+    }
+
+    #[test]
+    fn a_missing_data_id_disables_the_check() {
+        let mut rows = vec![review("0x0:0xdef456")];
+        assert_eq!(retain_reviews_of_place(&mut rows, ""), 0);
+        assert_eq!(rows.len(), 1);
+    }
 }
 
 /// The circle an area job was created with, read once per batch.
 ///
-/// `None` means "no circle to enforce": the batch is unattributed (`job_id`
-/// empty), or the job row is gone (an e2e fixture attributing rows to an id it
-/// never inserted). Both keep storing whatever arrives — dropping them would
-/// silently break the suites, and neither can claim a radius the user chose.
+/// `None` means "no circle to enforce": no job id was passed, or the job row is
+/// gone (an e2e fixture attributing rows to an id it never inserted). Both keep
+/// storing whatever arrives — dropping them would silently break the suites,
+/// and neither can claim a radius the user chose.
+///
+/// Callers must resolve an unattributed batch to the running job *before*
+/// calling this (P2-3); `store_businesses` does.
 fn job_area(state: &tauri::State<'_, AppState>, job_id: &str) -> Option<(f64, f64, f64)> {
     if job_id.is_empty() {
         return None;
@@ -873,12 +1114,35 @@ pub fn store_businesses(
     mut businesses: Vec<Business>,
     source_query: &str,
     job_id: &str,
+    epoch: Option<u64>,
 ) -> usize {
     if businesses.is_empty() {
         return 0;
     }
 
     let state = app.state::<AppState>();
+
+    // P1-4: a batch produced before the last `clear_data` must not land in the
+    // emptied table. The switch-off grace exists to rescue a batch that was
+    // already on the wire, and that is exactly the window this check closes —
+    // the epoch says whether the batch belongs to the session that was cleared.
+    //
+    // The e2e fixtures emit `business-data` without an epoch, so a payload that
+    // omits the field is exempt (debug builds only, same gate as the session
+    // override); a payload that declares one is always judged on it.
+    let expected_epoch = state
+        .collection_epoch
+        .load(std::sync::atomic::Ordering::Acquire);
+    if !epoch_admits(epoch, expected_epoch, fixture_batches_allowed()) {
+        let received = businesses.len();
+        state.record_batch(received, 0, received);
+        log_debug!(
+            "business-data refused: produced under epoch {:?}, the table is at epoch {}",
+            epoch,
+            expected_epoch
+        );
+        return 0;
+    }
 
     // Only an active session may write. `business-data` is reachable from any
     // script on the maps page (R-26 bounds the volume, not the timing), and the
@@ -984,10 +1248,26 @@ pub fn store_businesses(
     // which 62 were inside the circle. Unattributed batches have no job and
     // therefore no circle: those keep the old behaviour.
     //
+    // P2-3: an unattributed batch still belongs to whichever job is running.
+    // `attribute_batch` refuses a late batch from the previous cell by design,
+    // but skipping the radius check for it let rows up to kilometres outside the
+    // circle in under the "unattributed" label — the same rows the filter exists
+    // to remove. With no runner there is no circle, and that stays the case.
+    let area_job = if job_id.is_empty() {
+        state
+            .active_runner
+            .lock()
+            .ok()
+            .and_then(|slot| slot.clone())
+            .unwrap_or_default()
+    } else {
+        job_id.to_string()
+    };
+
     // `batch_seen` is what Google actually sent (after the switch backstop,
     // before the area filter); `count_tile_rows` takes both numbers.
     let batch_seen = businesses.len();
-    if let Some((center_lat, center_lng, radius_km)) = job_area(&state, job_id) {
+    if let Some((center_lat, center_lng, radius_km)) = job_area(&state, &area_job) {
         businesses.retain(|business| {
             grid::within_radius(center_lat, center_lng, business.lat, business.lng, radius_km)
         });
@@ -1007,8 +1287,9 @@ pub fn store_businesses(
     // decision reads it (see `collector::count_tile_rows`). Counting the raw
     // batch made a 1.5 km cell subdivide — 120 rows arrived, ~30 were inside
     // the radius, the 100-row threshold tripped and the quadtree grew into
-    // territory the job never covered.
-    collector::count_tile_rows(app, businesses.len(), batch_seen);
+    // territory the job never covered. The counter also checks attribution and
+    // counts each place id once (P2-2).
+    collector::count_tile_rows(app, job_id, &businesses);
 
     // A batch that is entirely filtered out still happened: the summary must
     // see it, but there is nothing to write or announce.
@@ -1109,6 +1390,33 @@ fn sanitize_review(review: &mut db::ReviewRow) -> bool {
     !review.review_id.is_empty()
 }
 
+/// C-02: drop review rows that name a different place than the one requested.
+///
+/// The fetch is a migration of the pane to a place page and back through a
+/// timed sequence, so it can read a document it did not navigate to — another
+/// place, or a search page whose state still holds the previous place's
+/// reviews. Rust stamps the panel's key on every row, so without this check
+/// those rows would be stored under the wrong business and `INSERT OR REPLACE`
+/// would overwrite the right ones.
+///
+/// `payload_place_id` is the parser's own place field; the hex tail of
+/// `data_id` is the part that survives both shapes (`0x0:0x…` in the payload,
+/// `0x…:0x…` in the business row). A row without the field cannot be judged and
+/// is kept — dropping it would lose real data whenever the parser omits the id.
+/// Returns how many rows were dropped, for the diagnostic log.
+fn retain_reviews_of_place(reviews: &mut Vec<db::ReviewRow>, data_id: &str) -> usize {
+    let tail = data_id.rsplit(':').next().unwrap_or("").trim();
+    if tail.is_empty() {
+        return 0;
+    }
+    let before = reviews.len();
+    reviews.retain(|review| {
+        let own = review.payload_place_id.trim();
+        own.is_empty() || own.contains(tail)
+    });
+    before - reviews.len()
+}
+
 /// M9: store one place's reviews and tell the panel they changed. Unlike
 /// `business-data`, no session gate: reviews are fetched per business on
 /// demand, outside any collecting session. The rate window is what bounds a
@@ -1123,6 +1431,20 @@ fn store_reviews(
         return 0;
     }
     let state = app.state::<AppState>();
+
+    let mismatched = retain_reviews_of_place(&mut reviews, data_id);
+    if mismatched > 0 {
+        log_warn!(
+            "business-reviews for {}: {} row(s) belonged to another place and were dropped",
+            crate::logging::redact_place_id(place_id),
+            mismatched
+        );
+        state.record_error(format!(
+            "Reviews fetch for {} returned {} row(s) of another place; dropped",
+            crate::logging::redact_place_id(place_id),
+            mismatched
+        ));
+    }
 
     // Rust stamps the panel's key on every row — the payload's own place
     // field has a different shape and is kept only for reference.
@@ -1170,12 +1492,9 @@ fn store_reviews(
         0
     };
 
-    if inserted > 0 {
-        let _ = app.emit("reviews:updated", &serde_json::json!({
-            "placeId": place_id,
-            "count": inserted,
-        }));
-    }
+    // The completion event is emitted by the `business-reviews` listener, once
+    // per payload — including the zero-row, mismatch and failure cases (P2-5).
+    // Emitting here as well would answer twice for the same sequence.
     inserted
 }
 
@@ -1191,10 +1510,13 @@ pub fn run() {
         .plugin(tauri_plugin_updater::Builder::new().build())
         .setup(|app| {
             // ========== Initialize SQLite (system data dir, avoids dev watcher restarts) ==========
-            let data_dir = app
-                .path()
-                .app_data_dir()
-                .expect("Failed to get app data directory");
+            let data_dir = match app.path().app_data_dir() {
+                Ok(dir) => dir,
+                Err(error) => {
+                    log_error!("app data directory unavailable: {}", error);
+                    return Err(format!("app data directory unavailable: {}", error).into());
+                }
+            };
             let db_path = data_dir.join("placemill.db");
             log_info!(
                 "database path: {}",
@@ -1234,8 +1556,16 @@ pub fn run() {
 
             // Settings must be read before the window is created: the first paint
             // has to use the persisted theme / language / page size / split, and
-            // the split is needed by the layout math below.
-            let (settings, settings_warning) = db::load_settings(&db);
+            // the split is needed by the layout math below. A read failure is
+            // fatal here: starting with defaults would let the first save
+            // overwrite the user's real settings row (P2-11).
+            let (settings, settings_warning) = match db::load_settings(&db) {
+                Ok(pair) => pair,
+                Err(error) => {
+                    log_error!("settings unavailable: {}", error);
+                    return Err(format!("settings unavailable: {}", error).into());
+                }
+            };
             // R-36b: the stored level is the first thing to apply, so the very
             // next line (including a settings warning) is already filtered.
             logging::set_level(&settings.log_level);
@@ -1248,14 +1578,18 @@ pub fn run() {
             // Serialized once, injected into the React webview so the very first
             // render already has the real settings (no flash, and no duplicate
             // defaults on the JS side).
+            let settings_json = serde_json::to_string(&settings)
+                .map_err(|error| format!("Failed to serialize settings: {}", error))?;
             let bootstrap_script = format!(
                 "window.__PLACE_MILL_SETTINGS__ = {};",
-                serde_json::to_string(&settings).expect("Failed to serialize settings")
+                settings_json
             );
 
             app.manage(AppState {
                 db: Mutex::new(db),
                 settings: Mutex::new(settings.clone()),
+                settings_write: Mutex::new(()),
+                export_in_flight: AtomicBool::new(false),
                 split_ratio: Mutex::new(startup_ratio),
                 map_collapsed: Mutex::new(settings.map_collapsed),
                 listening: Mutex::new(false),
@@ -1271,8 +1605,12 @@ pub fn run() {
                 parse_degraded_at: Mutex::new(None),
                 email_mining: Mutex::new(None),
                 enrich_job: Mutex::new(None),
+                pane_owner: Mutex::new(None),
+                review_fetch: Mutex::new(false),
                 enrich_payload: Mutex::new(None),
                 probe_limit: Mutex::new(None),
+                health_blocked_at: Mutex::new(None),
+                collection_epoch: std::sync::atomic::AtomicU64::new(0),
                 query_latency: Mutex::new(std::collections::VecDeque::new()),
                 clear_backup: Mutex::new(None),
                 dashboard: Mutex::new(db::DashboardCache::new()),
@@ -1358,6 +1696,9 @@ pub fn run() {
                 "creating maps webview: x={}, w={}, h={}, url={}",
                 maps_x, maps_w, window_size.height, maps_url
             );
+            let maps_url: url::Url = maps_url
+                .parse()
+                .map_err(|error| format!("invalid maps URL: {}", error))?;
 
             // R-31: `intercept.js` gates its debug helpers (`__placemillDiag`,
             // `__placemillTest`) on this flag. They write rows into SQLite from
@@ -1376,7 +1717,7 @@ pub fn run() {
                         "maps",
                         // `hl`/`gl` come from the settings, so the map language is
                         // independent from the OS locale and from the panel UI.
-                        tauri::WebviewUrl::External(maps_url.parse().unwrap()),
+                        tauri::WebviewUrl::External(maps_url),
                     )
                     // NOTE: do not call additional_browser_args() here. WebView2
                     // creates one environment per webview and requires identical
@@ -1415,12 +1756,16 @@ pub fn run() {
 
                         match settings {
                             Ok(settings) => {
+                                let epoch = state
+                                    .collection_epoch
+                                    .load(std::sync::atomic::Ordering::Acquire);
                                 let script = collector_settings_script(
                                     &settings,
                                     field_map.as_ref(),
                                     None,
                                     enabled,
                                     true,
+                                    epoch,
                                 );
                                 if let Err(error) = webview.eval(&script) {
                                     log_warn!("on_page_load eval failed: {}", error);
@@ -1455,81 +1800,107 @@ pub fn run() {
             app.listen("business-data", move |event| {
                 match serde_json::from_str::<serde_json::Value>(event.payload()) {
                     Ok(value) => {
-                        if let Some(biz_json) = value.get("businesses") {
-                            match serde_json::from_value::<Vec<Business>>(biz_json.clone()) {
-                                Ok(businesses) => {
-                                    // Batch attribution lives on the event, not on
-                                    // `Business`: it describes the search that
-                                    // produced the rows. The grid runner reads the
-                                    // same fields to close a cell.
-                                    let field = |key: &str| {
-                                        value
-                                            .get(key)
-                                            .and_then(|v| v.as_str())
-                                            .unwrap_or("")
-                                            .to_string()
-                                    };
-                                    let source_query = field("sourceQuery");
-                                    // The page's `jobId` is deliberately ignored:
-                                    // it is read from sessionStorage, outlives the
-                                    // job that wrote it, and made a cancelled job's
-                                    // result list keep growing. Rust decides the
-                                    // attribution below; the payload only names the
-                                    // tile the page thinks it is scrolling.
-                                    let tile_id = field("tileId");
-
-                                    // Which job/tile this batch belongs to. Only the
-                                    // tile the runner is waiting on is attributed, so a
-                                    // late batch from the previous cell cannot inflate
-                                    // the current one.
-                                    let attributed =
-                                        collector::attribute_batch(&app_handle, &tile_id);
-                                    // Fixture mode (debug build + explicit flag): the
-                                    // e2e suites attribute rows to a job that is not
-                                    // running, which is what the payload id used to do
-                                    // for every caller. Release builds never take this
-                                    // branch.
-                                    let attributed = attributed.or_else(|| {
-                                        let payload_id = field("jobId");
-                                        (fixture_batches_allowed() && !payload_id.is_empty())
-                                            .then_some(payload_id)
-                                    });
-                                    let job_id = attributed.clone().unwrap_or_default();
-
-                                    let inserted = store_businesses(
-                                        &app_handle,
-                                        businesses,
-                                        &source_query,
-                                        &job_id,
-                                    );
-
-                                    if let Some(job_id) = attributed {
-                                        if inserted > 0 {
-                                            let state = app_handle.state::<AppState>();
-                                            let Ok(conn) = state.db.lock() else {
-                                                return;
-                                            };
-                                            let _ = db::bump_job_inserted(&conn, &job_id, inserted);
-                                            drop(conn);
-                                            collector::emit_progress(&app_handle, &job_id);
-                                        }
-                                    }
-                                    log_debug!(
-                                        "batch stored, newly inserted: {} (query: {:?}, job: {:?}, tile: {:?})",
-                                        inserted, source_query, job_id, tile_id
-                                    );
-                                }
-                                Err(e) => {
-                                    log_error!(
-                                        "event deserialize businesses error: {}",
-                                        e
-                                    );
+                        let Some(biz_json) = value.get("businesses") else {
+                            log_error!("business-data payload has no businesses array");
+                            app_handle.state::<AppState>().record_error(
+                                "business-data payload has no businesses array".to_string(),
+                            );
+                            return;
+                        };
+                        // P2-7: cap before deserializing, and let one malformed
+                        // row cost itself instead of the whole batch.
+                        let (businesses, over_cap, invalid) =
+                            match parse_business_batch(biz_json) {
+                                Ok(parsed) => parsed,
+                                Err(error) => {
+                                    log_error!("event deserialize businesses error: {}", error);
                                     app_handle
                                         .state::<AppState>()
-                                        .record_error(format!("Failed to parse business data: {}", e));
+                                        .record_error(format!(
+                                            "Failed to parse business data: {}",
+                                            error
+                                        ));
+                                    return;
                                 }
+                            };
+                        if over_cap > 0 || invalid > 0 {
+                            log_warn!(
+                                "business-data: {} row(s) over the {} cap, {} invalid row(s) skipped",
+                                over_cap,
+                                MAX_BATCH_ROWS,
+                                invalid
+                            );
+                            app_handle.state::<AppState>().record_error(format!(
+                                "business-data: {} row(s) over the {} cap and {} invalid row(s) skipped",
+                                over_cap, MAX_BATCH_ROWS, invalid
+                            ));
+                        }
+
+                        // Batch attribution lives on the event, not on
+                        // `Business`: it describes the search that produced the
+                        // rows. The grid runner reads the same fields to close a
+                        // cell.
+                        let field = |key: &str| {
+                            value
+                                .get(key)
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("")
+                                .to_string()
+                        };
+                        let source_query = field("sourceQuery");
+                        // The page's `jobId` is deliberately ignored: it is read
+                        // from sessionStorage, outlives the job that wrote it,
+                        // and made a cancelled job's result list keep growing.
+                        // Rust decides the attribution below; the payload only
+                        // names the tile the page thinks it is scrolling.
+                        let tile_id = field("tileId");
+
+                        // Which job/tile this batch belongs to. Only the tile
+                        // the runner is waiting on is attributed, so a late batch
+                        // from the previous cell cannot inflate the current one.
+                        let attributed = collector::attribute_batch(&app_handle, &tile_id);
+                        // Fixture mode (debug build + explicit flag): the e2e
+                        // suites attribute rows to a job that is not running,
+                        // which is what the payload id used to do for every
+                        // caller. Release builds never take this branch.
+                        let attributed = attributed.or_else(|| {
+                            let payload_id = field("jobId");
+                            (fixture_batches_allowed() && !payload_id.is_empty())
+                                .then_some(payload_id)
+                        });
+                        let job_id = attributed.clone().unwrap_or_default();
+                        // P1-4: the epoch the page was collecting under when it
+                        // produced this batch. `None` means the payload never
+                        // declared one — only the e2e fixtures do that; the
+                        // injected script always sends the number.
+                        let epoch = value.get("epoch").and_then(|v| v.as_u64());
+
+                        let inserted = store_businesses(
+                            &app_handle,
+                            businesses,
+                            &source_query,
+                            &job_id,
+                            epoch,
+                        );
+
+                        if let Some(job_id) = attributed {
+                            if inserted > 0 {
+                                let state = app_handle.state::<AppState>();
+                                let Ok(conn) = state.db.lock() else {
+                                    return;
+                                };
+                                let _ = db::bump_job_inserted(&conn, &job_id, inserted);
+                                drop(conn);
+                                collector::emit_progress(&app_handle, &job_id);
                             }
                         }
+                        log_debug!(
+                            "batch stored, newly inserted: {} (query: {:?}, job: {:?}, tile: {:?})",
+                            inserted,
+                            source_query,
+                            job_id,
+                            tile_id
+                        );
                     }
                     Err(e) => {
                         log_error!("event parse payload error: {}", e);
@@ -1543,61 +1914,76 @@ pub fn run() {
             // ========== Listen for the business-reviews event (M9) ==========
             // The eval'd fetch resolves and emits here: one payload per
             // place, carrying the place id Rust stamped on the request.
+            //
+            // P2-5: every payload ends the sequence for the panel, whatever it
+            // carried. The old code emitted `reviews:updated` only when rows were
+            // *inserted*, so a business with zero reviews — a common case — left
+            // the drawer spinning until its own 15 s timeout and kept every pane
+            // action disabled for that whole window.
             let reviews_handle = app.handle().clone();
             app.listen("business-reviews", move |event| {
-                match serde_json::from_str::<serde_json::Value>(event.payload()) {
-                    Ok(value) => {
-                        let field = |key: &str| {
-                            value
-                                .get(key)
-                                .and_then(|v| v.as_str())
-                                .unwrap_or("")
-                                .to_string()
-                        };
-                        let place_id = field("placeId");
-                        let data_id = field("dataId");
-                        match value.get("reviews") {
-                            Some(reviews_json) => {
-                                match serde_json::from_value::<Vec<db::ReviewRow>>(
-                                    reviews_json.clone(),
-                                ) {
-                                    Ok(reviews) => {
-                                        let inserted =
-                                            store_reviews(&reviews_handle, reviews, &place_id, &data_id);
-                                        log_debug!(
-                                            "reviews stored, newly inserted: {} (place: {})",
-                                            inserted,
-                                            place_id
-                                        );
-                                    }
-                                    Err(e) => {
-                                        reviews_handle
-                                            .state::<AppState>()
-                                            .record_error(format!(
-                                                "Failed to parse review rows: {}",
-                                                e
-                                            ));
-                                    }
-                                }
+                let Ok(value) = serde_json::from_str::<serde_json::Value>(event.payload()) else {
+                    // Unparseable is still an answer the panel must not wait on,
+                    // but there is no place id to address it to here.
+                    log_error!("event parse reviews payload error: {}", event.payload());
+                    return;
+                };
+                let field = |key: &str| {
+                    value
+                        .get(key)
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string()
+                };
+                let place_id = field("placeId");
+                let data_id = field("dataId");
+                let mut inserted = 0usize;
+                match value.get("reviews") {
+                    Some(reviews_json) => match parse_review_batch(reviews_json) {
+                        Ok((reviews, over_cap, invalid)) => {
+                            if over_cap > 0 || invalid > 0 {
+                                log_warn!(
+                                    "business-reviews: {} row(s) over the {} cap, {} invalid row(s) skipped",
+                                    over_cap,
+                                    MAX_REVIEW_ROWS,
+                                    invalid
+                                );
+                                reviews_handle
+                                    .state::<AppState>()
+                                    .record_error(format!(
+                                        "business-reviews: {} row(s) over the {} cap and {} invalid row(s) skipped",
+                                        over_cap, MAX_REVIEW_ROWS, invalid
+                                    ));
                             }
-                            None => {
-                                // An error payload (no rows) — surface the reason.
-                                let error = field("error");
-                                if !error.is_empty() {
-                                    reviews_handle
-                                        .state::<AppState>()
-                                        .record_error(format!(
-                                            "Reviews fetch for {} failed: {}",
-                                            place_id, error
-                                        ));
-                                }
-                            }
+                            inserted =
+                                store_reviews(&reviews_handle, reviews, &place_id, &data_id);
+                            log_debug!(
+                                "reviews stored, newly inserted: {} (place: {})",
+                                inserted,
+                                crate::logging::redact_place_id(&place_id)
+                            );
+                        }
+                        Err(e) => {
+                            reviews_handle
+                                .state::<AppState>()
+                                .record_error(format!("Failed to parse review rows: {}", e));
+                        }
+                    },
+                    None => {
+                        // An error payload (no rows) — surface the reason.
+                        let error = field("error");
+                        if !error.is_empty() {
+                            reviews_handle.state::<AppState>().record_error(format!(
+                                "Reviews fetch for {} failed: {}",
+                                place_id, error
+                            ));
                         }
                     }
-                    Err(e) => {
-                        log_error!("event parse reviews payload error: {}", e);
-                    }
                 }
+                let _ = reviews_handle.emit(
+                    "reviews:updated",
+                    &serde_json::json!({ "placeId": place_id, "count": inserted }),
+                );
             });
 
             // ========== Listen for the enrich:payload event (Tier-2) ==========
@@ -1623,7 +2009,7 @@ pub fn run() {
             // closing the current one.
             let start_handle = app.handle().clone();
             app.listen("collector:scroll-start", move |event| {
-                log_debug!("collector:scroll-start {}", event.payload());
+                log_debug!("collector:scroll-start {:?}", event.payload());
                 let Ok(value) = serde_json::from_str::<serde_json::Value>(event.payload()) else {
                     return;
                 };
@@ -1642,7 +2028,7 @@ pub fn run() {
 
             let idle_handle = app.handle().clone();
             app.listen("collector:scroll-idle", move |event| {
-                log_debug!("collector:scroll-idle {}", event.payload());
+                log_debug!("collector:scroll-idle {:?}", event.payload());
                 let Ok(value) = serde_json::from_str::<serde_json::Value>(event.payload()) else {
                     return;
                 };
@@ -1683,6 +2069,68 @@ pub fn run() {
                 }
             });
 
+            // ========== Dead-page health (P1-2) ==========
+            // The injected probe reports consent / captcha / no-results changes
+            // while the switch is on. `no-results` is informational — an empty
+            // area looks the same from the page — but a consent screen or a
+            // captcha means every further navigation is wasted, so a running
+            // task is paused here through the same path the pause button takes
+            // (job `paused`, tile back to `pending`, switch off, progress
+            // emitted). Leaving it to the dead-page streak alone cost two full
+            // cells per blocking page before anything happened.
+            let health_handle = app.handle().clone();
+            app.listen("maps:health", move |event| {
+                let Ok(value) = serde_json::from_str::<serde_json::Value>(event.payload()) else {
+                    return;
+                };
+                let health = value.get("state").and_then(|v| v.as_str()).unwrap_or("");
+                if health != "consent" && health != "captcha" {
+                    return;
+                }
+                let state = health_handle.state::<AppState>();
+                // Nothing to pause: returning before the cooldown is touched
+                // matters, because a blocked page reported while the app is idle
+                // would otherwise use up the window and leave the next task
+                // unpaused for a minute.
+                let job_id = state
+                    .active_runner
+                    .lock()
+                    .ok()
+                    .and_then(|slot| slot.clone());
+                let Some(job_id) = job_id else {
+                    return;
+                };
+                let due = match state.health_blocked_at.lock() {
+                    Ok(mut last) => {
+                        let due = last
+                            .map(|at| at.elapsed() >= HEALTH_PAUSE_COOLDOWN)
+                            .unwrap_or(true);
+                        if due {
+                            *last = Some(std::time::Instant::now());
+                        }
+                        due
+                    }
+                    Err(_) => false,
+                };
+                if !due {
+                    return;
+                }
+                log_warn!(
+                    "maps:health {} — pausing task {} until the map page is usable again",
+                    health,
+                    job_id
+                );
+                state.record_error(format!(
+                    "The Maps page reports {}; the task was paused",
+                    health
+                ));
+                if let Err(error) =
+                    crate::commands::pause_running_job(&health_handle, state.inner(), &job_id)
+                {
+                    log_warn!("maps:health pause failed for {}: {}", job_id, error);
+                }
+            });
+
             // ========== Parse degradation (M5 / J-05d) ==========
             // The script has already reset itself to the built-in map before
             // sending this. Drop the remote map so later page loads do not
@@ -1691,7 +2139,7 @@ pub fn run() {
             // case a corrected config is already published.
             let degraded_handle = app.handle().clone();
             app.listen("collector:parse-degraded", move |event| {
-                log_warn!("parse degraded reported: {}", event.payload());
+                log_warn!("parse degraded reported: {:?}", event.payload());
                 let state = degraded_handle.state::<AppState>();
                 if let Ok(mut slot) = state.remote_field_map.lock() {
                     *slot = None;
@@ -1739,6 +2187,15 @@ pub fn run() {
                     // shared layout function is the whole handler (UI-11).
                     if let Err(error) = crate::apply_split_layout(&handle) {
                         log_warn!("resize apply_split_layout failed: {}", error);
+                    }
+                }
+                // P3-10: a move to a monitor with a different DPI changes the
+                // physical inner size without necessarily producing the same
+                // `Resized` sequence; re-apply the split so the child webviews
+                // still fill the window.
+                tauri::WindowEvent::ScaleFactorChanged { .. } => {
+                    if let Err(error) = crate::apply_split_layout(&handle) {
+                        log_warn!("DPI change apply_split_layout failed: {}", error);
                     }
                 }
                 // The panel's X used to be a hard kill: the process died mid-tile
@@ -1975,5 +2432,125 @@ mod ingress_tests {
         let mut window = BatchWindow::default();
         assert!(window.admit(MAX_ROWS_PER_WINDOW));
         assert!(!window.admit(1));
+    }
+
+    /// P2-7: the cap must apply before deserialization, and one malformed row
+    /// must not cost the valid rows in the same payload.
+    #[test]
+    fn a_business_batch_is_capped_and_skips_only_the_bad_row() {
+        let good = serde_json::to_value(row("ChIJN1t_tDeuEmsRUsoyG83frY4"))
+            .expect("serialize a row");
+        let capped: Vec<serde_json::Value> = (0..MAX_BATCH_ROWS + 5)
+            .map(|_| good.clone())
+            .collect();
+        let (rows, over_cap, invalid) =
+            parse_business_batch(&serde_json::Value::Array(capped)).expect("parse capped");
+        assert_eq!(rows.len(), MAX_BATCH_ROWS);
+        assert_eq!(over_cap, 5);
+        assert_eq!(invalid, 0);
+
+        let mixed = serde_json::Value::Array(vec![
+            good.clone(),
+            serde_json::json!({ "name": "missing everything else" }),
+            good,
+        ]);
+        let (rows, over_cap, invalid) = parse_business_batch(&mixed).expect("parse mixed");
+        assert_eq!(rows.len(), 2, "the two good rows survive");
+        assert_eq!(over_cap, 0);
+        assert_eq!(invalid, 1);
+    }
+
+    /// P2-7: the reviews path gets the same bound and the same tolerance.
+    #[test]
+    fn a_review_batch_is_capped_and_skips_only_the_bad_row() {
+        let good = serde_json::to_value(db::ReviewRow::default()).expect("serialize review");
+        let capped: Vec<serde_json::Value> = (0..MAX_REVIEW_ROWS + 2)
+            .map(|_| good.clone())
+            .collect();
+        let (rows, over_cap, invalid) =
+            parse_review_batch(&serde_json::Value::Array(capped)).expect("parse capped");
+        assert_eq!(rows.len(), MAX_REVIEW_ROWS);
+        assert_eq!(over_cap, 2);
+        assert_eq!(invalid, 0);
+
+        let mixed = serde_json::Value::Array(vec![
+            good.clone(),
+            serde_json::json!({ "stars": "not a number" }),
+            good,
+        ]);
+        let (rows, over_cap, invalid) = parse_review_batch(&mixed).expect("parse mixed");
+        assert_eq!(rows.len(), 2);
+        assert_eq!(over_cap, 0);
+        assert_eq!(invalid, 1);
+    }
+}
+
+/// R-38: regression guard for the release-only outage of 2026-10-27.
+///
+/// `fetch_business_reviews` and the Tier-2 enrichment runner name their page
+/// entry points in `eval`, so `intercept.js` must define them in *every*
+/// build. They once sat inside the `if (DEBUG_BUILD)` block: `tauri dev`
+/// worked and the bundled app failed with `window.__placemillX is not a
+/// function` — a 20 s timeout in the drawer and a silent "failed" place in
+/// enrichment. The markers in the script are the machine-readable form of
+/// the rule; keep them.
+#[cfg(test)]
+mod intercept_script_tests {
+    use super::*;
+
+    const PRODUCTION_ENTRY_POINTS: [&str; 2] =
+        ["__placemillFetchReviews", "__placemillParsePlaceState"];
+
+    fn production_section() -> &'static str {
+        let begin = "// ---- R-38 production entry points begin ----";
+        let end = "// ---- R-38 production entry points end ----";
+        let start = INTERCEPT_SCRIPT
+            .find(begin)
+            .expect("R-38: production entry-point section has no begin marker");
+        let stop = INTERCEPT_SCRIPT
+            .find(end)
+            .expect("R-38: production entry-point section has no end marker");
+        assert!(start < stop, "R-38: the section markers are out of order");
+        &INTERCEPT_SCRIPT[start..stop]
+    }
+
+    #[test]
+    fn production_entry_points_are_not_debug_gated() {
+        let section = production_section();
+        assert!(
+            !section
+                .lines()
+                .any(|line| line.trim_start().starts_with("if (DEBUG_BUILD)")),
+            "R-38: a production entry point may not sit inside the debug gate — \
+             a release build would lose it"
+        );
+        for name in PRODUCTION_ENTRY_POINTS {
+            let definition = format!("defineEntryPoint('{name}'");
+            assert_eq!(
+                section.matches(definition.as_str()).count(),
+                1,
+                "R-38: {name} must be defined exactly once inside the production section"
+            );
+            assert_eq!(
+                INTERCEPT_SCRIPT.matches(definition.as_str()).count(),
+                1,
+                "R-38: {name} must not be defined a second time outside the section"
+            );
+        }
+    }
+
+    #[test]
+    fn the_debug_gate_still_hides_the_development_helpers() {
+        let section = production_section();
+        assert!(
+            INTERCEPT_SCRIPT.contains("if (DEBUG_BUILD) {"),
+            "R-31: the debug gate disappeared — check what it used to hide"
+        );
+        for name in ["__placemillDiag", "__placemillTest"] {
+            assert!(
+                !section.contains(name),
+                "R-31: {name} writes rows into SQLite and must stay debug-only"
+            );
+        }
     }
 }

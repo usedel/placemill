@@ -79,6 +79,10 @@ pub const STATUS_FOUND: &str = "found";
 pub const STATUS_NONE_FOUND: &str = "none-found";
 pub const STATUS_BLOCKED: &str = "blocked";
 pub const STATUS_ERROR: &str = "error";
+/// A transient failure (timeout, DNS, 5xx). Deliberately stored as the empty
+/// "not mined yet" status so `mining_targets` picks the row up on the next run;
+/// `run_mining` still counts it as a failed site for the progress UI.
+pub const STATUS_RETRYABLE: &str = "";
 
 // ---------------------------------------------------------------------------
 // Extraction (pure functions — the unit tests below run entirely on fixtures)
@@ -573,7 +577,11 @@ enum FetchError {
     /// The site (or its edge) actively refused automated access. Never retried
     /// within a run, never followed by a scheme fallback.
     Blocked(String),
-    /// Anything else: DNS, timeout, 404, oversized page.
+    /// A non-2xx HTTP status. Kept distinct from `Transport` so robots.txt can
+    /// follow RFC 9309 (4xx = unavailable/allow, 5xx = unreachable/deny) and so
+    /// a transient 5xx can be retried by a later mining run.
+    Status(u16),
+    /// Anything else: DNS, timeout, oversized page.
     Transport(String),
     /// The run was cancelled while this fetch was in flight (R-02). Distinguished
     /// from `Transport` so the worker loop can tell "user pressed stop" from
@@ -650,14 +658,14 @@ fn read_body_limited<R: Read>(
 
 /// Status-code → error mapping shared by the request paths.
 fn classify_status(code: u16) -> FetchError {
-    if matches!(code, 401 | 403 | 429 | 503) {
-        FetchError::Blocked(format!("HTTP {}", code))
-    } else {
-        FetchError::Transport(format!("HTTP {}", code))
-    }
+    FetchError::Status(code)
 }
 
-fn fetch_page(agent: &ureq::Agent, url: &str, cancel: &AtomicBool) -> Result<String, FetchError> {
+fn fetch_page(
+    agent: &ureq::Agent,
+    url: &str,
+    cancel: &AtomicBool,
+) -> Result<(Url, String), FetchError> {
     if cancel.load(Ordering::Relaxed) {
         return Err(FetchError::Cancelled);
     }
@@ -729,7 +737,7 @@ fn fetch_page(agent: &ureq::Agent, url: &str, cancel: &AtomicBool) -> Result<Str
             continue;
         }
         if !(200..300).contains(&status) {
-            return Err(FetchError::Transport(format!("HTTP {}", status)));
+            return Err(FetchError::Status(status));
         }
 
         // `take` keeps a hostile Content-Length from promising more than the cap;
@@ -740,7 +748,7 @@ fn fetch_page(agent: &ureq::Agent, url: &str, cancel: &AtomicBool) -> Result<Str
         if looks_like_challenge(&html) {
             return Err(FetchError::Blocked("challenge page".to_string()));
         }
-        return Ok(html);
+        return Ok((parsed, html));
     }
     Err(FetchError::Transport("too many redirects".to_string()))
 }
@@ -847,16 +855,26 @@ fn is_private_ipv4(ip: std::net::Ipv4Addr) -> bool {
         || (o[0] == 100 && (64..=127).contains(&o[1])) // CGNAT
         || (o[0] == 198 && (o[1] == 18 || o[1] == 19)) // benchmarking
         || (o[0] == 192 && o[1] == 0 && o[2] == 0)    // IETF protocol assignments
+        || (o[0] == 192 && o[1] == 0 && o[2] == 2)    // TEST-NET-1
+        || (o[0] == 198 && o[1] == 51 && o[2] == 100) // TEST-NET-2
+        || (o[0] == 203 && o[1] == 0 && o[2] == 113)  // TEST-NET-3
+        || (o[0] == 192 && o[1] == 88 && o[2] == 99)  // 6to4 relay anycast
+        || (224..=239).contains(&o[0])                // multicast
         || o[0] >= 240                                // reserved + broadcast
 }
 
 fn is_private_ipv6(ip: std::net::Ipv6Addr) -> bool {
+    let segments = ip.segments();
     ip.is_loopback()
         || ip.is_unspecified()
-        || (ip.segments()[0] & 0xfe00) == 0xfc00 // unique local fc00::/7
-        || (ip.segments()[0] & 0xffc0) == 0xfe80 // link-local fe80::/10
-        || match ip.to_ipv4_mapped() {
-            // ::ffff:10.0.0.1 and friends reach private IPv4 space too.
+        || (segments[0] & 0xfe00) == 0xfc00 // unique local fc00::/7
+        || (segments[0] & 0xffc0) == 0xfe80 // link-local fe80::/10
+        || (segments[0] & 0xff00) == 0xff00 // multicast ff00::/8
+        || (segments[0] == 0x2001 && segments[1] == 0x0db8) // documentation
+        || (segments[0] == 0x0064 && segments[1] == 0xff9b) // NAT64 64:ff9b::/96
+        || segments[0] == 0x2002            // 6to4 2002::/16 (embeds IPv4)
+        || match ip.to_ipv4() {
+            // IPv4-mapped (::ffff:a.b.c.d) and IPv4-compatible (::a.b.c.d).
             Some(v4) => is_private_ipv4(v4),
             None => false,
         }
@@ -886,36 +904,33 @@ fn domain_key(url: &Url) -> String {
     registrable_domain(url.host_str().unwrap_or(""))
 }
 
-/// Two-part public suffixes that actually show up on business websites. A
-/// full Public Suffix List is overkill for v1; anything not listed falls back
-/// to "last two labels", which is correct for the common .com/.net/.org case.
-const TWO_PART_SUFFIXES: &[&str] = &[
-    "co.uk", "org.uk", "ac.uk", "gov.uk", "me.uk", "ltd.uk", "plc.uk", "com.au",
-    "net.au", "org.au", "co.nz", "net.nz", "org.nz", "com.br", "com.mx", "com.ar",
-    "co.jp", "or.jp", "ne.jp", "co.in", "net.in", "org.in", "co.za", "com.sg",
-    "com.tr", "com.tw", "com.hk", "com.cn", "co.kr", "co.il", "com.pl", "com.ua",
-    "co.id", "com.my", "com.ph", "com.vn", "com.co", "com.pe", "com.eg",
-];
-
 /// Registrable domain (eTLD+1) — the grouping key that makes "50 branches of
 /// one bank" one visit instead of fifty. `locations.bankofamerica.com` and
 /// `www.bankofamerica.com` collapse onto `bankofamerica.com`; IP hosts (loopback
-/// fixtures, intranet) are never suffix-split.
+/// fixtures, intranet) and unknown suffixes are never suffix-split.
+///
+/// P1-6: this used to be a hand-written 39-entry two-label table with a
+/// "last two labels" fallback. That grouped every unrelated `.com.ru` site
+/// under `com.ru` and every blog under `blogspot.com`, and the miner then wrote
+/// one site's emails to all of them (see `group_by_domain` /
+/// `update_email_mining`). The embedded Public Suffix List, including its
+/// private section, is the only correct source for this boundary.
 fn registrable_domain(host: &str) -> String {
-    let host = host.trim_start_matches("www.").to_lowercase();
+    let host = host.trim().trim_end_matches('.').to_lowercase();
     if host.is_empty() {
         return host;
     }
-    let labels: Vec<&str> = host.split('.').filter(|label| !label.is_empty()).collect();
-    if labels.len() <= 2 || labels.iter().all(|label| label.chars().all(|c| c.is_ascii_digit())) {
+    // PSL answers `None` for an IP literal, but it does not always: it read
+    // `127.0.0.2` as the domain `0.2`. IP hosts are their own grouping key.
+    let numeric_labels = host
+        .split('.')
+        .all(|label| !label.is_empty() && label.chars().all(|c| c.is_ascii_digit()));
+    if numeric_labels || host.starts_with('[') {
         return host;
     }
-    let last_two = labels[labels.len() - 2..].join(".");
-    if TWO_PART_SUFFIXES.contains(&last_two.as_str()) {
-        labels[labels.len() - 3..].join(".")
-    } else {
-        last_two
-    }
+    psl::domain_str(&host)
+        .map(str::to_string)
+        .unwrap_or(host)
 }
 
 fn jitter_delay() -> Duration {
@@ -997,6 +1012,47 @@ impl RobotsRules {
             .iter()
             .any(|prefix| path_and_query.starts_with(prefix.as_str()))
     }
+
+}
+
+/// What one `scheme://host:port` said in its robots.txt.
+///
+/// The three cases are kept apart because they call for different behaviour:
+/// `Rules`/`DenyAll` are answers about *this* site, while `Unreachable` only
+/// says the file could not be read — a plain-HTTP server that fails the TLS
+/// probe has an unreadable `https://` robots file, not a refusal, and the
+/// miner must still be allowed to try the other scheme.
+#[derive(Debug, Clone)]
+enum CachedRobots {
+    Rules(RobotsRules),
+    DenyAll,
+    Unreachable,
+}
+
+/// Interpret a failed robots.txt fetch.
+///
+/// RFC 9309: 4xx (other than auth/rate limits) means "unavailable" — allow all;
+/// 5xx and transport failures mean "unreachable" — do not crawl, but do not
+/// pretend the site forbade us either. Keeping auth/rate limits as a denial is
+/// deliberate: a site that answers 403 to a polite bot is telling us to leave.
+fn robots_on_fetch_error(error: &FetchError) -> CachedRobots {
+    match error {
+        FetchError::Status(404 | 410) => CachedRobots::Rules(RobotsRules {
+            disallow: Vec::new(),
+            crawl_delay: None,
+        }),
+        FetchError::Status(401 | 403 | 429) => CachedRobots::DenyAll,
+        // A 5xx is "unreachable" for this run, not "gone".
+        FetchError::Status(code) if (500..=599).contains(code) => CachedRobots::Unreachable,
+        // Any other status is "unavailable" per RFC 9309.
+        FetchError::Status(_) => CachedRobots::Rules(RobotsRules {
+            disallow: Vec::new(),
+            crawl_delay: None,
+        }),
+        FetchError::Blocked(_) | FetchError::Transport(_) | FetchError::Cancelled => {
+            CachedRobots::Unreachable
+        }
+    }
 }
 
 /// Per-domain politeness state for one mining run (R-20).
@@ -1009,45 +1065,72 @@ impl RobotsRules {
 struct Politeness<'a> {
     agent: &'a ureq::Agent,
     cancel: &'a AtomicBool,
-    /// robots.txt per registrable domain; `None` = fetched and unavailable.
-    robots: Mutex<HashMap<String, Option<RobotsRules>>>,
+    /// robots.txt per `scheme://host:port`. The key is the real host *and port*
+    /// — robots.txt is host-specific, and two servers on one machine can be
+    /// different sites (the e2e fixtures are exactly that).
+    robots: Mutex<HashMap<String, CachedRobots>>,
     /// Next `Instant` each registrable domain may be contacted.
     next_slot: Mutex<HashMap<String, Instant>>,
 }
 
+/// `scheme://host:port/robots.txt` for a site URL.
+///
+/// Built from the URL itself, not from `host_str()`: a hand-formatted
+/// `scheme://host/robots.txt` drops the port, so `127.0.0.2:14300` asked *:443*
+/// for its rules and every site on a non-default port looked unreachable.
+fn robots_url_for(base: &Url) -> Url {
+    let mut url = base.clone();
+    url.set_path("/robots.txt");
+    url.set_query(None);
+    url.set_fragment(None);
+    url
+}
+
+/// Cache key for one robots file. The port is part of the origin, and two
+/// servers on one host can be different sites (the e2e fixtures are exactly
+/// that), so it must not be dropped here either.
+fn robots_cache_key(base: &Url) -> String {
+    format!(
+        "{}://{}:{}",
+        base.scheme(),
+        base.host_str().unwrap_or(""),
+        base.port_or_known_default().unwrap_or(0)
+    )
+}
+
 impl Politeness<'_> {
-    /// robots.txt rules for the domain, fetched and cached on first contact.
+    /// robots.txt answer for one scheme+host+port, fetched and cached on first
+    /// contact.
     ///
-    /// Any fetch error counts as "no rules": RFC 9309 lets a missing robots
-    /// file be treated as allow-all, and retrying robots.txt against a broken
-    /// site is exactly the behaviour being removed. One unpaced request per
-    /// domain per run is the cost of learning the rules.
-    fn rules_for(&self, domain: &str, base: &Url) -> Option<RobotsRules> {
+    /// RFC 9309: a 4xx robots response means "unavailable" (allow all), while
+    /// a 5xx / transport failure means "unreachable" (do not crawl). The old
+    /// code turned every error into allow-all, which is how a broken site became
+    /// an unlimited crawl target. One request per host per run is the cost of
+    /// learning the rules.
+    fn robots_for(&self, base: &Url) -> CachedRobots {
+        let key = robots_cache_key(base);
         if let Ok(robots) = self.robots.lock() {
-            if let Some(rules) = robots.get(domain) {
-                return rules.clone();
+            if let Some(cached) = robots.get(&key) {
+                return cached.clone();
             }
         }
-        let robots_url = format!(
-            "{}://{}/robots.txt",
-            base.scheme(),
-            base.host_str().unwrap_or("")
-        );
-        let rules = match fetch_page(self.agent, &robots_url, self.cancel) {
-            Ok(body) => Some(RobotsRules::parse(&body)),
-            Err(_) => None,
+        let robots_url = robots_url_for(base);
+        let cached = match fetch_page(self.agent, robots_url.as_str(), self.cancel) {
+            Ok((_final_url, body)) => CachedRobots::Rules(RobotsRules::parse(&body)),
+            Err(error) => robots_on_fetch_error(&error),
         };
         if let Ok(mut robots) = self.robots.lock() {
-            robots.insert(domain.to_string(), rules.clone());
+            robots.insert(key, cached.clone());
         }
-        rules
+        cached
     }
 
     /// Wait until the domain's next slot is due, then claim it.
     fn acquire_slot(&self, domain: &str, base: &Url) {
-        let crawl_delay = self
-            .rules_for(domain, base)
-            .and_then(|rules| rules.crawl_delay);
+        let crawl_delay = match self.robots_for(base) {
+            CachedRobots::Rules(rules) => rules.crawl_delay,
+            CachedRobots::DenyAll | CachedRobots::Unreachable => None,
+        };
         loop {
             let due = {
                 let Ok(mut slots) = self.next_slot.lock() else {
@@ -1072,18 +1155,34 @@ impl Politeness<'_> {
     /// Whether this URL may be fetched under the site's robots.txt. A missing
     /// robots file allows everything. RFC 9309 matches on path *and* query, so
     /// a `Disallow: /search?` style rule is honored too.
-    fn robots_allows(&self, url: &Url, domain: &str) -> bool {
-        match self.rules_for(domain, url) {
-            Some(rules) => {
+    fn robots_verdict(&self, url: &Url) -> RobotsVerdict {
+        match self.robots_for(url) {
+            CachedRobots::Rules(rules) => {
                 let path_and_query = match url.query() {
                     Some(query) => format!("{}?{}", url.path(), query),
                     None => url.path().to_string(),
                 };
-                rules.is_allowed(&path_and_query)
+                if rules.is_allowed(&path_and_query) {
+                    RobotsVerdict::Allowed
+                } else {
+                    RobotsVerdict::Denied
+                }
             }
-            None => true,
+            CachedRobots::DenyAll => RobotsVerdict::Denied,
+            CachedRobots::Unreachable => RobotsVerdict::Unreachable,
         }
     }
+}
+
+/// The answer the caller acts on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RobotsVerdict {
+    Allowed,
+    /// The site forbade this path.
+    Denied,
+    /// robots.txt could not be read for this scheme; the other scheme may still
+    /// answer (`https://` on a plain-HTTP server fails the handshake).
+    Unreachable,
 }
 
 /// Visit one site. Homepage first; when no address is found there, up to
@@ -1098,22 +1197,47 @@ fn mine_site(politeness: &Politeness, rules: &EmailRules, website: &str) -> Site
     }
 
     let mut base: Option<(Url, String)> = None;
+    // P2-9: distinguish "this site really is gone" from "the network/5xx was
+    // transient". Only the latter is written as `STATUS_RETRYABLE` (empty), so
+    // the next run will include the row again.
+    let mut saw_permanent_failure = false;
+    // Every candidate's robots.txt was unreadable: the site is off-limits for
+    // this run (RFC 9309), and it is a block rather than a transient failure.
+    let mut robots_unreachable = false;
     for url in &candidates {
         if cancel.load(Ordering::Relaxed) {
             return SiteOutcome::cancelled();
         }
         let domain = domain_key(url);
         politeness.acquire_slot(&domain, url);
-        if !politeness.robots_allows(url, &domain) {
-            log_info!(
-                "mining {}: not fetched (robots.txt)",
-                url.host_str().unwrap_or("")
-            );
-            return SiteOutcome::empty(STATUS_BLOCKED);
+        match politeness.robots_verdict(url) {
+            RobotsVerdict::Allowed => {}
+            RobotsVerdict::Denied => {
+                log_info!(
+                    "mining {}: not fetched (robots.txt)",
+                    url.host_str().unwrap_or("")
+                );
+                return SiteOutcome::empty(STATUS_BLOCKED);
+            }
+            RobotsVerdict::Unreachable => {
+                // Do not crawl a site whose rules could not be read, but do not
+                // end the site on one scheme either: `https://host/robots.txt`
+                // fails the handshake on a plain-HTTP server, while the http
+                // candidate would answer normally.
+                robots_unreachable = true;
+                log_info!(
+                    "mining {}: robots.txt unreachable over {}, trying the next target",
+                    url.host_str().unwrap_or(""),
+                    url.scheme()
+                );
+                continue;
+            }
         }
         match fetch_page(politeness.agent, url.as_str(), cancel) {
-            Ok(html) => {
-                base = Some((url.clone(), html));
+            Ok((final_url, html)) => {
+                // Relative contact links must resolve against where the page
+                // actually landed, not the URL that started the redirect chain.
+                base = Some((final_url, html));
                 break;
             }
             Err(FetchError::Blocked(reason)) => {
@@ -1121,6 +1245,30 @@ fn mine_site(politeness: &Politeness, rules: &EmailRules, website: &str) -> Site
                 return SiteOutcome::empty(STATUS_BLOCKED);
             }
             Err(FetchError::Cancelled) => return SiteOutcome::cancelled(),
+            Err(FetchError::Status(code)) => {
+                if matches!(code, 401 | 403 | 429) {
+                    log_info!(
+                        "mining {}: blocked (HTTP {})",
+                        url.host_str().unwrap_or(""),
+                        code
+                    );
+                    return SiteOutcome::empty(STATUS_BLOCKED);
+                }
+                if (500..=599).contains(&code) {
+                    log_warn!(
+                        "mining {}: HTTP {} (transient), trying next scheme",
+                        url.host_str().unwrap_or(""),
+                        code
+                    );
+                } else {
+                    saw_permanent_failure = true;
+                    log_warn!(
+                        "mining {}: HTTP {} (permanent), trying next scheme",
+                        url.host_str().unwrap_or(""),
+                        code
+                    );
+                }
+            }
             Err(FetchError::Transport(reason)) => {
                 log_warn!(
                     "mining {}: fetch failed ({}), trying next scheme",
@@ -1131,13 +1279,24 @@ fn mine_site(politeness: &Politeness, rules: &EmailRules, website: &str) -> Site
         }
     }
     let Some((base_url, base_html)) = base else {
-        return SiteOutcome::empty(STATUS_ERROR);
+        return SiteOutcome::empty(if robots_unreachable {
+            STATUS_BLOCKED
+        } else if saw_permanent_failure {
+            STATUS_ERROR
+        } else {
+            STATUS_RETRYABLE
+        });
     };
 
     // R-21b: one parse, three queries. The page used to be re-scanned for
     // addresses, social links and contact links separately.
     let base_doc = PageDoc::parse(&base_html);
-    let mut emails = base_doc.emails();
+    // P2-9: rank the homepage addresses *before* deciding whether to visit
+    // contact pages. A homepage that only carries a placeholder address
+    // (`noreply@…`, `example@…`) used to look non-empty, so the real contact
+    // page was never fetched.
+    let site_domain = registrable_domain(base_url.host_str().unwrap_or(""));
+    let mut emails = rank_emails(base_doc.emails(), &site_domain, &rules.blocklist);
     let mut socials = base_doc.socials(Some(&base_url));
     let mut source_url = if emails.is_empty() {
         String::new()
@@ -1154,20 +1313,21 @@ fn mine_site(politeness: &Politeness, rules: &EmailRules, website: &str) -> Site
             let Ok(page) = Url::parse(&page_url) else { continue };
             let domain = domain_key(&page);
             politeness.acquire_slot(&domain, &page);
-            if !politeness.robots_allows(&page, &domain) {
+            if politeness.robots_verdict(&page) != RobotsVerdict::Allowed {
                 continue;
             }
             match fetch_page(politeness.agent, &page_url, cancel) {
-                Ok(page_html) => {
+                Ok((final_url, page_html)) => {
                     let page_doc = PageDoc::parse(&page_html);
                     if emails.is_empty() {
-                        let page_emails = page_doc.emails();
+                        let page_emails =
+                            rank_emails(page_doc.emails(), &site_domain, &rules.blocklist);
                         if !page_emails.is_empty() {
                             emails = page_emails;
-                            source_url = page_url.clone();
+                            source_url = final_url.as_str().to_string();
                         }
                     }
-                    for social in page_doc.socials(Some(&page)) {
+                    for social in page_doc.socials(Some(&final_url)) {
                         if socials.len() >= MAX_SOCIALS_PER_SITE {
                             break;
                         }
@@ -1181,9 +1341,8 @@ fn mine_site(politeness: &Politeness, rules: &EmailRules, website: &str) -> Site
         }
     }
 
-    // Score against the registrable domain: `info@bankofamerica.com` must win
-    // even when the visit landed on `www.` or a locations subdomain.
-    let site_domain = registrable_domain(base_url.host_str().unwrap_or(""));
+    // Score the combined list once more: contact pages can contribute more
+    // than one address, and `rank_emails` is also the dedupe pass.
     let emails = rank_emails(emails, &site_domain, &rules.blocklist);
     let status = if emails.is_empty() {
         STATUS_NONE_FOUND
@@ -1315,47 +1474,73 @@ pub fn run_mining(
                 // happens while cancel is pending is still counted as a
                 // failure instead of silently vanishing.
                 let cancelled = outcome.was_cancelled;
+                // C-03: "found" means the rows were written. A site whose
+                // business rows were cleared or deleted mid-run matches
+                // nothing, and reporting it as a find would put a number in
+                // `email:done` that the table does not contain.
+                let mut wrote = !cancelled;
                 if !cancelled {
                     let state = app.state::<crate::AppState>();
                     let write = state.db.lock();
                     match write {
                         Ok(conn) => {
-                            let result = crate::db::update_email_mining(
+                            match crate::db::update_email_mining(
                                 &conn,
                                 &target.place_ids,
                                 &outcome.emails,
                                 &outcome.socials,
                                 &outcome.source_url,
                                 outcome.status,
-                            );
-                            if let Err(error) = result {
-                                log_warn!(
-                                    "mining write failed for {}: {}",
-                                    target.website, error
-                                );
+                            ) {
+                                Ok(0) => {
+                                    wrote = false;
+                                    log_warn!(
+                                        "mining write matched no row for {}",
+                                        target.website
+                                    );
+                                }
+                                Ok(_) => {}
+                                Err(error) => {
+                                    wrote = false;
+                                    log_warn!(
+                                        "mining write failed for {}: {}",
+                                        target.website, error
+                                    );
+                                }
                             }
                         }
                         Err(error) => {
+                            wrote = false;
                             log_error!("mining db lock failed: {}", error);
                         }
                     }
                 }
 
-                match outcome.status {
-                    STATUS_FOUND => {
-                        progress.found.fetch_add(1, Ordering::Relaxed);
-                    }
-                    STATUS_BLOCKED => {
-                        progress.blocked.fetch_add(1, Ordering::Relaxed);
-                    }
-                    STATUS_ERROR => {
-                        if !cancelled {
-                            progress.failed.fetch_add(1, Ordering::Relaxed);
-                        }
-                    }
-                    _ => {}
-                }
                 if !cancelled {
+                    if wrote {
+                        match outcome.status {
+                            STATUS_FOUND => {
+                                progress.found.fetch_add(1, Ordering::Relaxed);
+                            }
+                            STATUS_BLOCKED => {
+                                progress.blocked.fetch_add(1, Ordering::Relaxed);
+                            }
+                            STATUS_ERROR => {
+                                progress.failed.fetch_add(1, Ordering::Relaxed);
+                            }
+                            STATUS_RETRYABLE => {
+                                // The row stays unmined so the next run retries
+                                // it, but the progress UI still reports a
+                                // failure for this attempt.
+                                progress.failed.fetch_add(1, Ordering::Relaxed);
+                            }
+                            _ => {}
+                        }
+                    } else {
+                        // Work that could not be recorded is a failure, not a
+                        // find and not a silent success.
+                        progress.failed.fetch_add(1, Ordering::Relaxed);
+                    }
                     progress.done.fetch_add(1, Ordering::Relaxed);
                 }
 
@@ -1542,6 +1727,32 @@ mod tests {
         assert_eq!(registrable_domain(""), "");
     }
 
+    /// P1-6: the old hand-written table grouped unrelated `.com.ru` sites under
+    /// `com.ru` and every blog under `blogspot.com`. The PSL keeps both apart,
+    /// so a mined site's contacts can no longer be written to another business.
+    #[test]
+    fn registrable_domain_uses_the_public_suffix_list() {
+        assert_eq!(registrable_domain("a.com.ru"), "a.com.ru");
+        assert_eq!(registrable_domain("b.com.ru"), "b.com.ru");
+        assert_eq!(registrable_domain("foo.blogspot.com"), "foo.blogspot.com");
+        assert_eq!(registrable_domain("bar.blogspot.com"), "bar.blogspot.com");
+        assert_eq!(registrable_domain("x.github.io"), "x.github.io");
+        assert_eq!(registrable_domain("shop.example.com.es"), "example.com.es");
+        assert_eq!(registrable_domain("WWW.Example.COM."), "example.com");
+        assert_eq!(registrable_domain("com.ru"), "com.ru");
+    }
+
+    #[test]
+    fn shared_hosting_sites_are_not_grouped_together() {
+        let grouped = group_by_domain(vec![
+            ("a".to_string(), "https://foo.blogspot.com/".to_string()),
+            ("b".to_string(), "https://bar.blogspot.com/".to_string()),
+            ("c".to_string(), "https://a.com.ru/".to_string()),
+            ("d".to_string(), "https://b.com.ru/".to_string()),
+        ]);
+        assert_eq!(grouped.len(), 4, "each private-suffix site stays separate");
+    }
+
     // ----- read_body_limited (R-02): cancel-aware, size-capped body read -----
 
     /// Yields one byte per call and flips the cancel flag after `flip_after`
@@ -1633,6 +1844,15 @@ mod tests {
         assert!(site_candidates("http://[::1]/").is_empty());
         assert!(site_candidates("http://[fc00::1]/").is_empty());
         assert!(site_candidates("http://[::ffff:192.168.0.1]/").is_empty());
+        // P2-10: NAT64, 6to4, multicast, documentation and TEST-NET ranges.
+        assert!(site_candidates("http://[64:ff9b::7f00:1]/").is_empty());
+        assert!(site_candidates("http://[2002:7f00:1::]/").is_empty());
+        assert!(site_candidates("http://[ff02::1]/").is_empty());
+        assert!(site_candidates("http://[2001:db8::1]/").is_empty());
+        assert!(site_candidates("http://224.0.0.1/").is_empty());
+        assert!(site_candidates("http://192.0.2.1/").is_empty());
+        assert!(site_candidates("http://198.51.100.1/").is_empty());
+        assert!(site_candidates("http://203.0.113.1/").is_empty());
     }
 
     #[test]
@@ -1675,6 +1895,77 @@ mod tests {
         // Missing rules (no robots.txt) allow everything.
         let empty = RobotsRules::parse("");
         assert!(empty.is_allowed("/"));
+    }
+
+    /// P2-9: RFC 9309 distinguishes "unavailable" (4xx, allow) from
+    /// "unreachable" (5xx/transport, do not crawl). The old code allowed both,
+    /// and the three cases stay distinguishable here because the caller tries
+    /// the other scheme before giving up on a site.
+    #[test]
+    fn robots_fetch_failures_follow_rfc_9309() {
+        let allow_all = |cached: CachedRobots| match cached {
+            CachedRobots::Rules(rules) => rules.is_allowed("/"),
+            other => panic!("expected allow-all rules, got {:?}", other),
+        };
+        assert!(allow_all(robots_on_fetch_error(&FetchError::Status(404))));
+        assert!(allow_all(robots_on_fetch_error(&FetchError::Status(400))));
+
+        for code in [401, 403, 429] {
+            assert!(
+                matches!(
+                    robots_on_fetch_error(&FetchError::Status(code)),
+                    CachedRobots::DenyAll
+                ),
+                "HTTP {code} must deny the site"
+            );
+        }
+        for code in [500, 502, 503] {
+            assert!(
+                matches!(
+                    robots_on_fetch_error(&FetchError::Status(code)),
+                    CachedRobots::Unreachable
+                ),
+                "HTTP {code} must be unreachable, not a refusal"
+            );
+        }
+        assert!(matches!(
+            robots_on_fetch_error(&FetchError::Transport("dns".into())),
+            CachedRobots::Unreachable
+        ));
+        assert!(matches!(
+            robots_on_fetch_error(&FetchError::Blocked("challenge".into())),
+            CachedRobots::Unreachable
+        ));
+    }
+
+    /// The robots URL is built from the site URL, so it must keep the port: a
+    /// hand-formatted `scheme://host/robots.txt` asked port 443 for the rules of
+    /// a server on `:14300`, every such site looked unreachable, and the
+    /// documented `https`-then-`http` fallback never ran.
+    #[test]
+    fn the_robots_url_keeps_the_port_and_drops_the_path() {
+        let base = Url::parse("http://127.0.0.2:14300/contact?x=1").expect("url");
+        assert_eq!(
+            robots_url_for(&base).as_str(),
+            "http://127.0.0.2:14300/robots.txt"
+        );
+        // A plain host keeps the default port out of the URL but not out of the
+        // cache key, so `:80` spelled out and `:80` implied share one entry.
+        let plain = Url::parse("https://downtowndental.com/about").expect("url");
+        assert_eq!(
+            robots_url_for(&plain).as_str(),
+            "https://downtowndental.com/robots.txt"
+        );
+        assert_eq!(robots_cache_key(&plain), "https://downtowndental.com:443");
+        assert_ne!(robots_cache_key(&base), robots_cache_key(&plain));
+    }
+
+    /// P2-9: an HTTP failure keeps its code until the caller decides whether it
+    /// is a transient/retryable failure or a permanent one.
+    #[test]
+    fn http_failures_keep_their_status_code() {
+        assert!(matches!(classify_status(418), FetchError::Status(418)));
+        assert!(matches!(classify_status(503), FetchError::Status(503)));
     }
 
     // ----- R-21: social extraction -----

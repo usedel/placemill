@@ -50,18 +50,48 @@ function isAllowedMapsUrl(url) {
     }
 }
 
-// Tile identity is attribution data written by the runner. Keep the two known
-// string fields and drop anything else, so a page script cannot stuff the row
-// with arbitrary payload.
+// Tile identity and cell geometry are written by the runner before a
+// navigation. `jobId` / `tileId` are attribution data; the four numbers are the
+// scroll budget and the drift check's reference point. Everything is
+// whitelisted by type, so a page script cannot stuff the row with arbitrary
+// payload.
+//
+// The numbers used to be dropped here while `autoScroll.start` kept reading
+// them (P1-1): every cell then ran on the default budget and `drifted()`
+// returned early, so the radius-based scroll cap and the drift stop were dead
+// code in a contract that *looked* implemented on both sides.
+var TILE_CONTEXT_STRINGS = ['jobId', 'tileId'];
+// [name, minimum, maximum]
+var TILE_CONTEXT_NUMBERS = [
+    ['lat', -90, 90],
+    ['lng', -180, 180],
+    // The panel's own budget maxes out at 1000 and a grid tile passes at most
+    // `max_scrolls_for_radius` (~40). Accept the whole configured range rather
+    // than clamping to a number picked for one caller.
+    ['maxScrolls', 1, 1000],
+    // `drift_allowance_km` is one viewport width: ~16 km at zoom 13 and ~32 km
+    // at the lowest zoom a tile can carry (12). 500 leaves room for a future
+    // wider viewport without letting a typo make the check unreachable.
+    ['maxDriftKm', 0, 500]
+];
+
 function sanitizeTileContext(ctx) {
     if (!ctx || typeof ctx !== 'object') return null;
     var out = {};
-    var keys = ['jobId', 'tileId'];
-    for (var index = 0; index < keys.length; index += 1) {
-        var value = ctx[keys[index]];
+    for (var index = 0; index < TILE_CONTEXT_STRINGS.length; index += 1) {
+        var value = ctx[TILE_CONTEXT_STRINGS[index]];
         if (typeof value === 'string' && value.length > 0 && value.length <= 200) {
-            out[keys[index]] = value;
+            out[TILE_CONTEXT_STRINGS[index]] = value;
         }
+    }
+    for (var n = 0; n < TILE_CONTEXT_NUMBERS.length; n += 1) {
+        var spec = TILE_CONTEXT_NUMBERS[n];
+        var number = ctx[spec[0]];
+        // `typeof` first: `Number(null)` is 0, which would turn an absent field
+        // into a value that passes the range check.
+        if (typeof number !== 'number' || !isFinite(number)) continue;
+        if (number < spec[1] || number > spec[2]) continue;
+        out[spec[0]] = number;
     }
     return Object.keys(out).length > 0 ? out : null;
 }
@@ -79,8 +109,15 @@ function setTileContext(ctx) {
     }
 }
 
-var VERSION = 'v2.21';
+var VERSION = 'v2.22';
 var PENDING = [];
+// P2-15: the queue bridges a short IPC outage, it is not a session buffer.
+// 20 batches x 500 rows is far beyond any real gap; past that the oldest batch
+// is dropped with a warning instead of growing the page without bound.
+var PENDING_MAX_BATCHES = 20;
+// Owned by this closure, not `window`: a page script can overwrite a global and
+// leave the flusher running (or stop it) behind our back.
+var pendingTimer = null;
 var counters = { fetch: 0, xhr: 0, matched: 0, parsed: 0, sent: 0, skipped: 0 };
 // Epoch ms of the last `/search?tbm=map` response, whatever it contained.
 // UI-01b's health probe reads it: "no response for 20 s and no result feed"
@@ -112,8 +149,9 @@ function isTargetUrl(url) {
 // R-08: a target response larger than this is logged and skipped, not parsed.
 // Real search payloads stay far below it (the biggest observed are a few MB);
 // the cap exists so a runaway or hostile response cannot pin the page inside
-// JSON.parse for seconds.
-var MAX_BODY_BYTES = 8 * 1024 * 1024;
+// JSON.parse for seconds. `text.length` counts UTF-16 code units, not bytes;
+// the name says so (P3-14) so nobody multiplies it by two by mistake.
+var MAX_BODY_CHARS = 8 * 1024 * 1024;
 
 // ============================================================
 // 0.1 Batch metadata + event plumbing
@@ -291,7 +329,7 @@ var BUILTIN_FIELD_MAP = {
     // while `detail[76]` is null.
     priceRange: 4, timezone: 30,
     // M8 / J-08c: the fields the index probe confirmed as filled in the
-    // search payload (`docs/parser.md`). The value is the
+    // search payload (docs/field-index-map.md §2). The value is the
     // *container* index; the deeper path inside it is a constant of the
     // format and lives in the extractor.
     completeAddress: 183, dataId: 10, reviewsLink: 4, thumbnail: 72,
@@ -401,7 +439,7 @@ function effectiveFieldMap() {
 // ============================================================
 // 0.1 Index probe (M8 / J-08b)
 //
-// The candidate paths below are the ones `docs/parser.md`
+// The candidate paths below are the ones `docs/field-index-map.md` §2
 // lists. The probe reports the shape that actually sits at each of
 // them *in this payload*, so choosing an index becomes a reading
 // task instead of guesswork — and it is the only way to settle the
@@ -932,67 +970,23 @@ defineEntryPoint('__placemillNoteParsedBatch', noteParsedBatch);
                 };
             }
         });
-        // M9 / J-09a: what the page's own traffic taught us about its session.
-        defineEntryPoint('__placemillReviewsSession', function () {
-            return {
-                token: __reviewsSession.token,
-                bgkey: __reviewsSession.bgkey,
-                tokenAt: __reviewsSession.tokenAt,
-                bgkeyAt: __reviewsSession.bgkeyAt,
-                seen: __reviewsSession.seen,
-                shapes: __reviewsSession.shapes,
-                lastBatchBody: __reviewsSession.lastBatchBody,
-                lastQv9Response: __reviewsSession.lastQv9Response,
-                lastQv9FullLen: (__reviewsSession.lastQv9Full || '').length,
-                qv9Calls: __reviewsSession.qv9Calls,
-                messages: __reviewsSession.messages,
-            };
-        });
-        // M9 / J-09a: build a reviews request for a place, using the session
-        // we learned from the page. `overrides` (token/bgkey) exists for the
-        // e2e to tell a stale capture from a wrong request shape.
-        defineEntryPoint('__placemillBuildReviewsRequest', function (placeId, overrides) {
-            try {
-                var over = overrides && typeof overrides === 'object' ? overrides : {};
-                // No `reviewsTokenFromState()` fallback here: the page state
-                // holds many token-shaped strings (a ChIJ place id matches the
-                // same regex) and a wrong pick lands in the TOKEN slot of the
-                // request body — measured to produce an empty answer.
-                var token = over.token || __reviewsSession.token;
-                var bgkey = over.bgkey || __reviewsSession.bgkey;
-                var request = buildReviewsRequest(String(placeId || ''), token, null, bgkey);
-                return {
-                    ok: Boolean(request.body && request.url),
-                    url: request.url,
-                    body: request.body,
-                    headers: request.headers,
-                    hasToken: Boolean(token),
-                    hasBgkey: Boolean(bgkey),
-                };
-            } catch (e) {
-                return { ok: false, error: String(e && e.message ? e.message : e) };
-            }
-        });
-        // M8 / J-08f: parse a payload the caller hands over, so the e2e can
-        // prove that a response carrying a raw control byte still yields
-        // rows. It only reads the string it is given and writes nothing.
-        defineEntryPoint('__placemillParse', function (text) {
-            try {
-                var rows = parseBusiness(typeof text === 'string' ? text : String(text || ''));
-                return { ok: true, count: rows.length, rows: rows };
-            } catch (e) {
-                return { ok: false, error: String(e && e.message ? e.message : e) };
-            }
-        });
     }
 
-    // R-31 boundary: the two entry points below are PRODUCTION, not debug
-    // helpers. Rust evals them in every build — `fetch_reviews` calls
-    // `__placemillFetchReviews` and the Tier-2 runner calls
-    // `__placemillParsePlaceState` — so gating them on DEBUG_BUILD made
-    // reviews and enrichment fail in release builds while working under
-    // `tauri dev`. Only the developer console helpers stay behind the gate.
-
+    // ---- R-38 production entry points begin ----
+    //
+    // 0.2 Production entry points (every build)
+    //
+    // These two are eval'd by Rust in *every* build: `fetch_business_reviews`
+    // calls `__placemillFetchReviews`, and the Tier-2 enrichment runner calls
+    // `__placemillParsePlaceState`. They used to live inside the
+    // `if (DEBUG_BUILD)` block above, so a release build never defined them
+    // and both features failed with "window.__placemillX is not a function"
+    // while `tauri dev` (where the flag is true) kept working. Any entry point
+    // a Rust command evals by name belongs here; probes, fixtures and
+    // diagnostics stay behind the gate.
+    //
+    // `intercept_script_tests::production_entry_points_are_not_debug_gated`
+    // reads the two markers — keep them.
     // M9 / J-09a: the reviews fetch, three sources in one call. Preferred:
     // the bootstrap state — Google server-renders the place's reviews-link
     // payload into APP_INITIALIZATION_STATE, so the featured review is
@@ -1180,7 +1174,6 @@ defineEntryPoint('__placemillNoteParsedBatch', noteParsedBatch);
         }
         return viaQv9();
     });
-
     // Tier-2: the enrichment runner's one eval — read the current place
     // payload out of the bootstrap state (see placemillParsePlaceState).
     // Production path, like __placemillFetchReviews: a pure read of the
@@ -1188,6 +1181,69 @@ defineEntryPoint('__placemillNoteParsedBatch', noteParsedBatch);
     defineEntryPoint('__placemillParsePlaceState', function () {
         return placemillParsePlaceState();
     });
+    // ---- R-38 production entry points end ----
+
+    // ============================================================
+    // 0.3 Debug helpers (probes, fixtures, diagnostics)
+    //
+    // Everything below is a development tool: it reports payload shapes,
+    // feeds the e2e fixtures, or probes IPC from the console. A release build
+    // must not define them at all (R-31), so the gate is re-opened here.
+    // ============================================================
+    if (DEBUG_BUILD) {
+        // M9 / J-09a: what the page's own traffic taught us about its session.
+        defineEntryPoint('__placemillReviewsSession', function () {
+            return {
+                token: __reviewsSession.token,
+                bgkey: __reviewsSession.bgkey,
+                tokenAt: __reviewsSession.tokenAt,
+                bgkeyAt: __reviewsSession.bgkeyAt,
+                seen: __reviewsSession.seen,
+                shapes: __reviewsSession.shapes,
+                lastBatchBody: __reviewsSession.lastBatchBody,
+                lastQv9Response: __reviewsSession.lastQv9Response,
+                lastQv9FullLen: (__reviewsSession.lastQv9Full || '').length,
+                qv9Calls: __reviewsSession.qv9Calls,
+                messages: __reviewsSession.messages,
+            };
+        });
+        // M9 / J-09a: build a reviews request for a place, using the session
+        // we learned from the page. `overrides` (token/bgkey) exists for the
+        // e2e to tell a stale capture from a wrong request shape.
+        defineEntryPoint('__placemillBuildReviewsRequest', function (placeId, overrides) {
+            try {
+                var over = overrides && typeof overrides === 'object' ? overrides : {};
+                // No `reviewsTokenFromState()` fallback here: the page state
+                // holds many token-shaped strings (a ChIJ place id matches the
+                // same regex) and a wrong pick lands in the TOKEN slot of the
+                // request body — measured to produce an empty answer.
+                var token = over.token || __reviewsSession.token;
+                var bgkey = over.bgkey || __reviewsSession.bgkey;
+                var request = buildReviewsRequest(String(placeId || ''), token, null, bgkey);
+                return {
+                    ok: Boolean(request.body && request.url),
+                    url: request.url,
+                    body: request.body,
+                    headers: request.headers,
+                    hasToken: Boolean(token),
+                    hasBgkey: Boolean(bgkey),
+                };
+            } catch (e) {
+                return { ok: false, error: String(e && e.message ? e.message : e) };
+            }
+        });
+        // M8 / J-08f: parse a payload the caller hands over, so the e2e can
+        // prove that a response carrying a raw control byte still yields
+        // rows. It only reads the string it is given and writes nothing.
+        defineEntryPoint('__placemillParse', function (text) {
+            try {
+                var rows = parseBusiness(typeof text === 'string' ? text : String(text || ''));
+                return { ok: true, count: rows.length, rows: rows };
+            } catch (e) {
+                return { ok: false, error: String(e && e.message ? e.message : e) };
+            }
+        });
+    }
 
     // ============================================================
     // 1. fetch interception (Object.defineProperty keeps it from being overwritten by Google Maps)
@@ -1316,7 +1372,7 @@ defineEntryPoint('__placemillNoteParsedBatch', noteParsedBatch);
                             // R-10: any target response feeds the health probe,
                             // whatever it contained.
                             lastMapResponseAt = Date.now();
-                            if (text.length > MAX_BODY_BYTES) {
+                            if (text.length > MAX_BODY_CHARS) {
                                 counters.skipped++;
                                 warn('[Placemill] fetch #' + counters.fetch + ' body too large to parse:', text.length);
                                 return;
@@ -1351,38 +1407,62 @@ defineEntryPoint('__placemillNoteParsedBatch', noteParsedBatch);
 
         __ourFetch = makeInterceptor(__realFetch);
 
-        // Lock window.fetch with Object.defineProperty:
-        // - the getter always returns our interceptor
-        // - the setter captures the fetch installed by Google Maps as the new realFetch
-        Object.defineProperty(window, 'fetch', {
-            get: function () { return __ourFetch; },
-            set: function (newVal) {
-                // R-12: a page that saves and restores window.fetch
-                // (`fetch = fetch`, the polyfill dance) must not make us wrap
-                // our own interceptor — that stacked one clone+parse layer per
-                // round trip, growing with every save/restore cycle.
-                if (newVal === __ourFetch) {
-                    return;
-                }
-                log('[Placemill] fetch overwritten by page, updating realFetch');
-                __realFetch = newVal;
-                __ourFetch = makeInterceptor(__realFetch);
-            },
-            configurable: false,
-            enumerable: true
-        });
+        // P2-15: keep the property configurable. Locking it (`configurable:
+        // false`) makes `defineProperty` throw when the page (or Google's own
+        // fetch polyfill) tries to redefine it — and that throw used to abort
+        // the rest of this script, taking the XHR hook, the parser and the IPC
+        // path with it. The setter below still captures any replacement and
+        // re-wraps it, so a plain `fetch = ...` cannot unhook us.
+        try {
+            Object.defineProperty(window, 'fetch', {
+                get: function () { return __ourFetch; },
+                set: function (newVal) {
+                    // R-12: a page that saves and restores window.fetch
+                    // (`fetch = fetch`, the polyfill dance) must not make us wrap
+                    // our own interceptor — that stacked one clone+parse layer per
+                    // round trip, growing with every save/restore cycle.
+                    if (newVal === __ourFetch) {
+                        return;
+                    }
+                    log('[Placemill] fetch overwritten by page, updating realFetch');
+                    __realFetch = newVal;
+                    __ourFetch = makeInterceptor(__realFetch);
+                },
+                configurable: true,
+                enumerable: true
+            });
+        } catch (e) {
+            // One interception path down is much better than the whole script
+            // aborting: the grid, reviews and settings entry points still
+            // install below.
+            console.error('[Placemill] could not install fetch interception:', e && e.message);
+        }
     })();
 
     // ============================================================
     // 2. XHR interception (no URL filter, tries to parse every response)
     // ============================================================
-    window.__placemillOriginalOpen = XMLHttpRequest.prototype.open;
-    window.__placemillOriginalSend = XMLHttpRequest.prototype.send;
-    window.__placemillOriginalSetRequestHeader = XMLHttpRequest.prototype.setRequestHeader;
+    // P2-15: the page's own methods live in this closure, not on `window`.
+    // A page script can write any global, and swapped originals would let it
+    // run its own calls while our hooks still looked installed.
+    var originalOpen = XMLHttpRequest.prototype.open;
+    var originalSend = XMLHttpRequest.prototype.send;
+    var originalSetRequestHeader = XMLHttpRequest.prototype.setRequestHeader;
+
+    // Assign one prototype hook at a time: a frozen or proxied prototype must
+    // log one failure and leave the remaining hooks installable instead of
+    // aborting the rest of the script.
+    function hookXhr(name, fn) {
+        try {
+            XMLHttpRequest.prototype[name] = fn;
+        } catch (e) {
+            console.error('[Placemill] XHR ' + name + ' hook install failed:', e && e.message);
+        }
+    }
 
     // M9: the page sets x-maps-bgkey through setRequestHeader, so that is
     // where we read it from. We only look at the one header we care about.
-    XMLHttpRequest.prototype.setRequestHeader = function (name, value) {
+    hookXhr('setRequestHeader', function (name, value) {
         try {
             if (String(name).toLowerCase() === 'x-maps-bgkey') {
                 rememberReviewsSession({ bgkey: String(value || '') });
@@ -1390,10 +1470,10 @@ defineEntryPoint('__placemillNoteParsedBatch', noteParsedBatch);
         } catch (e) {
             /* ignore */
         }
-        return window.__placemillOriginalSetRequestHeader.apply(this, arguments);
-    };
+        return originalSetRequestHeader.apply(this, arguments);
+    });
 
-    XMLHttpRequest.prototype.open = function (method, url) {
+    hookXhr('open', function (method, url) {
         var xhrId = ++counters.xhr;
         this.__placemillUrl = url;
         this.__placemillMethod = method;
@@ -1401,10 +1481,10 @@ defineEntryPoint('__placemillNoteParsedBatch', noteParsedBatch);
         if (isTargetUrl(url)) {
             vlog('[Placemill] XHR open #' + xhrId + ':', method, url.substring(0, 200));
         }
-        return window.__placemillOriginalOpen.apply(this, arguments);
-    };
+        return originalOpen.apply(this, arguments);
+    });
 
-    XMLHttpRequest.prototype.send = function (body) {
+    hookXhr('send', function (body) {
         var self = this;
         var _xhrId = self.__placemillId || 0;
         var _xhrUrl = self.__placemillUrl || '';
@@ -1484,7 +1564,7 @@ defineEntryPoint('__placemillNoteParsedBatch', noteParsedBatch);
                         vlog('[Placemill] XHR DONE #' + _xhrId + ' | status:', self.status, '| len:', text.length);
 
                         // R-08: the size cap applies to XHR too.
-                        if (text.length > MAX_BODY_BYTES) {
+                        if (text.length > MAX_BODY_CHARS) {
                             counters.skipped++;
                             warn('[Placemill] XHR #' + _xhrId + ' body too large to parse:', text.length);
                             return;
@@ -1518,8 +1598,8 @@ defineEntryPoint('__placemillNoteParsedBatch', noteParsedBatch);
         // gone. They only logged readyState changes — no parsing, no data —
         // and an aborted request kept its interval alive for the full 30 s.
 
-        return window.__placemillOriginalSend.apply(this, arguments);
-    };
+        return originalSend.apply(this, arguments);
+    });
 
     // M8 / J-08f: strip the raw control bytes before parsing.
     //
@@ -1645,23 +1725,10 @@ defineEntryPoint('__placemillNoteParsedBatch', noteParsedBatch);
             results = extractBusinesses(data);
         } catch (e) {
             console.error('[Placemill] parseWrapper error:', e.message || e);
-            // Fallback: try the raw format
-            if (text.charAt(0) === '{') {
-                vlog('[Placemill] parseWrapper: falling back to raw format');
-                // Check whether the response actually starts with )]}'
-                var maybeRaw = text.replace(/^\)\]\}'\n?/, '');
-                if (maybeRaw !== text) {
-                    try {
-                        var arr = JSON.parse(maybeRaw);
-                        if (Array.isArray(arr)) {
-                            vlog('[Placemill] parseWrapper: raw fallback succeeded, data len =', arr.length);
-                            results = extractBusinesses(arr);
-                        }
-                    } catch (e2) {
-                        console.error('[Placemill] parseWrapper: raw fallback also failed:', e2.message || e2);
-                    }
-                }
-            }
+            // The raw-format fallback lives in `parseBusiness`: it runs when
+            // this function returns 0. The old catch branch re-checked a `{`
+            // prefix and stripped an XSSI marker that could not be present, so
+            // it was unreachable (P3-14).
         }
         return results;
     }
@@ -1823,7 +1890,7 @@ defineEntryPoint('__placemillNoteParsedBatch', noteParsedBatch);
     // holds the reviews (each review is `inner[2][i][0]`).
     //
     // The relative field paths are the ones gosom uses — only the root
-    // changed (`docs/parser.md`). Measured, not guessed:
+    // changed (docs/field-index-map.md §6.2). Measured, not guessed:
     //   text            r[2][15][0][0]
     //   stars           r[2][0][0]
     //   author          r[1][4][5][0]
@@ -1832,7 +1899,7 @@ defineEntryPoint('__placemillNoteParsedBatch', noteParsedBatch);
     // ============================================================
 
     // The page's session state. The reviews request needs three things
-    // (see `docs/parser.md`): the session token, the session header
+    // (field-index-map §6.3): the session token, the session header
     // x-maps-bgkey, and the target place's hex id. The first two live in the
     // page's own requests, so we learn them from the traffic instead of
     // asking the page for them.
@@ -1976,7 +2043,10 @@ defineEntryPoint('__placemillNoteParsedBatch', noteParsedBatch);
     (function hookPostMessage() {
         var original = window.postMessage;
         if (typeof original !== 'function') return;
-        window.__placemillOriginalPostMessage = original.bind(window);
+        // P2-15: keep the page's original in this closure. A writable global
+        // let a page script swap it and run its own postMessage while our hook
+        // still looked installed.
+        var originalPostMessage = original.bind(window);
         window.postMessage = function (message, target, transfer) {
             try {
                 if (typeof message === 'string') {
@@ -1987,7 +2057,7 @@ defineEntryPoint('__placemillNoteParsedBatch', noteParsedBatch);
             } catch (e) {
                 /* ignore */
             }
-            return window.__placemillOriginalPostMessage(message, target, transfer);
+            return originalPostMessage(message, target, transfer);
         };
     })();
 
@@ -2136,7 +2206,7 @@ defineEntryPoint('__placemillNoteParsedBatch', noteParsedBatch);
 
     // Map one review root to our shape. Both channels (qv9Egd and the
     // reviews_link payload) share the same relative field paths — measured,
-    // `docs/parser.md`.
+    // docs/field-index-map.md §6.2.
     function mapReview(review) {
         return {
             review_id: strAt(review, [0]),
@@ -2257,7 +2327,7 @@ defineEntryPoint('__placemillNoteParsedBatch', noteParsedBatch);
     // Build the request for one place's reviews. The inner JSON is the shape
     // the page sends (measured); only the place id and the session token are
     // ours. The source path can be anything the page would accept — the
-    // place's name in it turned out to be irrelevant (see `docs/parser.md`).
+    // place's name in it turned out to be irrelevant (field-index-map §6.3).
     function buildReviewsRequest(placeId, sessionToken, sourcePath, bgkey) {
         // The inner JSON, element for element as the page sends it. Two
         // earlier mistakes to not repeat: element 0 is [[placeId], ...] (one
@@ -2316,7 +2386,7 @@ defineEntryPoint('__placemillNoteParsedBatch', noteParsedBatch);
     // The place-page payload (APP_INITIALIZATION_STATE[3].Dg[6]) carries
     // jd[6] — the SAME positional detail array the search payload carries per
     // element, measured 2/2 on a dealer and a coffeehouse
-    // (see `docs/parser.md`). Only four fields are worth reading here; the
+    // (field-index-map §6.8). Only four fields are worth reading here; the
     // search payload fills everything else, and price_level/popular_times are
     // NOT in this payload even for pages that render them (measured).
 
@@ -2560,33 +2630,68 @@ defineEntryPoint('__placemillNoteParsedBatch', noteParsedBatch);
     // ============================================================
     // 4. Send data to the Rust backend
     // ============================================================
+    // Whether either IPC surface is present. Kept in one place: `flushData`
+    // and the drain timer must agree on what "ready" means.
+    function ipcReady() {
+        return Boolean(
+            (window.__TAURI__ && window.__TAURI__.event && typeof window.__TAURI__.event.emit === 'function') ||
+            (window.__TAURI_INTERNALS__ && typeof window.__TAURI_INTERNALS__.invoke === 'function')
+        );
+    }
+
+    // Queue a whole batch, capped, and make sure the drain timer is running.
+    function queueBatch(businesses, meta, retried) {
+        if (PENDING.length >= PENDING_MAX_BATCHES) {
+            var dropped = PENDING.shift();
+            warn('[Placemill] pending queue full, dropping ' + dropped.businesses.length + ' older row(s)');
+        }
+        PENDING.push({ businesses: businesses, meta: meta || {}, retried: Boolean(retried) });
+        if (pendingTimer) return;
+        pendingTimer = setInterval(function () {
+            if (!ipcReady()) return;
+            while (PENDING.length > 0) {
+                var entry = PENDING.shift();
+                vlog('[Placemill] Flushing ' + entry.businesses.length + ' pending items');
+                doSend(entry.businesses, entry.meta, entry.retried);
+            }
+            // P2-15: the outage is over and the queue is empty; the old timer
+            // kept polling every 200 ms for the rest of the session.
+            clearInterval(pendingTimer);
+            pendingTimer = null;
+        }, 200);
+    }
+
+    // One retry for a batch whose emit rejected. Without this the data was
+    // simply lost: `flushData` had already returned by the time the promise
+    // settled, and only a console line remained.
+    function requeueFailedBatch(businesses, meta, retried) {
+        if (retried) {
+            warn('[Placemill] IPC still failing, dropping ' + businesses.length + ' row(s)');
+            return;
+        }
+        queueBatch(businesses, meta, true);
+    }
+
     function flushData(businesses, meta) {
         vlog('[Placemill] flushData called, count:', businesses.length);
-        var hasIPC = (window.__TAURI__ && window.__TAURI__.event && window.__TAURI__.event.emit) ||
-                      (window.__TAURI_INTERNALS__ && window.__TAURI_INTERNALS__.invoke);
-        if (hasIPC) {
-            doSend(businesses, meta);
+        // P1-4: stamp the clear epoch when the batch is *produced*, not when it
+        // is sent. A batch can sit in PENDING across a clear, and reading the
+        // epoch at send time would let the post-clear value vouch for rows that
+        // were parsed out of the table the user had just emptied.
+        var stamped = (meta && typeof meta === 'object') ? meta : {};
+        stamped.epoch = (typeof window.__placemillEpoch === 'number') ? window.__placemillEpoch : 0;
+        if (ipcReady()) {
+            doSend(businesses, stamped, false);
         } else {
             warn('[Placemill] IPC not ready, queuing...');
             // Queue whole batches, not flat rows: the metadata belongs to the
             // response that produced those rows, and merging them would attribute
             // a later search's rows to an earlier one.
-            PENDING.push({ businesses: businesses, meta: meta || {} });
-            if (!window.__placemillTimer) {
-                window.__placemillTimer = setInterval(function () {
-                    var ready = (window.__TAURI__ && window.__TAURI__.event && window.__TAURI__.event.emit) ||
-                                 (window.__TAURI_INTERNALS__ && window.__TAURI_INTERNALS__.invoke);
-                    while (ready && PENDING.length > 0) {
-                        var entry = PENDING.shift();
-                        vlog('[Placemill] Flushing ' + entry.businesses.length + ' pending items');
-                        doSend(entry.businesses, entry.meta);
-                    }
-                }, 200);
-            }
+            queueBatch(businesses, stamped, false);
         }
     }
 
-    function doSend(businesses, meta) {
+    function doSend(businesses, meta, retried) {
         if (!window.__placemillEnabled) {
             vlog('[Placemill] doSend: disabled, skipping ' + businesses.length + ' items');
             return;
@@ -2613,7 +2718,10 @@ defineEntryPoint('__placemillNoteParsedBatch', noteParsedBatch);
             businesses: businesses,
             sourceQuery: (meta && typeof meta.sourceQuery === 'string') ? meta.sourceQuery : '',
             jobId: currentTileField('jobId'),
-            tileId: currentTileField('tileId')
+            tileId: currentTileField('tileId'),
+            // P1-4: the epoch this batch was produced under; Rust refuses a
+            // batch from before the last clear.
+            epoch: (meta && typeof meta.epoch === 'number') ? meta.epoch : 0
         };
         vlog('[Placemill] IPC emit: business-data, count:', businesses.length,
             '| query:', payload.sourceQuery, '| tile:', payload.tileId);
@@ -2628,6 +2736,7 @@ defineEntryPoint('__placemillNoteParsedBatch', noteParsedBatch);
                         vlog('[Placemill] IPC emit OK (via __TAURI__.event.emit)');
                     }).catch(function (e) {
                         console.error('[Placemill] IPC emit FAILED:', e);
+                        requeueFailedBatch(businesses, meta, retried);
                     });
                 } else {
                     vlog('[Placemill] IPC emit OK (sync)');
@@ -2642,6 +2751,7 @@ defineEntryPoint('__placemillNoteParsedBatch', noteParsedBatch);
                         vlog('[Placemill] IPC emit OK (via invoke fallback)');
                     }).catch(function (e) {
                         console.error('[Placemill] IPC emit FAILED:', e);
+                        requeueFailedBatch(businesses, meta, retried);
                     });
                 } else {
                     vlog('[Placemill] IPC emit OK (sync fallback)');
@@ -2651,6 +2761,7 @@ defineEntryPoint('__placemillNoteParsedBatch', noteParsedBatch);
             }
         } catch (e) {
             console.error('[Placemill] IPC emit FAILED:', e);
+            requeueFailedBatch(businesses, meta, retried);
         }
     }
 
@@ -2673,6 +2784,27 @@ defineEntryPoint('__placemillNoteParsedBatch', noteParsedBatch);
 var HEALTH_INTERVAL_MS = 10000;
 var HEALTH_SILENCE_MS = 20000;
 var lastHealthState = '';
+
+// Whether this document rendered the Maps shell at all.
+//
+// `probeHealth` answers "is the page blocked / silent"; this answers the more
+// basic question a cell needs: "is there a Maps UI here, or just an empty
+// document". Capture screen, consent screen and a failed SPA render all have no
+// shell, which is what separates `no-feed` (dead page) from `no-results` (a
+// working page with nothing to show). Several selectors on purpose: Maps has
+// renamed them before, and one surviving match is enough.
+function mapsShellAlive() {
+    try {
+        return Boolean(
+            document.querySelector('#searchbox') ||
+            document.querySelector('div[role="main"]') ||
+            document.querySelector('#map') ||
+            document.querySelector('canvas')
+        );
+    } catch (e) {
+        return false;
+    }
+}
 
 function probeHealth() {
     try {
@@ -2736,6 +2868,11 @@ setInterval(function () {
         tileLat: null,
         tileLng: null,
         maxDriftKm: 0,
+        // `lastMapResponseAt` when this run started. Only used to make the
+        // end-of-cell log line say whether the page answered at all — the
+        // `no-results` / `no-feed` split is decided by `mapsShellAlive()`, not by
+        // this (P1-2: an empty search often renders server-side with no XHR).
+        responseAtStart: 0,
         containerCache: null,
         lastContainerHeight: 0,
         noChangeCount: 0,                                  // consecutive rounds without change
@@ -2840,18 +2977,48 @@ setInterval(function () {
                 return;
             }
 
-            var container = this.containerCache || this.findContainer();
-            this.containerCache = container;
+            // P2-15: the cache survives navigations, but the element may not.
+            // A detached or hidden feed (display:none after a new search) is not
+            // the list that is loading now, and scrolling it would report "no
+            // change" until the idle rounds gave up on a cell that had results.
+            var container = this.containerCache;
+            if (container && (!container.isConnected || container.clientHeight === 0)) {
+                vlog('[Placemill] autoScroll: cached container is gone or hidden, looking again');
+                container = null;
+                this.containerCache = null;
+            }
+            if (!container) {
+                container = this.findContainer();
+                this.containerCache = container;
+            }
 
             if (!container) {
                 // An area with no results never renders a feed. Retrying forever
                 // would burn the whole per-tile budget (90 s) on an empty cell, so
-                // five misses is "this cell has nothing" — the grid runner treats
-                // `no-results` as a finished cell, not a failure.
+                // five misses is "this cell has nothing".
                 this.containerMisses++;
                 if (this.containerMisses >= 5) {
-                    log('[Placemill] autoScroll: no result list after ' + this.containerMisses + ' tries, ending this cell');
-                    this.stop('no-results');
+                    // P1-2: "no feed" is not the same fact as "no results". A
+                    // consent screen, a captcha or a search that never came back
+                    // also renders no feed, and the scheduler used to count all of
+                    // them as an empty cell — a captcha could walk a whole grid to
+                    // `empty` while the panel promised the task would pause. Only a
+                    // page that is demonstrably alive may claim the cell is empty;
+                    // everything else ends as `no-feed`, which Rust counts towards
+                    // its dead-page streak.
+                    //
+                    // "Alive" is the Maps shell, not the response channel: an
+                    // empty search legitimately answers with no feed *and* often
+                    // with no `tbm=map` XHR at all (Google renders the empty page
+                    // server-side), so requiring a fresh response reclassified
+                    // every genuinely empty cell as a dead page.
+                    var health = probeHealth();
+                    var shell = mapsShellAlive();
+                    var alive = shell && (health === 'ok' || health === 'no-results');
+                    log('[Placemill] autoScroll: no result list after ' + this.containerMisses +
+                        ' tries (health=' + health + ', shell=' + shell +
+                        ', new response=' + (lastMapResponseAt !== this.responseAtStart) + ')');
+                    this.stop(alive ? 'no-results' : 'no-feed');
                     return;
                 }
                 log('[Placemill] autoScroll: container not found, retrying in 3s...');
@@ -2914,6 +3081,9 @@ setInterval(function () {
             this.noChangeCount = 0;
             this.containerMisses = 0;
             this.containerCache = null;
+            // Baseline for the "did this page actually answer?" check that
+            // separates `no-results` from `no-feed` (P1-2).
+            this.responseAtStart = lastMapResponseAt;
             // Bind the identity for the whole run: this document cannot know
             // which cell replaces it later, and must not pretend it does.
             this.jobId = currentTileField('jobId');
@@ -2954,11 +3124,13 @@ setInterval(function () {
             this.timer = setTimeout(this.doScroll.bind(this), initialDelay);
         },
 
-        // `reason` is part of the contract with the scheduler: only 'idle' and
-        // 'max-scrolls' mean "this grid cell is finished". 'navigate' fires
-        // before every restart (the search handler stops then starts), and
-        // 'manual' covers the user / Rust toggling the switch — neither may
-        // close a cell.
+        // `reason` is part of the contract with the scheduler: 'idle',
+        // 'max-scrolls', 'no-results' and 'drift' mean "this grid cell is
+        // finished". 'no-feed' is a finished cell too, but one whose page was
+        // not alive — Rust counts it towards the dead-page streak (P1-2).
+        // 'navigate' fires before every restart (the search handler stops then
+        // starts), and 'settings' / 'manual' cover the user or Rust toggling the
+        // switch — none of those may close a cell.
         stop: function (reason) {
             var wasRunning = this.running;
             var scrolls = this.scrollCount;

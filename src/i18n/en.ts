@@ -245,6 +245,7 @@ export const en = {
   'tile.reason.timeout': 'timed out',
   'tile.reason.parseEmpty': 'nothing parsed',
   'tile.reason.drift': 'map drifted',
+  'tile.reason.noFeed': 'no result list (map blocked?)',
   'task.keyword': 'Keyword',
   'task.km': '{value} km',
   'task.loadFailed': 'Failed to load the task data: {error}',
@@ -298,11 +299,13 @@ export const en = {
 
 
   // ===== Metrics =====
-  'metrics.avgRating': 'Avg rating',
-  'metrics.avgRatingRated': 'Avg rating · {count} rated',
-  'metrics.collected': 'Collected',
+  // P3-5: the first figure is the whole table; the other two are scoped to the
+  // current filters. Say so, otherwise one strip reads as one scope.
+  'metrics.avgRating': 'Avg rating · filtered',
+  'metrics.avgRatingRated': 'Avg rating · {count} rated · filtered',
+  'metrics.collected': 'Collected (all)',
   'metrics.outOfFive': '/ 5',
-  'metrics.withPhoneShare': 'With phone · {pct}%',
+  'metrics.withPhoneShare': 'With phone · {pct}% · filtered',
 
   // ===== Settings drawer =====
   'settings.csvBom': 'CSV with BOM',
@@ -421,10 +424,10 @@ export const en = {
   'table.address': 'Address',
   'table.business': 'Business',
   'table.clearDesc':
-    'This also deletes every row in the local database. It cannot be undone.',
+    'This deletes the businesses and task data from the local database; fetched reviews are kept. It cannot be undone.',
   'table.clearFilters': 'Clear filters',
-  'table.clearTitle': 'Delete {count} records?',
-  'table.clearTooltip': 'Clear all data',
+  'table.clearTitle': 'Delete {count} businesses?',
+  'table.clearTooltip': 'Clear business data (reviews kept)',
   'table.count': '{count} businesses',
   'table.task': 'Task',
   'table.exportFirst': 'Export before clearing',
@@ -455,6 +458,7 @@ export const en = {
   'table.exportSelected': 'Export {count} selected',
   'table.locate': 'Locate on map',
   'table.mineEmails': 'Mine emails',
+  'table.mineEmailsForce': 'Re-mine anyway',
   'table.mineEmailsHint':
     'Visit the websites of the selected rows — or the whole filtered set — to collect emails and social profiles',
   'table.miningProgress': 'Mining {done}/{total} · {found} with email',
@@ -483,7 +487,7 @@ export const en = {
   'toast.collectorRestarted': 'Collector restarted',
   'toast.copied': 'Copied to clipboard',
   'toast.copyFailed': 'Copy failed: {error}',
-  'toast.dataCleared': 'All data cleared',
+  'toast.dataCleared': 'Business data cleared (reviews kept)',
   'toast.diagFailed': 'Failed to read diagnostics: {error}',
   'toast.settingsCorrected': 'Some settings were adjusted to valid values: {fields}',
   'toast.queryFailed': 'Could not load the table: {error}',
@@ -495,6 +499,8 @@ export const en = {
   'toast.undoFailed': 'Undo failed: {error}',
   'toast.exportDirFallback':
     'The export folder {dir} is unavailable — pick a location in the dialog instead',
+  'toast.exportBusy': 'Another export is still running. Wait for it to finish.',
+  'toast.excelRowLimit': 'Excel cannot hold {count} rows in one sheet. Export CSV instead.',
   'toast.exportFailed': 'Export failed: {error}',
   'toast.exported': 'Exported {count} record(s) to {format}',
   'toast.exportedPartial':
@@ -509,6 +515,11 @@ export const en = {
   'toast.emailMineFailed': 'Email mining failed: {error}',
   'toast.emailMineRunning': 'Email mining is already running',
   'toast.emailNothingToMine': 'No rows with a website in this scope',
+  'toast.emailAllMinedTitle': 'These {count} businesses were already mined',
+  'toast.emailAllMinedBody':
+    'They all have websites — the previous run already visited them. Re-visit those sites and overwrite the earlier results?',
+  'toast.emailSitesUnusable':
+    'The websites of these businesses cannot be visited (private host, malformed URL, or blocked by a challenge page)',
   'toast.enrichNothing': 'Select the businesses to enrich first',
   'toast.enrichBusy': 'An enrichment run is already in progress',
   'toast.enrichMapBusy': 'The map is owned by a running task — try again when it ends',
@@ -530,10 +541,17 @@ export const en = {
   'toast.restoreFailed': 'Failed to restore saved data: {error}',
   'toast.revealFailed': 'Failed to open the export folder: {error}',
   'toast.reviewsFetchFailed': 'Failed to request reviews: {error}',
+  'toast.reviewsFetchTimeout': 'The reviews fetch did not answer in time — check the map pane and try again.',
   'toast.reviewsBlockedBySession': 'The collector is using the map — stop collecting before fetching reviews.',
   'toast.reviewsBlockedByJob': 'A task is using the map — fetch reviews once it pauses or finishes.',
   'toast.reviewsBlockedByEnrich': 'Detail enrichment is using the map — try again when it ends.',
+  'toast.reviewsBusy': 'Reviews are being fetched for another business — try again in a few seconds.',
+  'toast.jobBusy': 'A task is using the map — try again once it pauses or finishes.',
+  'toast.sessionBusy': 'The collector is using the map — stop collecting first.',
   'detail.reviewsBlockedByJob': 'Task “{name}” is using the map; reviews can be fetched once it ends',
+  'detail.reviewsFetching': 'Fetching reviews — the map is busy for a few seconds',
+  'table.enrichBlockedHint': 'The map is busy — try again when the current task, enrichment or reviews fetch ends',
+  'toast.reloadInterruptsPane': 'Reloading interrupts the reviews fetch or enrichment in progress.',
   'toast.subscribeFailed': 'Failed to subscribe to events: {error}',
 
   // ===== Auto-update (G-06) =====

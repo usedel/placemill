@@ -126,6 +126,34 @@ function buildRows() {
   ];
 }
 
+/**
+ * Run a command and normalise success/failure so a check can read either.
+ *
+ * The catch has to live *inside* the page: a rejected `invoke` surfaces over
+ * CDP as a bare "Uncaught (in promise)" with the message stripped, which is
+ * exactly the code the checks below assert on.
+ */
+async function attempt(panel, command, args) {
+  const raw = await evalIn(
+    panel,
+    `(async () => {
+       try {
+         const value = await window.__TAURI_INTERNALS__.invoke(
+           ${JSON.stringify(command)},
+           ${JSON.stringify(args ?? {})}
+         );
+         return JSON.stringify({ ok: true, value: value === undefined ? null : value });
+       } catch (error) {
+         return JSON.stringify({
+           ok: false,
+           error: String(error && error.message ? error.message : error),
+         });
+       }
+     })()`,
+  );
+  return JSON.parse(raw);
+}
+
 async function fetchRow(call, placeId) {
   const page = await call('query_businesses', {
     request: { page: 1, pageSize: 50 },
@@ -171,19 +199,11 @@ async function main() {
     check('two distinct sites are scheduled', sites === 2, `${sites}`);
 
     // ---- single-flight ---------------------------------------------------
-    // The CDP bridge flattens invoke rejections to "Uncaught (in promise)",
-    // so refusal is detected by the call throwing rather than by its text.
-    let secondRun = 'resolved';
-    try {
-      const value = await call('start_email_mining', { request: { filter: {} } });
-      secondRun = `resolved with ${value}`;
-    } catch (error) {
-      secondRun = `rejected: ${String(error)}`;
-    }
+    const secondRun = await attempt(panel, 'start_email_mining', { request: { filter: {} } });
     check(
       'a second run is refused while one is active',
-      secondRun.startsWith('rejected:'),
-      secondRun,
+      !secondRun.ok && secondRun.error.includes('already-running'),
+      JSON.stringify(secondRun),
     );
 
     // ---- results ---------------------------------------------------------
@@ -234,10 +254,15 @@ async function main() {
     );
 
     // ---- idempotency -----------------------------------------------------
-    const again = await call('start_email_mining', {
-      request: { filter: {} },
-    });
-    check('a non-force re-run schedules nothing', again === 0, `${again}`);
+    // C-15: an empty scope is an error that says *why* (`nothing_to_mine:*`),
+    // not `0`. The panel used to report all three causes as "no website", which
+    // is wrong when the row has one and was simply mined before.
+    const again = await attempt(panel, 'start_email_mining', { request: { filter: {} } });
+    check(
+      'a non-force re-run reports why there is nothing to mine',
+      !again.ok && again.error.includes('nothing_to_mine:already_mined'),
+      JSON.stringify(again),
+    );
 
     // (cancel_email_mining with nothing running must be a harmless no-op)
     await call('cancel_email_mining');

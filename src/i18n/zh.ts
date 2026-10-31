@@ -231,6 +231,7 @@ export const zh: Dict = {
   'tile.reason.timeout': '超时',
   'tile.reason.parseEmpty': '未解析到数据',
   'tile.reason.drift': '地图偏移',
+  'tile.reason.noFeed': '没有结果列表（地图被拦截？）',
   'task.keyword': '关键词',
   'task.km': '{value} km',
   'task.loadFailed': '读取任务数据失败：{error}',
@@ -279,11 +280,12 @@ export const zh: Dict = {
 
 
   // ===== Metrics =====
-  'metrics.avgRating': '平均评分',
-  'metrics.avgRatingRated': '平均评分 · {count} 条已评',
-  'metrics.collected': '已采集',
+  // P3-5：第一个数字是整张表，另两个按当前筛选计算；文案必须说明口径。
+  'metrics.avgRating': '平均评分（筛选后）',
+  'metrics.avgRatingRated': '平均评分（筛选后）· {count} 条已评',
+  'metrics.collected': '已采集（全部）',
   'metrics.outOfFive': '/ 5',
-  'metrics.withPhoneShare': '有电话 · {pct}%',
+  'metrics.withPhoneShare': '有电话 · {pct}%（筛选后）',
 
   // ===== Settings drawer =====
   'settings.csvBom': 'CSV 带 BOM',
@@ -396,10 +398,10 @@ export const zh: Dict = {
   // ===== Table / toolbar =====
   'table.address': '地址',
   'table.business': '商家',
-  'table.clearDesc': '本地数据库中的所有行也会被删除，且无法撤销。',
+  'table.clearDesc': '本地数据库中的商户与任务数据会被删除（已抓取的评论保留），且无法撤销。',
   'table.clearFilters': '清除筛选',
-  'table.clearTitle': '删除 {count} 条记录？',
-  'table.clearTooltip': '清空所有数据',
+  'table.clearTitle': '删除 {count} 个商户？',
+  'table.clearTooltip': '清空商户数据（评论保留）',
   'table.count': '{count} 个商家',
   'table.task': '任务',
   'table.exportFirst': '先导出再清空',
@@ -430,6 +432,7 @@ export const zh: Dict = {
   'table.exportSelected': '导出所选 {count} 项',
   'table.locate': '在地图上定位',
   'table.mineEmails': '挖掘邮箱',
+  'table.mineEmailsForce': '强制重挖',
   'table.mineEmailsHint':
     '访问选中行（无选中时为当前筛选全部）的网站，挖掘邮箱与社媒链接',
   'table.miningProgress': '挖掘中 {done}/{total} · {found} 站有邮箱',
@@ -458,7 +461,7 @@ export const zh: Dict = {
   'toast.collectorRestarted': '采集已重新开始',
   'toast.copied': '已复制到剪贴板',
   'toast.copyFailed': '复制失败：{error}',
-  'toast.dataCleared': '数据已全部清空',
+  'toast.dataCleared': '商户数据已清空（评论保留）',
   'toast.diagFailed': '读取诊断信息失败：{error}',
   'toast.settingsCorrected': '部分设置已调整为有效值：{fields}',
   'toast.queryFailed': '加载数据失败：{error}',
@@ -468,6 +471,8 @@ export const zh: Dict = {
   'toast.undoCleared': '已恢复 {count} 条记录',
   'toast.undoFailed': '撤销失败：{error}',
   'toast.exportDirFallback': '导出目录 {dir} 不可用，已改为手动选择保存位置',
+  'toast.exportBusy': '另一个导出仍在进行，请等它完成。',
+  'toast.excelRowLimit': 'Excel 单表无法容纳 {count} 行，请改用 CSV 导出。',
   'toast.exportFailed': '导出失败：{error}',
   'toast.exported': '已导出 {count} 条数据到 {format}',
   'toast.exportedPartial': '已导出 {count} 条数据到 {format} —— {failed} 行写入失败',
@@ -480,6 +485,11 @@ export const zh: Dict = {
   'toast.emailMineFailed': '邮箱挖掘失败：{error}',
   'toast.emailMineRunning': '邮箱挖掘已在进行中',
   'toast.emailNothingToMine': '该范围内没有带网站的行',
+  'toast.emailAllMinedTitle': '这 {count} 个商家都已挖掘过',
+  'toast.emailAllMinedBody':
+    '它们都有网站，只是上次已经挖过了。要重新访问这些网站并覆盖上次的结果吗？',
+  'toast.emailSitesUnusable':
+    '这些商家的网站地址无法访问（内网地址、格式异常或已被防护页拦截）',
   'toast.enrichNothing': '请先选择要富化的商家',
   'toast.enrichBusy': '已有富化任务在运行',
   'toast.enrichMapBusy': '地图正被任务占用，任务结束后再试',
@@ -500,10 +510,17 @@ export const zh: Dict = {
   'toast.restoreFailed': '恢复已保存的数据失败：{error}',
   'toast.revealFailed': '打开导出目录失败：{error}',
   'toast.reviewsFetchFailed': '请求评论失败：{error}',
+  'toast.reviewsFetchTimeout': '评论抓取没有按时返回——检查地图面板后重试。',
   'toast.reviewsBlockedBySession': '采集器正在使用地图——请先停止采集，再拉取评论。',
   'toast.reviewsBlockedByJob': '任务正在占用地图——等它暂停或结束后再拉取评论。',
   'toast.reviewsBlockedByEnrich': '详情富化正在使用地图——结束后再拉取评论。',
+  'toast.reviewsBusy': '正在抓取另一家商户的评论——几秒后再试。',
+  'toast.jobBusy': '任务正在占用地图——等它暂停或结束后再试。',
+  'toast.sessionBusy': '采集器正在使用地图——请先停止采集。',
   'detail.reviewsBlockedByJob': '任务「{name}」正在占用地图，结束后可拉取评论',
+  'detail.reviewsFetching': '正在抓取评论——地图被占用几秒',
+  'table.enrichBlockedHint': '地图正被占用——等当前任务、富化或评论抓取结束后再试',
+  'toast.reloadInterruptsPane': '重载会中断正在进行的评论抓取或详情富化。',
   'toast.subscribeFailed': '订阅事件失败：{error}',
 
   // ===== 自动更新（G-06）=====

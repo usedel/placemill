@@ -243,6 +243,7 @@ export const es: Dict = {
   'tile.reason.timeout': 'tiempo agotado',
   'tile.reason.parseEmpty': 'nada que parsear',
   'tile.reason.drift': 'mapa desplazado',
+  'tile.reason.noFeed': 'sin lista de resultados (¿mapa bloqueado?)',
   'task.keyword': 'Palabra clave',
   'task.km': '{value} km',
   'task.loadFailed': 'No se pudieron cargar los datos: {error}',
@@ -296,11 +297,13 @@ export const es: Dict = {
 
 
   // ===== Metrics =====
-  'metrics.avgRating': 'Valoración media',
-  'metrics.avgRatingRated': 'Valoración media · {count} con reseñas',
-  'metrics.collected': 'Recolectados',
+  // P3-5: la primera cifra es toda la tabla; las otras dos se calculan sobre
+  // los filtros activos. El texto debe decirlo.
+  'metrics.avgRating': 'Valoración media (filtrada)',
+  'metrics.avgRatingRated': 'Valoración media (filtrada) · {count} con reseñas',
+  'metrics.collected': 'Recolectados (total)',
   'metrics.outOfFive': '/ 5',
-  'metrics.withPhoneShare': 'Con teléfono · {pct} %',
+  'metrics.withPhoneShare': 'Con teléfono · {pct} % (filtrado)',
 
   // ===== Settings drawer =====
   'settings.csvBom': 'CSV con BOM',
@@ -419,10 +422,10 @@ export const es: Dict = {
   'table.address': 'Dirección',
   'table.business': 'Negocio',
   'table.clearDesc':
-    'Esto también elimina todas las filas de la base de datos local. No se puede deshacer.',
+    'Esto elimina los negocios y los datos de tareas de la base de datos local; las reseñas descargadas se conservan. No se puede deshacer.',
   'table.clearFilters': 'Quitar filtros',
-  'table.clearTitle': '¿Eliminar {count} registros?',
-  'table.clearTooltip': 'Borrar todos los datos',
+  'table.clearTitle': '¿Eliminar {count} negocios?',
+  'table.clearTooltip': 'Borrar datos de negocios (reseñas conservadas)',
   'table.count': '{count} negocios',
   'table.task': 'Tarea',
   'table.exportFirst': 'Exportar antes de borrar',
@@ -453,6 +456,7 @@ export const es: Dict = {
   'table.exportSelected': 'Exportar {count} seleccionados',
   'table.locate': 'Localizar en el mapa',
   'table.mineEmails': 'Extraer correos',
+  'table.mineEmailsForce': 'Volver a extraer',
   'table.mineEmailsHint':
     'Visita los sitios web de las filas seleccionadas —o de todo el conjunto filtrado— para recolectar correos y perfiles sociales',
   'table.miningProgress': 'Extrayendo {done}/{total} · {found} con correo',
@@ -481,7 +485,7 @@ export const es: Dict = {
   'toast.collectorRestarted': 'Recolector reiniciado',
   'toast.copied': 'Copiado al portapapeles',
   'toast.copyFailed': 'No se pudo copiar: {error}',
-  'toast.dataCleared': 'Todos los datos borrados',
+  'toast.dataCleared': 'Datos de negocios borrados (reseñas conservadas)',
   'toast.diagFailed': 'No se pudieron leer los diagnósticos: {error}',
   'toast.settingsCorrected': 'Algunos ajustes se corrigieron a valores válidos: {fields}',
   'toast.queryFailed': 'No se pudo cargar la tabla: {error}',
@@ -493,6 +497,8 @@ export const es: Dict = {
   'toast.undoFailed': 'No se pudo deshacer: {error}',
   'toast.exportDirFallback':
     'La carpeta de exportación {dir} no está disponible: elige una ubicación en el diálogo',
+  'toast.exportBusy': 'Hay otra exportación en curso; espera a que termine.',
+  'toast.excelRowLimit': 'Excel no puede contener {count} filas en una hoja. Exporta a CSV.',
   'toast.exportFailed': 'La exportación falló: {error}',
   'toast.exported': 'Se exportaron {count} registro(s) a {format}',
   'toast.exportedPartial':
@@ -507,6 +513,11 @@ export const es: Dict = {
   'toast.emailMineFailed': 'La extracción de correos falló: {error}',
   'toast.emailMineRunning': 'La extracción de correos ya está en curso',
   'toast.emailNothingToMine': 'No hay filas con sitio web en este ámbito',
+  'toast.emailAllMinedTitle': 'Estos {count} negocios ya se extrajeron',
+  'toast.emailAllMinedBody':
+    'Todos tienen sitio web: la ejecución anterior ya los visitó. ¿Volver a visitarlos y sobrescribir los resultados anteriores?',
+  'toast.emailSitesUnusable':
+    'No se puede acceder a los sitios web de estos negocios (host privado, URL mal formada o bloqueado por una página de protección)',
   'toast.enrichNothing': 'Selecciona primero los negocios a enriquecer',
   'toast.enrichBusy': 'Ya hay una ejecución de enriquecimiento en curso',
   'toast.enrichMapBusy': 'El mapa está ocupado por una tarea — reintenta cuando termine',
@@ -528,10 +539,17 @@ export const es: Dict = {
   'toast.restoreFailed': 'No se pudieron restaurar los datos guardados: {error}',
   'toast.revealFailed': 'No se pudo abrir la carpeta de exportación: {error}',
   'toast.reviewsFetchFailed': 'No se pudo pedir las reseñas: {error}',
+  'toast.reviewsFetchTimeout': 'La obtención de reseñas no respondió a tiempo: revisa el panel del mapa e inténtalo de nuevo.',
   'toast.reviewsBlockedBySession': 'El recolector está usando el mapa: detén la recolección antes de traer reseñas.',
   'toast.reviewsBlockedByJob': 'Una tarea está usando el mapa: trae reseñas cuando se pause o termine.',
   'toast.reviewsBlockedByEnrich': 'El enriquecimiento está usando el mapa: reintenta cuando termine.',
+  'toast.reviewsBusy': 'Se están obteniendo reseñas de otro negocio: inténtalo en unos segundos.',
+  'toast.jobBusy': 'Una tarea está usando el mapa: inténtalo cuando se pause o termine.',
+  'toast.sessionBusy': 'El colector está usando el mapa: detén la recolección primero.',
   'detail.reviewsBlockedByJob': 'La tarea «{name}» está usando el mapa; las reseñas se pueden traer cuando termine',
+  'detail.reviewsFetching': 'Obteniendo reseñas: el mapa estará ocupado unos segundos',
+  'table.enrichBlockedHint': 'El mapa está ocupado: reintenta cuando termine la tarea, el enriquecimiento o la obtención de reseñas',
+  'toast.reloadInterruptsPane': 'Recargar interrumpe la obtención de reseñas o el enriquecimiento en curso.',
   'toast.subscribeFailed': 'No se pudo suscribir a los eventos: {error}',
 
   // ===== Actualización automática (G-06) =====

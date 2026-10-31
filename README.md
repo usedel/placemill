@@ -57,7 +57,7 @@ Jobs enter a queue and run one at a time — pause/resume/cancel/delete at will.
 
 - Local SQLite: `%APPDATA%\com.placemill.app\placemill.db`
 - Exports: default directory configurable in settings, filename template supports `{date}`
-- *Clear data* removes business rows but keeps job records; the diagnostics drawer shows the exact DB path.
+- *Clear data* removes business rows but keeps job records and mined reviews; the diagnostics drawer shows the exact DB path.
 
 ## Troubleshooting
 
@@ -89,6 +89,7 @@ npm run e2e:grid       # grid collection
 npm run e2e:queue      # queue + resume
 npm run e2e:tasks      # task views
 npm run e2e:browse     # paginated browsing
+npm run e2e:pane       # maps pane occupancy / single-flight
 npm run e2e:interceptor
 npm run e2e:emails
 npm run e2e:real       # real Google search (network-dependent)

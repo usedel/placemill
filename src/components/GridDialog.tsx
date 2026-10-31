@@ -88,6 +88,11 @@ export default function GridDialog({
     openRef.current = open;
   }, [open]);
 
+  // P2-16: the debounce timer cannot cancel a request that already left, so a
+  // slower reply for older coordinates could overwrite the plan for the current
+  // ones. Every request carries a generation number; only the latest applies.
+  const planRunRef = useRef(0);
+
   const keywordList = useMemo(
     () =>
       keywords
@@ -135,7 +140,10 @@ export default function GridDialog({
       if (openRef.current) setError(String(cause));
       return false;
     } finally {
-      if (openRef.current) setReadingView(false);
+      // P2-16: always clear the spinner. The old `openRef` guard left it stuck
+      // forever when the dialog closed mid-poll and was reopened: the state was
+      // never reset, so "read from map" looked like it was still running.
+      setReadingView(false);
     }
   }, [t]);
 
@@ -181,10 +189,14 @@ export default function GridDialog({
   // Live preview, debounced so typing a coordinate does not spam the backend.
   useEffect(() => {
     if (!open || lat === null || lng === null || !radius || !cell) {
+      // P2-16: invalidate an in-flight preview, otherwise a late reply can
+      // resurrect a plan the user just made impossible (cleared a coordinate).
+      planRunRef.current += 1;
       setPlan(null);
       return;
     }
     const timer = window.setTimeout(() => {
+      const run = ++planRunRef.current;
       invoke<GridPlan>('plan_grid', {
         centerLat: lat,
         centerLng: lng,
@@ -192,12 +204,17 @@ export default function GridDialog({
         cellKm: cell,
       })
         .then((next) => {
-          if (openRef.current) {
-            setPlan(next);
-            setTooLarge(false);
-          }
+          // P2-16: a newer request supersedes this one, and a closed dialog
+          // must not take a late plan.
+          if (run !== planRunRef.current || !openRef.current) return;
+          setPlan(next);
+          setTooLarge(false);
         })
         .catch((cause) => {
+          // R-34 / P2-16: same guards as the success path. The catch used to
+          // write into a closed dialog and let an older failure clear the plan
+          // a newer request had just set.
+          if (run !== planRunRef.current || !openRef.current) return;
           setPlan(null);
           setTooLarge(String(cause).includes('grid_too_large'));
           // R-34: store the raw error. Applying `errorText` here *and* again at
@@ -211,7 +228,9 @@ export default function GridDialog({
 
   /** The one-click fix for an oversized grid: the next size up, nothing else. */
   const suggestCell = useCallback(async () => {
-    if (!cell || !lat || !lng || !radius) return;
+    // P2-16: `!lat` treated the equator / prime meridian (0) as "no centre".
+    // Only null means the field was never filled.
+    if (cell === null || lat === null || lng === null || radius === null) return;
     for (const factor of [2, 3, 4]) {
       const candidate = Math.min(10, Number((cell * factor).toFixed(1)));
       if (candidate <= cell) break;

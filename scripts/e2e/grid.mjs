@@ -274,6 +274,50 @@ async function main() {
       parsedContext?.tileId === `${job.id}-t0`,
       String(context),
     );
+    // P1-1: the sanitizer used to keep only the two string fields, so the
+    // per-cell budget and the drift reference point never reached
+    // `autoScroll.start` — every cell ran on the default 80 scrolls and
+    // `drifted()` returned early. These four assertions are the contract.
+    check(
+      'tile context keeps the cell centre',
+      typeof parsedContext?.lat === 'number' &&
+        typeof parsedContext?.lng === 'number' &&
+        Math.abs(parsedContext.lat - CENTER.lat) < 1e-6 &&
+        Math.abs(parsedContext.lng - CENTER.lng) < 1e-6,
+      `${parsedContext?.lat}, ${parsedContext?.lng}`,
+    );
+    check(
+      'tile context keeps the radius-narrowed scroll budget',
+      typeof parsedContext?.maxScrolls === 'number' &&
+        Number.isInteger(parsedContext.maxScrolls) &&
+        parsedContext.maxScrolls > 0 &&
+        parsedContext.maxScrolls < 80,
+      String(parsedContext?.maxScrolls),
+    );
+    check(
+      'tile context keeps the drift allowance',
+      typeof parsedContext?.maxDriftKm === 'number' && parsedContext.maxDriftKm > 0,
+      String(parsedContext?.maxDriftKm),
+    );
+    // And the page must be using them, not just storing them.
+    const budgetApplied = await pollMaps(
+      `(function () {
+         var s = window.__placemillAutoScroll;
+         var ctx = null;
+         try { ctx = JSON.parse(sessionStorage.getItem('placemill.tileContext')); } catch (e) {}
+         var settings = window.__placemillSettings || {};
+         var base = typeof settings.maxScrolls === 'number' ? settings.maxScrolls : 80;
+         // start() narrows the configured budget to the cell's, never widens it.
+         return (s && ctx && s.maxScrolls === Math.min(base, ctx.maxScrolls) && s.tileLat === ctx.lat)
+           ? 'yes' : '';
+       })()`,
+      15_000,
+    );
+    check(
+      'autoScroll runs with the context values',
+      budgetApplied === 'yes',
+      String(budgetApplied),
+    );
 
     // Feed the current tile so the job's `received` counter has something to
     // show. Not a scraping assertion: Google's own results are out of scope.
@@ -400,6 +444,152 @@ async function main() {
       'cancel keeps the tile tally',
       Boolean(afterwards) && afterwards.doneTiles + afterwards.failedTiles <= 1,
     );
+
+    // ---- P1-2: a blocking page pauses the task ---------------------------
+    // The injected probe reports `captcha` on the health channel while the
+    // switch is on. Two cells used to be wasted on a blocking page before the
+    // dead-page streak noticed; the task must pause on the first report.
+    const healthCreated = await call('create_jobs', {
+      request: {
+        entries: [
+          {
+            keyword: `${KEYWORD}-health`,
+            city: 'E2E',
+            centerLat: CENTER.lat,
+            centerLng: CENTER.lng,
+          },
+        ],
+        radiusKm: 1,
+        cellKm: 5,
+      },
+    });
+    const healthJob = await call('start_job', { id: healthCreated[0].id });
+    check(
+      'a third job is running for the health check',
+      healthJob.status === 'running',
+      healthJob.status,
+    );
+    await evalMaps(
+      `window.__TAURI__.event.emit('maps:health', { state: 'captcha', at: Date.now() })`,
+    ).catch(() => {});
+    const pausedByHealth = await pollValue(
+      panel,
+      `(async () => {
+         const jobs = await window.__TAURI_INTERNALS__.invoke('list_jobs');
+         return jobs.find((item) => item.id === ${JSON.stringify(healthJob.id)}) ?? null;
+       })()`,
+      10_000,
+    );
+    check(
+      'a captcha report pauses the running task',
+      pausedByHealth?.status === 'paused',
+      pausedByHealth?.status ?? 'missing',
+    );
+    const collectorAfterHealth = await call('get_collector_state');
+    check(
+      'the switch follows the pause',
+      collectorAfterHealth.listening === false,
+      String(collectorAfterHealth.listening),
+    );
+    const healthTiles = await call('get_job_tiles', { id: healthJob.id });
+    check(
+      'the interrupted tile goes back to pending',
+      healthTiles.every((tile) => tile.status !== 'running'),
+      healthTiles.map((tile) => `${tile.id}:${tile.status}`).join(','),
+    );
+
+    // ---- P1-4: clearing parks the queue ---------------------------------
+    // Only with a snapshot taken: this really empties the table. The bug was
+    // that `clear_data` paused the running job but left the queue alone, so the
+    // worker chained to the next task, re-armed the switch and refilled the
+    // table the user had just emptied.
+    if (canIsolate) {
+      await sleep(3_600); // out of the pause grace
+      const queuedBatch = await call('create_jobs', {
+        request: {
+          entries: [
+            { keyword: `${KEYWORD}-clear-a`, city: 'E2E', centerLat: CENTER.lat, centerLng: CENTER.lng },
+            { keyword: `${KEYWORD}-clear-b`, city: 'E2E', centerLat: CENTER.lat, centerLng: CENTER.lng },
+          ],
+          radiusKm: 1,
+          cellKm: 5,
+        },
+      });
+      const runningBefore = await call('start_job', { id: queuedBatch[0].id });
+      const queuedBefore = (await call('list_jobs')).find((item) => item.id === queuedBatch[1].id);
+      check(
+        'a running task and a queued one are in place before the clear',
+        runningBefore.status === 'running' && queuedBefore?.status === 'queued',
+        `${runningBefore.status}/${queuedBefore?.status}`,
+      );
+
+      await call('clear_data');
+      await sleep(1_200);
+      const afterClear = await call('list_jobs');
+      const clearedRunning = afterClear.find((item) => item.id === queuedBatch[0].id);
+      const clearedQueued = afterClear.find((item) => item.id === queuedBatch[1].id);
+      check(
+        'clear pauses the running task',
+        clearedRunning?.status === 'paused',
+        clearedRunning?.status ?? 'missing',
+      );
+      check(
+        'clear parks the queued task too, so the worker has nothing to chain to',
+        clearedQueued?.status === 'paused',
+        clearedQueued?.status ?? 'missing',
+      );
+
+      // The worker would have chained within a second of the running job
+      // reaching a terminal state; a few seconds prove the queue stays parked.
+      await sleep(4_000);
+      const stillParked = (await call('list_jobs')).find((item) => item.id === queuedBatch[1].id);
+      check(
+        'the parked queue does not restart by itself after a clear',
+        stillParked?.status === 'paused',
+        stillParked?.status ?? 'missing',
+      );
+
+      // P1-4: a batch that *declares* an epoch is judged on it, so a batch
+      // produced before the clear is refused instead of landing in the emptied
+      // table. Only the absence of the field is exempt for fixtures.
+      const countRows = async () =>
+        (await call('query_businesses', { request: { page: 1, pageSize: 5 } })).total;
+      const afterClearRows = await countRows();
+      check('the clear really emptied the table', afterClearRows === 0, String(afterClearRows));
+
+      const emitBatch = (placeId, extra) =>
+        evalMaps(
+          `window.__TAURI__.event.emit('business-data', {
+             businesses: [{
+               name: 'E2E_EPOCH', address: '', phone: '',
+               rating: 0, reviews_total: 0,
+               lat: ${CENTER.lat}, lng: ${CENTER.lng},
+               place_id: ${JSON.stringify(placeId)}, website: '', types: ['e2e']
+             }],
+             sourceQuery: ${JSON.stringify(KEYWORD)}${extra}
+           })`,
+        ).catch(() => {});
+
+      await emitBatch(`E2E_STALE_EPOCH_${RUN}`, `, epoch: 987654`);
+      await sleep(800);
+      const afterStale = await countRows();
+      check(
+        'a batch carrying a stale epoch is refused',
+        afterStale === 0,
+        String(afterStale),
+      );
+
+      await emitBatch(`E2E_NO_EPOCH_${RUN}`, '');
+      await sleep(800);
+      const afterFixture = await countRows();
+      check(
+        'a payload without an epoch still lands (fixture path)',
+        afterFixture === 1,
+        String(afterFixture),
+      );
+    } else {
+      skip('P1-4 clear-parks-the-queue', 'no database snapshot, refusing to clear real rows');
+    }
   } finally {
     maps?.close();
     panel?.close();

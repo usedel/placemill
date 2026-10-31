@@ -1,6 +1,6 @@
 [package]
 name = "placemill"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 license = "MIT"
 
@@ -43,6 +43,12 @@ scraper = "0.29.0"
 # API used here (`PublicKey::decode`, `Signature::decode`, `verify`) is stable
 # in 0.2 and was verified against 0.2.5.
 minisign-verify = "0.2.5"
+# Registrable-domain (eTLD+1) grouping for the email miner (P1-6). The
+# hand-written two-label table grouped unrelated `.com.ru` sites and every
+# `blogspot.com` blog together, then wrote one site's contacts to all of them.
+# `psl` embeds the Public Suffix List (private section included) and does no
+# runtime IO.
+psl = "2"
 
 [features]
 default = ["custom-protocol"]

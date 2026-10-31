@@ -13,6 +13,12 @@
  * this fail. That is a real signal about the account/session, not a code
  * regression — read the `tauri dev` tail before blaming the parser.
  *
+ * Geometry: 2 km radius with 5 km cells collapses to exactly one tile, and the
+ * 2 km circle is what makes the count meaningful. A 1 km circle around the same
+ * point holds two dentists out of the ~40 the feed delivers (38 of them dropped
+ * by `grid::within_radius`), so the check below is a floor for "the pipeline
+ * produced rows", not a target: the radius decides how many there are.
+ *
  * Usage:
  *   npm run e2e:real                 # keyword "dentist", Los Angeles, 1 tile
  *   npm run e2e:real -- --keep-data  # leave the scraped rows in the database
@@ -41,7 +47,21 @@ const KEYWORD = 'dentist';
 const CITY = 'Los Angeles';
 const CENTER = { lat: 34.0522, lng: -118.2437 };
 const TILE_BUDGET_MS = 240_000;
-const MIN_ROWS = 10;
+/** Floor, not a target: a downtown 2 km circle holds far more than this on a
+ *  normal day, and a thin day must not read as "the parser broke". */
+const MIN_ROWS = 5;
+const RADIUS_KM = 2;
+
+/** Haversine, in km — the same circle `grid::within_radius` enforces. */
+function distanceKm(a, b) {
+  const rad = Math.PI / 180;
+  const dLat = (b.lat - a.lat) * rad;
+  const dLng = (b.lng - a.lng) * rad;
+  const h =
+    Math.sin(dLat / 2) ** 2 +
+    Math.cos(a.lat * rad) * Math.cos(b.lat * rad) * Math.sin(dLng / 2) ** 2;
+  return 2 * 6371 * Math.asin(Math.min(1, Math.sqrt(h)));
+}
 
 async function main() {
   await preflight();
@@ -78,7 +98,7 @@ async function main() {
         entries: [
           { keyword: KEYWORD, city: CITY, centerLat: CENTER.lat, centerLng: CENTER.lng },
         ],
-        radiusKm: 1,
+        radiusKm: RADIUS_KM,
         cellKm: 5,
       },
     });
@@ -125,6 +145,15 @@ async function main() {
     const inserted = outcome?.job?.inserted ?? 0;
     check('rows were inserted by a real search', inserted >= MIN_ROWS, `${inserted} rows`);
 
+    // How much the feed actually delivered, and how much of it the filters took.
+    // Without this line a low count is ambiguous: a thin result list, a feed that
+    // was cut short, or the radius filter doing its job all look the same.
+    const diagnostics = await call('get_diagnostics');
+    note(
+      `feed: ${diagnostics.records} row(s) seen, ${diagnostics.dropped} dropped ` +
+        `(ingress/phone/radius), ${diagnostics.newRecords} stored`,
+    );
+
     if (tile?.status === 'split') {
       // The parent proved the scrape worked; stop the children so the suite does
       // not spend another minute collecting the same neighbourhood.
@@ -139,6 +168,18 @@ async function main() {
     });
     const rows = page.rows;
     check('the database has the scraped rows', rows.length >= MIN_ROWS, `${rows.length} rows`);
+
+    // P2-3: the radius is enforced at write time, and a real feed is the only
+    // place where that can be observed — Google keeps loading further away as
+    // the page scrolls, so a row kilometres out is the normal case, not a bug.
+    const outside = rows.filter((row) => distanceKm(CENTER, row) > RADIUS_KM * 1.01);
+    check(
+      'every stored row is inside the job radius',
+      outside.length === 0,
+      outside.length === 0
+        ? `${rows.length} rows`
+        : outside.map((row) => `${row.name}: ${distanceKm(CENTER, row).toFixed(2)} km`).join('; '),
+    );
     check(
       'rows carry a real name',
       Boolean(rows[0]?.name) && rows[0].name.length > 1,

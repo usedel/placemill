@@ -1,7 +1,7 @@
 {
   "name": "placemill",
   "private": true,
-  "version": "0.1.0",
+  "version": "0.1.1",
   "license": "MIT",
   "type": "module",
   "scripts": {
@@ -16,6 +16,7 @@
     "e2e:real": "node scripts/e2e/real-search.mjs",
     "e2e:split": "node scripts/e2e/split.mjs",
     "e2e:browse": "node scripts/e2e/browse.mjs",
+    "e2e:pane": "node scripts/e2e/pane.mjs",
     "e2e:emails": "node scripts/e2e/emails.mjs",
     "e2e:interceptor": "node scripts/e2e/interceptor.mjs",
     "bench:grid-ab": "node scripts/bench/grid-ab.mjs",

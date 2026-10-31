@@ -179,11 +179,30 @@ export default function SettingsDrawer({
     });
   };
 
-  const applyRange = (min: number | null, max: number | null) => {
-    // A cleared input reports null: wait until both bounds are real numbers
-    // instead of writing a half-edited pair.
-    if (min === null || max === null) return;
-    apply({ scrollMinMs: min, scrollMaxMs: max });
+  // P2-6: the custom interval is a draft while it is being typed. Committing on
+  // every keystroke let Rust clamp the first digit (typing "1500" saved 200,
+  // then "200500") and fired one `settings:corrected` toast per character.
+  const [minDraft, setMinDraft] = useState<number | null>(settings.scrollMinMs);
+  const [maxDraft, setMaxDraft] = useState<number | null>(settings.scrollMaxMs);
+
+  useEffect(() => {
+    setMinDraft(settings.scrollMinMs);
+  }, [settings.scrollMinMs]);
+
+  useEffect(() => {
+    setMaxDraft(settings.scrollMaxMs);
+  }, [settings.scrollMaxMs]);
+
+  const commitRange = () => {
+    if (minDraft === null || maxDraft === null) {
+      // A cleared field: restore what is actually saved instead of writing a
+      // half-edited pair.
+      setMinDraft(settings.scrollMinMs);
+      setMaxDraft(settings.scrollMaxMs);
+      return;
+    }
+    if (minDraft === settings.scrollMinMs && maxDraft === settings.scrollMaxMs) return;
+    apply({ scrollMinMs: minDraft, scrollMaxMs: maxDraft });
   };
 
   const speedMode: SpeedPresetKey | 'custom' =
@@ -382,8 +401,10 @@ export default function SettingsDrawer({
             max={10000}
             step={100}
             precision={0}
-            value={settings.scrollMinMs}
-            onChange={(value) => applyRange(value, settings.scrollMaxMs)}
+            value={minDraft}
+            onChange={setMinDraft}
+            onBlur={commitRange}
+            onPressEnter={commitRange}
           />
           <span className="settings-dash">–</span>
           <InputNumber
@@ -393,8 +414,10 @@ export default function SettingsDrawer({
             max={30000}
             step={100}
             precision={0}
-            value={settings.scrollMaxMs}
-            onChange={(value) => applyRange(settings.scrollMinMs, value)}
+            value={maxDraft}
+            onChange={setMaxDraft}
+            onBlur={commitRange}
+            onPressEnter={commitRange}
           />
         </Row>
       )}

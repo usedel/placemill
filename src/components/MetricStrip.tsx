@@ -2,6 +2,7 @@ import { StarFilled } from '@ant-design/icons';
 import { useI18n } from '../i18n';
 
 interface Props {
+  /** The whole table, not the filtered set — the label says "(all)" (P3-5). */
   total: number;
   /** Every figure below the total is computed over the filtered rows. */
   avgRating: number;

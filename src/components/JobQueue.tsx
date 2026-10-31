@@ -17,6 +17,7 @@ import {
 import { invoke } from '@tauri-apps/api/core';
 import { useI18n } from '../i18n';
 import { jobStatusLabel } from '../lib/text';
+import { paneBusyMessageKey } from '../lib/busy';
 import type { Job } from '../types/job';
 
 const PROCESSED = (job: Job) => job.doneTiles + job.failedTiles;
@@ -190,7 +191,11 @@ export default function JobQueue({
             t('queue.startBlocked', { name: owner?.name || owner?.keyword || '' }),
           );
         } else {
-          message.error(t('queue.actionFailed', { error: text }));
+          // The four pane refusals get real sentences (C-10) instead of the
+          // raw `reviews_busy` / `map_busy:<id>` the backend returns.
+          const busyKey = paneBusyMessageKey(error);
+          if (busyKey) message.warning(t(busyKey));
+          else message.error(t('queue.actionFailed', { error: text }));
         }
       } finally {
         setBusy(null);
@@ -372,6 +377,9 @@ export default function JobQueue({
         tabIndex={0}
         onClick={() => onOpenTask(job)}
         onKeyDown={(event) => {
+          // The card contains real buttons. Let their own Enter/Space handling
+          // run; only a key on the card itself opens the task (P3-1).
+          if (event.target !== event.currentTarget) return;
           if (event.key === 'Enter' || event.key === ' ') {
             event.preventDefault();
             onOpenTask(job);

@@ -10,7 +10,7 @@
 //! from `SELECT ... WHERE status = 'pending' ORDER BY seq`, so finished cells are
 //! never visited twice and a half-scrolled cell is simply redone.
 
-use crate::logging::{log_info, log_warn};
+use crate::logging::{log_error, log_info, log_warn};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -50,13 +50,36 @@ pub const MAX_LEAF_TILES: i64 = 400;
 /// navigation loads, nothing scrolls, nothing arrives, the tile burns its two
 /// attempts and the runner moves on — for every remaining tile of the grid, at
 /// two timeouts each. A genuinely empty area never triggers this: it ends
-/// cleanly through `no-results`, which does not count as dry.
+/// cleanly through `no-results`, which does not count as dry — `no-feed` does
+/// (P1-2), because it means the page never rendered a result list at all.
 pub const DRY_TILE_PAUSE_STREAK: u32 = 2;
 const POLL_MS: u64 = 400;
+
+/// End-of-cell reasons the page may report. `navigate`, `settings` and
+/// `manual` are stops that happen for other reasons and must not close a cell.
+const CELL_END_REASONS: [&str; 5] = ["idle", "max-scrolls", "no-results", "no-feed", "drift"];
+
+fn is_cell_end(reason: &str) -> bool {
+    CELL_END_REASONS.contains(&reason)
+}
+
+/// Whether a finished tile is evidence of a dead page rather than an empty
+/// area (P1-2).
+///
+/// `no-feed` ends the cell so the runner does not wait out the idle timeout on
+/// a captcha, but it proves nothing about the area: the page had no result feed
+/// and no usable Maps shell (a captcha / consent screen / dead render). Counting
+/// it as dry is what stops a blocked map from walking the whole grid to `empty`.
+fn counts_as_dry(received: u32, started: bool, finished: bool, reason: Option<&str>) -> bool {
+    received == 0 && (!started || !finished || reason == Some("no-feed"))
+}
 
 /// The job state machine. Only some transitions are driven from Rust (the rest
 /// happen through SQL strings in `commands.rs`), so several variants are never
 /// constructed here — they still document the vocabulary the database uses.
+///
+/// Kept until those SQL writers are routed through this enum; tracked in
+/// `docs/collector-roadmap.md` under the P2 job state machine.
 #[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -92,6 +115,11 @@ pub struct ActiveJob {
     /// Rows of the current tile that survived the radius filter: the split
     /// decision reads this, not the raw batch size.
     pub received: u32,
+    /// Place ids already counted for the current tile. Google re-sends rows it
+    /// has already delivered when the feed re-renders, and `insert_businesses`
+    /// dedupes them in SQL — counting the raw batch made those repeats look
+    /// like new rows and tripped `split_threshold` early (P2-2).
+    pub seen: std::collections::HashSet<String>,
 }
 
 /// Why there is no "stop scrolling when results stop being local" rule.
@@ -148,6 +176,7 @@ pub fn begin_tile(app: &AppHandle, job_id: &str, tile_id: &str) {
         job_id: job_id.to_string(),
         current_tile: Some(tile_id.to_string()),
         received: 0,
+        seen: std::collections::HashSet::new(),
     });
 }
 
@@ -161,6 +190,7 @@ pub fn end_tile(app: &AppHandle) -> u32 {
     if let Some(active) = slot.as_mut() {
         active.current_tile = None;
         active.received = 0;
+        active.seen.clear();
     }
     rows
 }
@@ -201,6 +231,12 @@ pub fn attribute_batch(app: &AppHandle, tile_id: &str) -> Option<String> {
     Some(active.job_id.clone())
 }
 
+/// Upper bound on the ids remembered for one tile. The split threshold is 100
+/// rows and Google caps a search at ~120, so this is far beyond any real cell;
+/// it exists so a page that floods duplicate ids cannot grow this set without
+/// bound.
+const TILE_SEEN_LIMIT: usize = 5_000;
+
 /// Rows of the current tile that survived every filter, for the split decision.
 ///
 /// Google keeps loading further away as the page scrolls, so the raw batch size
@@ -209,26 +245,49 @@ pub fn attribute_batch(app: &AppHandle, tile_id: &str) -> Option<String> {
 /// quadrupled the grid into territory it was never asked to cover. Counting the
 /// kept rows is what stops that feedback loop.
 ///
-/// Rows of the current tile that survived every filter: the split decision
-/// reads this (see the struct field docs for why the raw batch size is wrong).
+/// P2-2: two more conditions on top of "survived the filters". The batch must
+/// be *attributed to the running job* (a late batch from the previous cell used
+/// to be counted against the current tile), and each `place_id` counts once
+/// (Google re-sends rows it has already delivered, and SQL dedupes them, so the
+/// raw count made a steady feed look denser than it was).
 ///
-/// `seen` is unused today but kept in the signature: the "stop scrolling when
-/// the feed walks out of the area" experiment needs exactly this pair, and the
-/// struct comment records why that rule must not come back without new
-/// evidence about how Google orders a feed.
-pub fn count_tile_rows(app: &AppHandle, kept: usize, _seen: usize) {
-    if kept == 0 {
-        return;
+/// Returns how many rows the counter actually grew by.
+pub fn count_tile_rows(app: &AppHandle, attributed_job: &str, rows: &[crate::Business]) -> u32 {
+    if rows.is_empty() || attributed_job.is_empty() {
+        return 0;
     }
     let state = app.state::<AppState>();
     let Ok(mut slot) = state.active_job.lock() else {
-        return;
+        return 0;
     };
-    if let Some(active) = slot.as_mut() {
-        if active.current_tile.is_some() {
-            active.received += kept as u32;
+    let Some(active) = slot.as_mut() else {
+        return 0;
+    };
+    count_new_ids(active, attributed_job, rows.iter().map(|row| row.place_id.as_str()))
+}
+
+/// Pure core of `count_tile_rows`: attribution check + per-tile dedupe.
+fn count_new_ids<'a>(
+    active: &mut ActiveJob,
+    attributed_job: &str,
+    ids: impl Iterator<Item = &'a str>,
+) -> u32 {
+    // `attribute_batch` already refuses a batch whose tile is not the one the
+    // runner waits on; repeating the job check here keeps the counter honest
+    // for callers that reach this function directly.
+    if active.current_tile.is_none() || active.job_id != attributed_job {
+        return 0;
+    }
+    let before = active.received;
+    for place_id in ids {
+        if place_id.is_empty() || active.seen.len() >= TILE_SEEN_LIMIT {
+            continue;
+        }
+        if active.seen.insert(place_id.to_string()) {
+            active.received += 1;
         }
     }
+    active.received - before
 }
 
 pub fn clear_active(app: &AppHandle) {
@@ -259,52 +318,166 @@ pub fn claim_runner(state: &AppState, job_id: &str) -> bool {
     }
 }
 
+/// Release whatever job holds the runner slot.
+///
+/// Only for the command error paths that claimed the slot themselves and have
+/// no runner thread behind it. A runner must use `release_runner_for`: its exit
+/// can race a `start_job` that already claimed the slot for the next job (the
+/// grace window is exactly that moment), and taking the slot then would leave
+/// the new runner unowned — no attribution, no pane claim.
 pub fn release_runner(state: &AppState) {
-    if let Ok(mut slot) = state.active_runner.lock() {
-        *slot = None;
+    // Take the id out first: the pane claim is released with the identity
+    // check, and holding `active_runner` while locking `pane_owner` is a lock
+    // order nobody else uses (P2-1).
+    let released = match state.active_runner.lock() {
+        Ok(mut slot) => slot.take(),
+        Err(_) => None,
+    };
+    if let Some(job_id) = released {
+        crate::commands::release_pane(state, &crate::PaneOwner::Job(job_id));
     }
+}
+
+/// Release the runner slot only if it still belongs to `job_id`.
+fn release_runner_for(state: &AppState, job_id: &str) {
+    let released = match state.active_runner.lock() {
+        Ok(mut slot) => {
+            if slot.as_deref() == Some(job_id) {
+                slot.take()
+            } else {
+                None
+            }
+        }
+        Err(_) => None,
+    };
+    if released.is_some() {
+        crate::commands::release_pane(state, &crate::PaneOwner::Job(job_id.to_string()));
+    }
+}
+
+/// Move the runner slot — and the pane claim — to the next chained job.
+///
+/// `attribute_batch` requires `active_job.job_id == active_runner`, so a
+/// chained job that never took the slot over collected its rows unattributed:
+/// they were stored with no job id, `bump_job_inserted` was skipped and the
+/// task view claimed it found nothing (P2-3).
+fn hand_runner_to(app: &AppHandle, job_id: &str) {
+    let state = app.state::<AppState>();
+    if let Ok(mut slot) = state.active_runner.lock() {
+        *slot = Some(job_id.to_string());
+    }
+    crate::commands::set_pane_owner(&state, crate::PaneOwner::Job(job_id.to_string()));
+}
+
+/// Releases everything the runner owns when it stops — including on a panic.
+///
+/// The worker is the last owner of the collector switch and it holds the single
+/// runner slot. Both used to be released by straight lines at the end of the
+/// loop, so a panic inside `run_job` skipped them and left the app claiming a
+/// running job forever: every later `start_job` answered `job_running`, the page
+/// kept collecting with no job behind it, and `active_job` kept attributing
+/// batches to a runner that no longer existed (C-06 — the same failure R-01
+/// fixed for the miner).
+struct RunnerExitGuard {
+    app: AppHandle,
+    /// The job this runner currently owns. Follows the queue when it chains, so
+    /// the release can be identity-checked against a slot a new `start_job` may
+    /// already have claimed.
+    job: std::sync::Mutex<String>,
+}
+
+impl RunnerExitGuard {
+    fn new(app: AppHandle, job_id: String) -> Self {
+        Self {
+            app,
+            job: std::sync::Mutex::new(job_id),
+        }
+    }
+
+    fn set_job(&self, job_id: &str) {
+        if let Ok(mut slot) = self.job.lock() {
+            *slot = job_id.to_string();
+        }
+    }
+}
+
+impl Drop for RunnerExitGuard {
+    fn drop(&mut self) {
+        // Every exit path — queue dry, paused, cancelled, failed, panic — ends
+        // the session here. This is the guarantee behind the panel never
+        // claiming "collecting" after a task stopped: commands may turn the
+        // switch off early for responsiveness, but nothing can leave it on.
+        crate::commands::switch_from_worker(&self.app, false);
+        clear_active(&self.app);
+        let job_id = self
+            .job
+            .lock()
+            .map(|slot| slot.clone())
+            .unwrap_or_default();
+        if !job_id.is_empty() {
+            release_runner_for(&self.app.state::<AppState>(), &job_id);
+        }
+        log_info!("runner stopped");
+    }
+}
+
+/// Message of a caught panic, for the log line.
+fn panic_reason(panic: &(dyn std::any::Any + Send)) -> String {
+    panic
+        .downcast_ref::<&str>()
+        .map(|text| text.to_string())
+        .or_else(|| panic.downcast_ref::<String>().cloned())
+        .unwrap_or_else(|| "unknown panic".to_string())
 }
 
 /// Start the worker for an already-claimed `job_id`. The slot must be held by
 /// the caller (`claim_runner`); the thread releases it when the queue runs dry.
 pub fn spawn_runner(app: AppHandle, job_id: String) {
     thread::spawn(move || {
+        let exit = RunnerExitGuard::new(app.clone(), job_id.clone());
         let mut current = Some(job_id);
         while let Some(id) = current.take() {
-            match run_job(&app, &id) {
-                Outcome::Finished => {
-                    current = match next_queued(&app) {
+            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                run_job(&app, &id)
+            }));
+            match outcome {
+                Ok(Outcome::Finished) => {
+                    current = match start_next_queued(&app) {
                         Some(next) => {
-                            if db_call(&app, |conn| db::set_job_status(conn, &next, "running")).is_none()
-                            {
-                                None
-                            } else {
-                                // The chained job collects from here on. A command
-                                // may have switched collection off for the job that
-                                // just finished (pause/cancel end the queue instead,
-                                // so this is the only place that re-arms it). The
-                                // switch is asserted *after* the status flip, so a
-                                // cancel that raced the queue cannot leave it on.
-                                crate::commands::switch_from_worker(&app, true);
-                                log_info!("queue: starting next job {}", next);
-                                Some(next)
-                            }
+                            // The chained job collects from here on. A command
+                            // may have switched collection off for the job that
+                            // just finished (pause/cancel end the queue instead,
+                            // so this is the only place that re-arms it). The
+                            // switch is asserted *after* the conditional status
+                            // flip, so a cancel that raced the queue cannot
+                            // leave it on.
+                            hand_runner_to(&app, &next);
+                            exit.set_job(&next);
+                            crate::commands::switch_from_worker(&app, true);
+                            log_info!("queue: starting next job {}", next);
+                            Some(next)
                         }
                         None => None,
                     };
                 }
-                Outcome::Halted => break,
+                Ok(Outcome::Halted) => break,
+                Err(panic) => {
+                    // A panicking tile loop must not leave the job `running`:
+                    // the panel would show a task that cannot be paused and that
+                    // blocks every other start until the app restarts. Pausing
+                    // is the state the panel knows how to offer ("resume").
+                    log_error!("job runner panicked on {}: {}", id, panic_reason(&*panic));
+                    // Conditional: a cancel/pause that landed before the panic
+                    // owns the status and must not be overwritten with paused.
+                    let _ = db_call(&app, |conn| {
+                        db::set_job_status_if_running(conn, &id, "paused")
+                    });
+                    let _ = db_call(&app, |conn| db::reset_running_tiles(conn, &id));
+                    emit_progress(&app, &id);
+                    break;
+                }
             }
         }
-
-        // Every exit path — queue dry, paused, cancelled, failed — ends the
-        // session here. This is the guarantee behind the panel never claiming
-        // "collecting" after a task stopped: commands may turn the switch off
-        // early for responsiveness, but nothing can leave it on.
-        crate::commands::switch_from_worker(&app, false);
-        clear_active(&app);
-        release_runner(&app.state::<AppState>());
-        log_info!("runner stopped");
     });
 }
 
@@ -319,8 +492,11 @@ fn run_job(app: &AppHandle, job_id: &str) -> Outcome {
         }
 
         let Some(tile) = db_call(app, |conn| db::next_pending_tile(conn, job_id)).flatten() else {
-            finish_job(app, job_id);
-            return Outcome::Finished;
+            return if finish_job(app, job_id) {
+                Outcome::Finished
+            } else {
+                Outcome::Halted
+            };
         };
 
         // Spacing between cells, paid only when there is another cell to visit.
@@ -481,10 +657,12 @@ fn run_job(app: &AppHandle, job_id: &str) -> Outcome {
         // view can say why without the diagnostics drawer. `drift` is only
         // worth surfacing when the re-fitted cell yielded nothing at all.
         let error_reason = match status {
-            "empty" => Some(if idle_reason.as_deref() == Some("drift") {
-                "drift"
-            } else {
-                "parse-empty"
+            "empty" => Some(match idle_reason.as_deref() {
+                Some("drift") => "drift",
+                // The page had no result list and no usable Maps shell: "nothing
+                // here" is not what this tile proved (P1-2).
+                Some("no-feed") => "no-feed",
+                _ => "parse-empty",
             }),
             "pending" | "skipped" => Some(if navigated { "timeout" } else { "nav-failed" }),
             _ => None,
@@ -527,22 +705,36 @@ fn run_job(app: &AppHandle, job_id: &str) -> Outcome {
         );
 
         // Dead-page watchdog: pause instead of burning through the grid.
-        if received == 0 && (!started || !finished) {
+        if counts_as_dry(received, started, finished, idle_reason.as_deref()) {
             dry_streak += 1;
         } else {
             dry_streak = 0;
         }
         if dry_streak >= DRY_TILE_PAUSE_STREAK {
-            log_info!(
-                "job {} paused automatically: {} tiles in a row ended \
-                 without data and without a clean stop (consent page, captcha or \
-                 a dead map?) — handle the page and press resume",
-                job_id, dry_streak
-            );
-            let _ = db_call(app, |conn| db::set_job_status(conn, job_id, "paused"));
-            let state = app.state::<AppState>();
-            let _ = crate::commands::apply_listening(app, state.inner(), false);
-            emit_progress(app, job_id);
+            // Conditional: a cancel/pause that landed while this tile was
+            // running owns the status now. The old unconditional update could
+            // turn a cancelled job back into `paused`.
+            let changed = db_call(app, |conn| {
+                db::set_job_status_if_running(conn, job_id, "paused")
+            })
+            .unwrap_or(0);
+            if changed > 0 {
+                log_info!(
+                    "job {} paused automatically: {} tiles in a row ended \
+                     without data and without a clean stop (consent page, captcha or \
+                     a dead map?) — handle the page and press resume",
+                    job_id, dry_streak
+                );
+                let state = app.state::<AppState>();
+                let _ = crate::commands::apply_listening(app, state.inner(), false);
+                emit_progress(app, job_id);
+            } else {
+                log_info!(
+                    "job {}: dead-page watchdog tripped, but the status was no longer \
+                     running; leaving the user's state untouched",
+                    job_id
+                );
+            }
             return Outcome::Halted;
         }
 
@@ -554,7 +746,7 @@ fn run_job(app: &AppHandle, job_id: &str) -> Outcome {
     }
 }
 
-fn finish_job(app: &AppHandle, job_id: &str) {
+fn finish_job(app: &AppHandle, job_id: &str) -> bool {
     let status = db_call(app, |conn| db::load_job(conn, job_id))
         .flatten()
         .map(|job| {
@@ -566,9 +758,22 @@ fn finish_job(app: &AppHandle, job_id: &str) {
         })
         .unwrap_or(JobStatus::Completed.as_str());
 
-    let _ = db_call(app, |conn| db::refresh_job_counts(conn, job_id, Some(status)));
-    // Closed after the counts are refreshed: `close_run` reads them back.
-    let _ = db_call(app, |conn| db::close_run(conn, job_id, status));
+    // C-07: only a job that is still `running` may be finished. A cancel or a
+    // pause that landed between the last tile and this call owns the status
+    // now, and overwriting it would show a cancelled task as completed. The
+    // counters are refreshed either way.
+    let _ = db_call(app, |conn| {
+        db::set_job_status_if_running(conn, job_id, status)?;
+        db::refresh_job_counts(conn, job_id, None)
+    });
+    // Closed after the counts are refreshed, and with the status that actually
+    // won: `close_run` writes the string it is given, and reusing the computed
+    // one would record a run as completed for a task the user cancelled.
+    let stored_status = db_call(app, |conn| db::load_job(conn, job_id))
+        .flatten()
+        .map(|job| job.status);
+    let final_status = stored_status.clone().unwrap_or_else(|| status.to_string());
+    let _ = db_call(app, |conn| db::close_run(conn, job_id, &final_status));
     emit_progress(app, job_id);
 
     if let Some(job) = db_call(app, |conn| db::load_job(conn, job_id)).flatten() {
@@ -582,6 +787,9 @@ fn finish_job(app: &AppHandle, job_id: &str) {
             job.inserted
         );
     }
+    // P2-4: no stored status (DB error) must not chain either — the queue is
+    // safer stopped than started on a guess.
+    stored_status.as_deref().map(queue_continues).unwrap_or(false)
 }
 
 // ---------------------------------------------------------------------------
@@ -628,6 +836,31 @@ fn load_context(app: &AppHandle, job_id: &str) -> Option<JobContext> {
 
 fn next_queued(app: &AppHandle) -> Option<String> {
     db_call(app, |conn| db::next_queued_job(conn)).flatten().map(|job| job.id)
+}
+
+/// Claim the oldest job that is *still* queued. A cancel/pause can land
+/// between `next_queued_job` reading the row and the worker starting it; the
+/// conditional update loses that race on purpose, and the loop moves on to the
+/// next candidate instead of reviving a cancelled task.
+fn start_next_queued(app: &AppHandle) -> Option<String> {
+    loop {
+        let next = next_queued(app)?;
+        match db_call(app, |conn| {
+            db::set_job_status_if_queued(conn, &next, "running")
+        }) {
+            Some(changed) if changed > 0 => return Some(next),
+            Some(_) => continue,
+            None => return None,
+        }
+    }
+}
+
+/// Whether a finished job may hand the queue to the next one. Only a job that
+/// really reached a terminal state may chain: a pause/cancel that landed
+/// between the last tile and `finish_job` must end the queue, not start the
+/// next task behind the user's back.
+fn queue_continues(status: &str) -> bool {
+    matches!(status, "completed" | "failed")
 }
 
 fn is_running(app: &AppHandle, job_id: &str) -> bool {
@@ -768,14 +1001,13 @@ fn wait_for_idle(
         let state = app.state::<AppState>();
         if let Ok(signal) = state.grid_signal.lock() {
             // Only a real end-of-cell counts: `navigate`, `settings`, `cancel`
-            // are stops that happen for other reasons. `no-results` is a
-            // legitimate end: the cell is empty and has nothing more to load.
-            // `drift` is too: the map re-fitted itself away from the cell, so
-            // everything after it would describe a different area.
-            let reason_ok = matches!(
-                signal.idle_reason.as_str(),
-                "idle" | "max-scrolls" | "no-results" | "drift"
-            );
+            // are stops that happen for other reasons. `no-results` means the
+            // cell is empty and has nothing more to load; `drift` means the map
+            // re-fitted itself away from the cell. `no-feed` ends the cell too —
+            // waiting out the full idle timeout on a captcha page only makes the
+            // grid burn two minutes per tile — but the runner counts it towards
+            // the dead-page streak (P1-2).
+            let reason_ok = is_cell_end(&signal.idle_reason);
             if signal.idle_seq > after && signal.idle_tile == tile_id && reason_ok {
                 return Some(signal.idle_reason.clone());
             }
@@ -838,6 +1070,73 @@ mod tests {
     }
 
     #[test]
+    fn a_cell_ends_on_every_page_reason_but_not_on_a_switch_stop() {
+        for reason in ["idle", "max-scrolls", "no-results", "no-feed", "drift"] {
+            assert!(is_cell_end(reason), "{} must end a cell", reason);
+        }
+        // Stops that happen for other reasons: closing the cell here would make
+        // Rust record a tile as done while the user is still toggling settings.
+        for reason in ["navigate", "settings", "manual", "cancel", ""] {
+            assert!(!is_cell_end(reason), "{} must not end a cell", reason);
+        }
+    }
+
+    #[test]
+    fn tile_rows_count_once_and_only_when_attributed() {
+        let mut active = ActiveJob {
+            job_id: "job-1".to_string(),
+            current_tile: Some("job-1-t0".to_string()),
+            received: 0,
+            seen: std::collections::HashSet::new(),
+        };
+
+        // A late batch attributed to another job must not touch this counter.
+        assert_eq!(
+            count_new_ids(&mut active, "job-2", ["a"].into_iter()),
+            0
+        );
+        assert_eq!(active.received, 0);
+
+        // First sighting counts; a repeat of the same place id does not, and
+        // neither does an empty id (a malformed row is not a place).
+        assert_eq!(
+            count_new_ids(&mut active, "job-1", ["a", "b", "a", ""].into_iter()),
+            2
+        );
+        assert_eq!(active.received, 2);
+        // A second batch re-sending the same rows is not new data.
+        assert_eq!(
+            count_new_ids(&mut active, "job-1", ["a", "b"].into_iter()),
+            0
+        );
+
+        // Between tiles the slot has no tile: rows that arrive then are late.
+        active.current_tile = None;
+        assert_eq!(
+            count_new_ids(&mut active, "job-1", ["c"].into_iter()),
+            0
+        );
+    }
+
+    #[test]
+    fn only_a_live_empty_cell_is_not_dry() {
+        // An empty area the page could actually show: a clean stop on a
+        // working Maps document.
+        assert!(!counts_as_dry(0, true, true, Some("no-results")));
+        assert!(!counts_as_dry(0, true, true, Some("idle")));
+        assert!(!counts_as_dry(5, true, true, Some("no-results")));
+
+        // P1-2: the page never rendered a feed — a captcha, a consent screen or
+        // a broken parser must count towards the dead-page streak even though
+        // the cell ended "cleanly".
+        assert!(counts_as_dry(0, true, true, Some("no-feed")));
+        // A cell that started and never stopped is the old dead-page case.
+        assert!(counts_as_dry(0, true, false, None));
+        // A navigation that never even started the script.
+        assert!(counts_as_dry(0, false, false, None));
+    }
+
+    #[test]
     fn tile_url_uses_the_search_path_and_encodes_keyword() {
         let url = tile_url("bed & breakfast", 34.0522, -118.2437, 16, "hl=en&gl=us");
         assert!(url.starts_with(
@@ -875,5 +1174,17 @@ mod tests {
         );
         assert_eq!(JobStatus::Paused.as_str(), "paused");
         assert_eq!(JobStatus::Queued.as_str(), "queued");
+    }
+
+    /// P2-4: only a job that really finished may hand the queue to the next
+    /// one. A stop that landed at the last tile must end the queue.
+    #[test]
+    fn only_terminal_jobs_continue_the_queue() {
+        assert!(queue_continues("completed"));
+        assert!(queue_continues("failed"));
+        assert!(!queue_continues("paused"));
+        assert!(!queue_continues("cancelled"));
+        assert!(!queue_continues("running"));
+        assert!(!queue_continues(""));
     }
 }

@@ -72,6 +72,7 @@ import { useSettings } from './settings/SettingsContext';
 import { renderFileName } from './settings/fileName';
 import { linkLabel, safeHttpUrl } from './lib/url';
 import { typeLabel } from './lib/text';
+import { paneBusyMessageKey } from './lib/busy';
 import { useI18n } from './i18n';
 import { checkForUpdate, downloadAndInstall, type UpdateOffer } from './updater';
 
@@ -281,6 +282,12 @@ export default function App() {
     ok: number;
     failed: number;
   } | null>(null);
+  /**
+   * True while a reviews fetch owns the maps pane (C-01). The drawer owns the
+   * fetch, so it reports the state up: while it runs the Rust side holds the
+   * pane for ~12 s and every other pane action would be refused.
+   */
+  const [reviewsBusy, setReviewsBusy] = useState(false);
   const [selectedKeys, setSelectedKeys] = useState<React.Key[]>([]);
   /**
    * Bumped whenever `selectedRowsRef` is re-pointed at fresh row objects
@@ -351,6 +358,27 @@ export default function App() {
   const [onlyNew, setOnlyNew] = useState(false);
   /** Job attribution for the rows currently on screen. */
   const [jobRefs, setJobRefs] = useState<BusinessJobRef[]>([]);
+
+  /**
+   * Clear every filter dimension.
+   *
+   * Defined above the long-lived event listeners so `data:cleared` can call it
+   * too (P2-16): that listener used to reset the text/rating/contact/type
+   * filters by hand and forgot `timeRange`, `taskFilter` and `onlyNew`,
+   * leaving the emptied table filtered.
+   */
+  const resetFilters = useCallback(() => {
+    setQuery('');
+    // Apply the cleared text immediately: the 250 ms debounce would otherwise
+    // keep querying the old term after the filters were visually reset.
+    setDebouncedQuery('');
+    setRating('all');
+    setContact('all');
+    setTimeRange('all');
+    setTypeFilter([]);
+    setTaskFilter('all');
+    setOnlyNew(false);
+  }, []);
 
   // Seeded from the settings Rust injected before the first paint, so the panel
   // starts at the persisted width and page size without a visible correction.
@@ -449,6 +477,10 @@ export default function App() {
   const requestIdRef = useRef(0);
   /** Mirror of `listening` for the long-lived event listeners (no stale closure). */
   const listeningRef = useRef(false);
+  // P3-4: a `listening:changed` event is newer than the `get_collector_state`
+  // snapshot that was already in flight; without this flag the older snapshot
+  // could overwrite the event's state on startup.
+  const listeningEventSeenRef = useRef(false);
   /** Whether the current listening session already showed the hands-off hint. */
   const firstBatchHintRef = useRef(false);
   // Long-lived event listeners and mount-only effects read the latest translator
@@ -479,6 +511,9 @@ export default function App() {
     )
       .then((state) => {
         if (cancelled) return;
+        // A `listening:changed` event already delivered newer state; applying
+        // this older snapshot would undo it (P3-4).
+        if (listeningEventSeenRef.current) return;
         applyListening(state.listening);
         if (state.listening) {
           setSessionStartedAt((prev) => prev ?? state.sessionStartedAt ?? Date.now());
@@ -606,6 +641,14 @@ export default function App() {
     [jobs],
   );
 
+  /**
+   * Another operation owns the Maps pane, so anything that navigates it must
+   * refuse (C-01/C-10). Covers the three states the panel can observe — a
+   * running task, an enrichment run and a reviews fetch — plus an active
+   * collecting session, which the backend also refuses.
+   */
+  const paneBusyElsewhere = Boolean(runningJob) || Boolean(enriching) || reviewsBusy || listening;
+
 
 
   /** Task the table is pinned to; `null` for "all" and "unassigned" (T-11). */
@@ -685,11 +728,12 @@ export default function App() {
     void loadPage();
   }, [loadPage]);
 
-  // A new filter or sort always starts at the first page. The time range and
-  // the session start (R-33) are part of that: both move the window's origin.
+  // A new filter or sort always starts at the first page. The time range, the
+  // "only new" toggle and the session start (R-33) are part of that: all of
+  // them change which rows match.
   useEffect(() => {
     setPage(1);
-  }, [debouncedQuery, rating, contact, typeFilter, taskFilter, timeRange, sessionStartedAt, sort]);
+  }, [debouncedQuery, rating, contact, typeFilter, taskFilter, timeRange, onlyNew, sessionStartedAt, sort]);
 
   // Typing should not query per keystroke; the other filters fire immediately.
   useEffect(() => {
@@ -765,7 +809,7 @@ export default function App() {
   useEffect(() => {
     let cancelled = false;
 
-    Promise.all([
+    Promise.allSettled([
       listen<Business[]>('businesses:updated', (event) => {
         const incoming = event.payload ?? [];
         // Recorded before the dedupe below: a batch made entirely of known rows
@@ -798,7 +842,9 @@ export default function App() {
         // "N new" pill; the highlight is applied when the page reloads.
         fresh.forEach((item) => {
           rememberSeen(seenRef.current, item.place_id);
-          pendingRevealRef.current.add(item.place_id);
+          // Same bound as `seenRef`: the reveal set only shrinks when the user
+          // actually reaches the page holding the id (P3-3).
+          rememberSeen(pendingRevealRef.current, item.place_id);
         });
 
         bumpKeyRef.current += 1;
@@ -930,6 +976,7 @@ export default function App() {
         }
       }),
       listen<boolean>('listening:changed', (event) => {
+        listeningEventSeenRef.current = true;
         applyListening(event.payload);
         if (event.payload) {
           setSessionStartedAt((prev) => prev ?? Date.now());
@@ -1028,12 +1075,12 @@ export default function App() {
         setSummary({ received: 0, inserted: 0, dropped: 0 });
         setMapHealth('unknown');
         // Reset filters too, otherwise a stale filter would hide the (now empty)
-        // filter bar and leave the table stuck on "no matching records".
-        setQuery('');
-        setDebouncedQuery('');
-        setRating('all');
-        setContact('all');
-        setTypeFilter([]);
+        // filter bar and leave the table stuck on "no matching records". One
+        // helper, not eight setters: the hand-written list used to forget
+        // `timeRange`, `taskFilter` and `onlyNew` (P2-16).
+        resetFilters();
+        // Sort is reset separately: `resetFilters` only touches filters, and a
+        // cleared table should come back in the default newest-first order.
         setSort({ field: 'collectedAt', direction: 'desc' });
         // UI-02b: the toast doubles as the undo entry, so it outlives the
         // default 3 s — the window matches Rust's `UNDO_CLEAR_WINDOW`.
@@ -1068,23 +1115,33 @@ export default function App() {
         },
       ),
     ])
-      .then((fns) => {
+      .then((results) => {
+        // P3-4: `Promise.all` rejects on the first failed `listen`, and the
+        // handles that did succeed were lost until the next reload. Collect
+        // every fulfilled handle, release them if the effect already cleaned
+        // up, and report the failure once.
+        const fns = results.flatMap((result) =>
+          result.status === 'fulfilled' ? [result.value] : [],
+        );
         if (cancelled) {
           fns.forEach((fn) => fn());
-        } else {
-          unlistenRef.current = fns;
+          return;
         }
-      })
-      .catch((error) =>
-        message.error(tRef.current('toast.subscribeFailed', { error: String(error) })),
-      );
+        unlistenRef.current = fns;
+        const failed = results.find((result) => result.status === 'rejected');
+        if (failed && failed.status === 'rejected') {
+          message.error(
+            tRef.current('toast.subscribeFailed', { error: String(failed.reason) }),
+          );
+        }
+      });
 
     return () => {
       cancelled = true;
       unlistenRef.current.forEach((fn) => fn());
       unlistenRef.current = [];
     };
-  }, [message, scheduleRefresh, revealExport, applyListening, handleUndoClear]);
+  }, [message, scheduleRefresh, revealExport, applyListening, handleUndoClear, resetFilters]);
 
   // ========== Layout measurements ==========
   useEffect(() => {
@@ -1117,8 +1174,11 @@ export default function App() {
     if (!target || !target.classList.contains('ant-table-body')) return;
     const distance = target.scrollHeight - target.scrollTop - target.clientHeight;
     if (distance < 24) {
-      // Reaching the bottom by hand means the backlog has been seen.
+      // Reaching the bottom by hand means the backlog has been seen, and it
+      // re-arms follow-the-tail: before this, scrolling back down cleared the
+      // counter but new batches never followed again (P3-2).
       setUnseen(0);
+      followTailRef.current = true;
     } else {
       // Scrolling up is an explicit "stop following me".
       followTailRef.current = false;
@@ -1360,6 +1420,14 @@ export default function App() {
   // reload (localStorage mirror in intercept.js), so only the liveness clock
   // is re-armed here.
   const handleReloadMap = useCallback(async () => {
+    // Reload stays allowed on purpose: it is the way out of a consent page or
+    // a wedged view, i.e. the state that is already costing the user time. It
+    // does replace the document a reviews fetch or the enrichment runner is
+    // reading, so say that out loud instead of failing silently (C-11). The
+    // review rows are guarded against a wrong-place write in Rust (C-02).
+    if (reviewsBusy || enriching) {
+      message.warning(t('toast.reloadInterruptsPane'));
+    }
     try {
       await invoke('reload_maps');
       lastActivityRef.current = Date.now();
@@ -1368,7 +1436,7 @@ export default function App() {
     } catch (error) {
       message.error(t('toast.mapReloadFailed', { error: String(error) }));
     }
-  }, [message, t]);
+  }, [reviewsBusy, enriching, message, t]);
 
   // Recovery action for a wedged scroll loop. It must not toggle the raw switch:
   // turning listening off is now a task pause, so a pause + resume is the
@@ -1405,9 +1473,10 @@ export default function App() {
 
   const handleLocate = useCallback(
     async (business: Business) => {
-      // Locating navigates the Maps webview, which is exactly what the runner is
-      // doing. Refuse while a task owns the map; the backend enforces it too.
-      if (runningJob) {
+      // Locating navigates the Maps webview, which is exactly what the runner,
+      // the enrichment runner and a reviews fetch are doing. Refuse while any
+      // of them owns the map; the backend enforces it too.
+      if (paneBusyElsewhere) {
         message.warning(t('toast.locateBlocked'));
         return;
       }
@@ -1420,16 +1489,17 @@ export default function App() {
         });
         message.success(t('toast.located', { name: business.name }));
       } catch (error) {
-        // A5: known refusals name their reason; the rest stays raw.
-        const text = String(error);
-        if (text === 'enrich_busy') {
-          message.warning(t('toast.enrichBusy'));
+        // A5: known refusals name their reason; the rest stays raw. All four
+        // pane codes are translated here (C-10).
+        const busyKey = paneBusyMessageKey(error);
+        if (busyKey) {
+          message.warning(t(busyKey));
         } else {
-          message.error(t('toast.locateFailed', { error: text }));
+          message.error(t('toast.locateFailed', { error: String(error) }));
         }
       }
     },
-    [runningJob, message, t],
+    [paneBusyElsewhere, message, t],
   );
 
   const loadDiagnostics = useCallback(async () => {
@@ -1743,6 +1813,15 @@ export default function App() {
     }
   }, [filterRequest, message, stats.total]);
 
+  // P2-16: "select all filtered" runs up to four sequential queries. A filter
+  // change supersedes the run — `data:cleared` is not the only way the result
+  // set moves, and rows from the old filter must not land in the new selection.
+  // `filterRequest` is the exact request builder the loop uses, so its identity
+  // changing is the precise "the selection would differ now" signal.
+  useEffect(() => {
+    selectAllRunRef.current += 1;
+  }, [filterRequest]);
+
   // M7: mine emails/socials for the current scope — the selection when rows
   // are selected, the whole filtered set otherwise (mirroring the export
   // button's two scopes). Large unselected runs get one confirmation, because
@@ -1752,13 +1831,13 @@ export default function App() {
     const scope = selectedKeys.length > 0 ? 'selection' : 'filter';
     const count = scope === 'selection' ? selectedKeys.length : stats.total;
     if (count === 0) return;
-    const start = async () => {
+    const start = async (force: boolean) => {
       try {
         const sites = await invoke<number>('start_email_mining', {
           request:
             scope === 'selection'
-              ? { placeIds: selectedKeys.map(String), force: false }
-              : { filter: filterRequest(), force: false },
+              ? { placeIds: selectedKeys.map(String), force }
+              : { filter: filterRequest(), force },
         });
         if (sites === 0) {
           message.warning(t('toast.emailNothingToMine'));
@@ -1769,9 +1848,33 @@ export default function App() {
         const text = String(error);
         if (text.includes('already-running')) {
           message.warning(t('toast.emailMineRunning'));
-        } else {
-          message.error(t('toast.emailMineFailed', { error: text }));
+          return;
         }
+        // C-15: an empty scope has three causes. "Already mined" is the common
+        // one — the rows do have websites — so it gets the re-run offer instead
+        // of the misleading "no rows with a website".
+        if (text.startsWith('nothing_to_mine:')) {
+          const cause = text.slice('nothing_to_mine:'.length);
+          if (cause === 'already_mined') {
+            modal.confirm({
+              title: t('toast.emailAllMinedTitle', { count }),
+              content: t('toast.emailAllMinedBody'),
+              okText: t('table.mineEmailsForce'),
+              cancelText: t('common.cancel'),
+              onOk: () => {
+                void start(true);
+              },
+            });
+            return;
+          }
+          message.warning(
+            cause === 'no_website'
+              ? t('toast.emailNothingToMine')
+              : t('toast.emailSitesUnusable'),
+          );
+          return;
+        }
+        message.error(t('toast.emailMineFailed', { error: text }));
       }
     };
     if (scope === 'filter' && count > 500) {
@@ -1781,12 +1884,12 @@ export default function App() {
         okText: t('table.mineEmails'),
         cancelText: t('common.cancel'),
         onOk: () => {
-          void start();
+          void start(false);
         },
       });
       return;
     }
-    void start();
+    void start(false);
   }, [emailMining, selectedKeys, stats.total, filterRequest, message, modal, t]);
 
   // ========== Tier-2 detail enrichment ==========
@@ -1814,6 +1917,8 @@ export default function App() {
           message.warning(t('toast.enrichMapBusy'));
         } else if (text.includes('session_active')) {
           message.warning(t('toast.enrichSession'));
+        } else if (text.includes('reviews_busy')) {
+          message.warning(t('toast.reviewsBusy'));
         } else {
           message.error(t('toast.enrichFailed', { error: text }));
         }
@@ -1836,6 +1941,9 @@ export default function App() {
 
   const handleExport = useCallback(
     async (format: ExportKind, saveAs = false) => {
+      // A double click on "export then clear" used to start a second export
+      // while the first was still writing (P3-11).
+      if (exporting) return;
       const selected = selectedBusinesses;
       const hasSelection = selected.length > 0;
       if (!hasSelection && stats.total === 0) {
@@ -1878,12 +1986,24 @@ export default function App() {
           }
         }
       } catch (error) {
-        message.error(t('toast.exportFailed', { error: String(error) }));
+        const raw = String(error);
+        if (raw.includes('export_busy')) {
+          message.warning(t('toast.exportBusy'));
+        } else if (raw.startsWith('excel_row_limit:')) {
+          message.error(
+            t('toast.excelRowLimit', {
+              count: raw.slice('excel_row_limit:'.length),
+            }),
+          );
+        } else {
+          message.error(t('toast.exportFailed', { error: raw }));
+        }
       } finally {
         setExporting(false);
       }
     },
     [
+      exporting,
       filterRequest,
       message,
       selectedBusinesses,
@@ -1946,7 +2066,12 @@ export default function App() {
           ),
         });
       } catch (error) {
-        message.error(t('toast.exportFailed', { error: String(error) }));
+        const raw = String(error);
+        message.error(
+          raw.includes('export_busy')
+            ? t('toast.exportBusy')
+            : t('toast.exportFailed', { error: raw }),
+        );
       } finally {
         setExporting(false);
       }
@@ -2019,17 +2144,8 @@ export default function App() {
     contact !== 'all' ||
     timeRange !== 'all' ||
     typeFilter.length > 0 ||
-    taskFilter !== 'all';
-
-  const resetFilters = useCallback(() => {
-    setQuery('');
-    setRating('all');
-    setContact('all');
-    setTimeRange('all');
-    setTypeFilter([]);
-    setTaskFilter('all');
-    setOnlyNew(false);
-  }, []);
+    taskFilter !== 'all' ||
+    onlyNew;
 
   /** Switching task resets "only new": the watermark belongs to one task. */
   const handleTaskFilter = useCallback((value: TaskFilter) => {
@@ -2981,10 +3097,21 @@ export default function App() {
                 : t('table.mineEmails')}
             </Button>
           </Tooltip>
-          <Tooltip title={enriching ? t('table.enrichCancelHint') : t('table.enrichHint')}>
+          <Tooltip
+            title={
+              enriching
+                ? t('table.enrichCancelHint')
+                : paneBusyElsewhere
+                  ? t('table.enrichBlockedHint')
+                  : t('table.enrichHint')
+            }
+          >
             <Button
               size="small"
               icon={enriching ? <SyncOutlined spin /> : <FileDoneOutlined />}
+              // Another pane owner would refuse the start anyway; say so before
+              // the click. The cancel state must stay clickable (C-01).
+              disabled={!enriching && paneBusyElsewhere}
               onClick={() => {
                 // Click-to-cancel: the runner checks the flag between places
                 // and at every poll, so a stop lands within seconds.
@@ -3141,8 +3268,9 @@ export default function App() {
         onPrev={showPrevDetail}
         onNext={showNextDetail}
         onSelectType={filterByType}
-        locateBlocked={Boolean(runningJob)}
+        locateBlocked={paneBusyElsewhere}
         mapBusyName={runningJob ? runningJob.name || runningJob.keyword : null}
+        onReviewsBusyChange={setReviewsBusy}
       />
 
       <DiagnosticsDrawer
@@ -3157,9 +3285,11 @@ export default function App() {
         open={settingsOpen}
         panelWidth={panelWidth}
         // Changing the map language/region reloads the pane, which the backend
-        // refuses while a task owns it — the drawer has to say so before the
-        // user picks a value that cannot be saved.
-        busy={Boolean(runningJob)}
+        // refuses while *any* pane owner holds it — a task, the enrichment
+        // runner, a reviews fetch or a collecting session (P2-6). Passing only
+        // `runningJob` let the user pick a value the backend then rejected with
+        // a raw `enrich_busy` / `reviews_busy` code.
+        busy={paneBusyElsewhere}
         onClose={() => setSettingsOpen(false)}
         onCheckUpdates={() => checkUpdates(true)}
       />

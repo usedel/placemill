@@ -11,6 +11,7 @@ import {
 import { invoke } from '@tauri-apps/api/core';
 import { useI18n, type MessageKey } from '../i18n';
 import { jobStatusLabel } from '../lib/text';
+import { paneBusyMessageKey } from '../lib/busy';
 import type { Business, BusinessPage } from '../types/business';
 import type { Job, JobRun, JobTile } from '../types/job';
 
@@ -22,6 +23,7 @@ const REASON_KEYS: Record<string, MessageKey> = {
   timeout: 'tile.reason.timeout',
   'parse-empty': 'tile.reason.parseEmpty',
   drift: 'tile.reason.drift',
+  'no-feed': 'tile.reason.noFeed',
 };
 
 /** SQLite `CURRENT_TIMESTAMP` is UTC without a zone marker. */
@@ -118,10 +120,12 @@ export default function TaskDetail({
         const text = String(error);
         if (text.includes('job_running')) {
           message.warning(t('grid.errorRunning'));
-        } else if (text.includes('enrich_busy')) {
-          message.warning(t('toast.enrichBusy'));
         } else {
-          message.error(t('queue.actionFailed', { error: text }));
+          // Covers enrich_busy, map_busy, reviews_busy and session_active with
+          // readable text (C-10).
+          const busyKey = paneBusyMessageKey(error);
+          if (busyKey) message.warning(t(busyKey));
+          else message.error(t('queue.actionFailed', { error: text }));
         }
       } finally {
         setBusy(false);

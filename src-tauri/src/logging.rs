@@ -91,8 +91,11 @@ pub fn record(level: Level, args: std::fmt::Arguments<'_>) {
 /// `...\Users\***\...`, which still shows where the file is without naming the
 /// account. Anything else is returned unchanged.
 pub fn redact_path(value: &str) -> String {
-    for marker in ["\\Users\\", "/Users/", "/home/"] {
-        if let Some(start) = value.find(marker) {
+    // P3-8: Windows paths are case-insensitive; a lowercase `c:\users\…`
+    // used to leave the account name in the log.
+    let lower = value.to_ascii_lowercase();
+    for marker in ["\\users\\", "/users/", "/home/"] {
+        if let Some(start) = lower.find(marker) {
             let rest_start = start + marker.len();
             let rest = &value[rest_start..];
             let end = rest
@@ -123,9 +126,9 @@ pub fn redact_place_id(value: &str) -> String {
 
 /// Mask an email address: `alice@example.com` → `a***@example.com`.
 ///
-/// Not used by the current log lines (none of them print an address), but the
-/// miner and any future diagnostic must have an obvious way to do it.
-#[allow(dead_code)]
+/// Test-only today (no production log line prints an address); kept here so a
+/// future diagnostic has one obvious helper.
+#[cfg(test)]
 pub fn redact_email(value: &str) -> String {
     match value.split_once('@') {
         Some((local, domain)) if !local.is_empty() => {
@@ -137,7 +140,7 @@ pub fn redact_email(value: &str) -> String {
 }
 
 /// Mask a phone number, keeping the last four digits.
-#[allow(dead_code)]
+#[cfg(test)]
 pub fn redact_phone(value: &str) -> String {
     let digits: String = value.chars().filter(|c| c.is_ascii_digit()).collect();
     if digits.len() <= 4 {
@@ -217,6 +220,11 @@ mod tests {
         assert_eq!(
             redact_path("/home/alice/.local/share/placemill.db"),
             "/home/***/.local/share/placemill.db"
+        );
+        assert_eq!(
+            redact_path(r"c:\users\alice\placemill.db"),
+            r"c:\users\***\placemill.db",
+            "Windows paths are case-insensitive (P3-8)"
         );
         assert_eq!(redact_path("relative/path.db"), "relative/path.db");
     }

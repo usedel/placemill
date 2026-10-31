@@ -48,7 +48,7 @@
 
 - 本地 SQLite：`%APPDATA%\com.placemill.app\placemill.db`
 - 导出文件：默认目录可在设置中修改，文件名模板支持 `{date}` 占位
-- 「清空数据」只删除商家数据，不影响任务记录；诊断抽屉可查看数据库路径、行数与查询性能
+- 「清空数据」只删除商家数据，评论记录与任务记录都会保留；诊断抽屉可查看数据库路径、行数与查询性能
 
 ## 故障排查
 
@@ -93,6 +93,7 @@ npm run e2e:grid        # 网格采集
 npm run e2e:queue       # 队列与断点续跑
 npm run e2e:tasks       # 任务视图
 npm run e2e:browse      # 分页浏览
+npm run e2e:pane        # 地图面板占用互斥
 npm run e2e:interceptor # 注入脚本
 npm run e2e:emails      # 邮箱挖掘
 npm run e2e:real        # 真实抓取（网络依赖）

@@ -255,11 +255,14 @@ async function main() {
     const refreshed = await call('selected_businesses', {
       placeIds: [rewritten.place_id],
     });
+    // G-16 normalizes every read-path row to E.164, so the new phone comes back
+    // as `+15550000` — compare digits, not the string that was written.
+    const digitsOf = (value) => String(value || '').replace(/\D/g, '');
     check(
       'the selection refresh channel returns the newest row',
       Array.isArray(refreshed) &&
         refreshed.length === 1 &&
-        refreshed[0].phone === '+1 555 0000',
+        digitsOf(refreshed[0].phone) === digitsOf(rewritten.phone),
       JSON.stringify(refreshed[0]?.phone ?? null),
     );
     await call('update_settings', { patch: { duplicateStrategy: 'ignore' } });

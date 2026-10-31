@@ -28,8 +28,12 @@ import type { Review } from '../types/review';
 import { useI18n } from '../i18n';
 import { linkLabel, safeHttpUrl } from '../lib/url';
 import { typeLabel } from '../lib/text';
+import { paneBusyMessageKey } from '../lib/busy';
 
 const { Text, Link } = Typography;
+
+/** Covers the Rust sequence (4.5 s + 3 s + 4 s) plus a slow cold load. */
+const REVIEW_FETCH_TIMEOUT_MS = 15_000;
 
 interface Props {
   business: Business | null;
@@ -48,6 +52,9 @@ interface Props {
   /** Display name of the task owning the map, when one runs (A2: the reviews
    * button says so before the click instead of after). */
   mapBusyName?: string | null;
+  /** Reports the reviews fetch to the panel (C-01): while it runs the maps pane
+   * is owned by the fetch thread, so the toolbar's pane actions must disable. */
+  onReviewsBusyChange?: (busy: boolean) => void;
 }
 
 /** True when the event target is a text field, where arrows must edit, not navigate. */
@@ -72,6 +79,7 @@ export default function DetailDrawer({
   onSelectType,
   locateBlocked = false,
   mapBusyName = null,
+  onReviewsBusyChange,
 }: Props) {
   const { t, tag } = useI18n();
 
@@ -104,20 +112,41 @@ export default function DetailDrawer({
   const { message } = AntdApp.useApp();
   const placeId = business?.place_id || '';
 
+  // C-01: while the fetch runs, the Rust side owns the maps pane for the whole
+  // timed sequence, so every other pane action must disable — the panel has to
+  // know. The ref mirrors the state for the timeout below: `setState` alone is
+  // read a render later, and a stale `true` there would warn after success.
+  const reviewsFetchingRef = useRef(false);
+  const setFetching = useCallback((busy: boolean) => {
+    reviewsFetchingRef.current = busy;
+    setReviewsFetching(busy);
+  }, []);
+
+  useEffect(() => {
+    onReviewsBusyChange?.(reviewsFetching);
+  }, [reviewsFetching, onReviewsBusyChange]);
+
+  // P2-5: only the answer to the *current* request may reach the table. A fast
+  // walk through the list (or a slow read for the previous business) used to let
+  // the older response win and show another place's reviews under this one.
+  const reviewsRequestRef = useRef(0);
+
   const loadReviews = useCallback(async (pid: string) => {
+    const request = ++reviewsRequestRef.current;
     if (!pid) {
       setReviews([]);
       return;
     }
     setReviewsLoading(true);
     try {
-      setReviews(await invoke<Review[]>('get_business_reviews', { placeId: pid }));
+      const rows = await invoke<Review[]>('get_business_reviews', { placeId: pid });
+      if (request === reviewsRequestRef.current) setReviews(rows);
     } catch {
       // A failed read leaves the drawer empty rather than crashing it; the
       // diagnostics drawer carries the error.
-      setReviews([]);
+      if (request === reviewsRequestRef.current) setReviews([]);
     } finally {
-      setReviewsLoading(false);
+      if (request === reviewsRequestRef.current) setReviewsLoading(false);
     }
   }, []);
 
@@ -126,46 +155,56 @@ export default function DetailDrawer({
     void loadReviews(placeId);
   }, [placeId, loadReviews]);
 
+  // The subscription is registered once and reads the current place through a
+  // ref: depending on `placeId` rebuilt it on every selection and the async
+  // cleanup could leave the old closure listening, so one event fired twice
+  // (P2-5). It is registered even with no place selected — the drawer can be
+  // closed while a fetch is in flight, and this event is what releases the busy
+  // state the whole panel waits on (C-01).
+  const placeIdRef = useRef(placeId);
   useEffect(() => {
-    if (!placeId) return;
+    placeIdRef.current = placeId;
+  }, [placeId]);
+
+  useEffect(() => {
     const unlisten = listen<{ placeId: string }>('reviews:updated', (event) => {
-      if (event.payload.placeId === placeId) {
-        setReviewsFetching(false);
-        void loadReviews(placeId);
-      }
+      // The slot is released once the sequence ends, whichever place it ended
+      // on: an event for another business still means this fetch is over, so
+      // the spinner must stop even though that table is not reloaded.
+      setFetching(false);
+      const current = placeIdRef.current;
+      if (current && event.payload.placeId === current) void loadReviews(current);
     });
     return () => {
       void unlisten.then((fn) => fn());
     };
-  }, [placeId, loadReviews]);
+  }, [loadReviews, setFetching]);
 
   const fetchReviews = async () => {
-    if (!placeId || reviewsFetching) return;
-    setReviewsFetching(true);
+    if (!placeId || reviewsFetchingRef.current) return;
+    setFetching(true);
     try {
       await invoke('fetch_business_reviews', { placeId });
     } catch (error) {
       // A failed request used to die silently — the user clicked and nothing
-      // happened. The toast is the only visible surface the drawer owns. The
-      // busy codes are translated (A5: a failure names its reason); anything
-      // unknown falls through as raw text.
-      const text = String(error);
+      // happened. The toast is the only visible surface the drawer owns. Every
+      // pane refusal is translated (C-10); anything unknown stays raw.
+      const busyKey = paneBusyMessageKey(error);
       message.error(
-        text === 'session_active'
-          ? t('toast.reviewsBlockedBySession')
-          : text.startsWith('map_busy')
-            ? t('toast.reviewsBlockedByJob')
-            : text === 'enrich_busy'
-              ? t('toast.reviewsBlockedByEnrich')
-              : t('toast.reviewsFetchFailed', { error: text }),
+        busyKey ? t(busyKey) : t('toast.reviewsFetchFailed', { error: String(error) }),
       );
-      setReviewsFetching(false);
+      setFetching(false);
       return;
     }
-    // The command only *requests* the fetch; if the event never lands (the
-    // maps pane closed mid-request), stop the spinner instead of spinning
-    // forever.
-    window.setTimeout(() => setReviewsFetching(false), 20_000);
+    // The command only *requests* the fetch: the sequence needs ~11.5 s
+    // (4.5 s load + 3 s reviews tab + 4 s retry), and the retry is the last
+    // thing that can still land. If no event arrives, stop the spinner and say
+    // so instead of spinning — and staying disabled — for 20 s.
+    window.setTimeout(() => {
+      if (!reviewsFetchingRef.current) return;
+      setFetching(false);
+      message.warning(t('toast.reviewsFetchTimeout'));
+    }, REVIEW_FETCH_TIMEOUT_MS);
   };
 
   const exportReviews = async (format: 'csv' | 'excel') => {
@@ -437,7 +476,13 @@ export default function DetailDrawer({
                 <Text strong>{t('detail.reviewsTitle', { count: reviews.length })}</Text>
                 <Space size={4}>
                   <Tooltip
-                    title={mapBusyName ? t('detail.reviewsBlockedByJob', { name: mapBusyName }) : undefined}
+                    title={
+                      mapBusyName
+                        ? t('detail.reviewsBlockedByJob', { name: mapBusyName })
+                        : reviewsFetching
+                          ? t('detail.reviewsFetching')
+                          : undefined
+                    }
                   >
                     <Button
                       size="small"

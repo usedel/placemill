@@ -1,7 +1,8 @@
 {
   "identifier": "default",
-  "description": "Default capabilities for main and maps webviews",
-  "windows": ["main", "maps"],
+  "description": "Default capabilities for the panel webview only; the remote maps webview has its own minimal capability",
+  "windows": ["main"],
+  "webviews": ["main"],
   "permissions": [
     "core:default",
     "core:event:default",
