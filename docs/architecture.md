@@ -58,5 +58,8 @@ A *job* is one keyword over a rectangular grid. `plan_grid` splits the radius in
 ## Storage, exports, updates
 
 - SQLite at `%APPDATA%\com.placemill.app\placemill.db`: `businesses` (`place_id UNIQUE`), job/tile tables, settings (single JSON row), plus migrations.
+- Email verification (G-04) is cached **by address**, not by row: `email_verifications` is keyed by the normalized address and `email_domain_checks` by the punycode domain, so one lookup covers every business sharing that address. Judging lives in `email_verify.rs`; `db.rs` only stores the verdict. Verification never writes `businesses.email_status` — that column belongs to the miner.
+- Mining and verification exclude each other through `contact_lock` (check-and-claim): verification reads the addresses mining writes back, so running both would leave an unexplained "verified, then a new address appeared". Neither occupies the maps pane.
+- `clear_data` bumps `verification_epoch` too; a queued verification batch compares it inside the `db` lock so it cannot resurrect the cache the clear just deleted.
 - Exports stream from Rust (CSV / Excel) — the panel never holds the full table; browsing is server-side paginated.
 - Auto-update via `tauri-plugin-updater` against a static `latest.json` on GitHub Releases; binaries are minisign-signed. The remote parser field map (`remote_config.rs`) is a separate minisign-verified config served from GitHub Pages — unsigned or tampered configs are rejected (fail closed) and the built-in field map applies. See [`parser.md`](parser.md).

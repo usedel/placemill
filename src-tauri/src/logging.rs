@@ -126,9 +126,9 @@ pub fn redact_place_id(value: &str) -> String {
 
 /// Mask an email address: `alice@example.com` → `a***@example.com`.
 ///
-/// Test-only today (no production log line prints an address); kept here so a
-/// future diagnostic has one obvious helper.
-#[cfg(test)]
+/// Production since G-04: the verification run logs a failing address this way
+/// when it needs to be correlated with a domain, and a full address in a log
+/// file the user may hand to someone else is a leak.
 pub fn redact_email(value: &str) -> String {
     match value.split_once('@') {
         Some((local, domain)) if !local.is_empty() => {

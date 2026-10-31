@@ -9,15 +9,21 @@ import { ANTD_LOCALE } from './i18n/locales';
 import { SettingsBoundary } from './settings/SettingsBoundary';
 import { SettingsProvider, useSettings } from './settings/SettingsContext';
 
-// Runs at module scope, i.e. before the first React render. `App.css` switches
-// its design tokens on `[data-theme]`, so doing this inside an effect would show
-// one frame of the light palette to dark-mode users. The marker makes that
-// ordering observable for the acceptance test.
+// Antd's default 8 px puts toasts on top of `.brand-bar`, i.e. over the
+// view switch — the control a user reaches for right after a toast like
+// "cleared" lands. Drop them below the header instead of over it.
+const TOAST_TOP = 64;
+
+// Runs at module scope, i.e. before the first React render. The palette is not
+// in the stylesheet: `applyThemeAttribute` writes `src/design/tokens.ts` onto
+// `<html>` as custom properties, and every rule in `App.css` reads `var(--…)`.
+// So this must run unconditionally — the bootstrap cache only exists inside
+// Tauri, and a browser-only `npm run dev` would otherwise leave the whole panel
+// without colours. The marker makes that ordering observable for the
+// acceptance test.
 const bootstrapSettings = window.__PLACE_MILL_SETTINGS__;
-if (bootstrapSettings) {
-  applyThemeAttribute(resolveDark(bootstrapSettings.theme));
-  window.__PLACE_MILL_THEME_APPLIED__ = 'module';
-}
+applyThemeAttribute(resolveDark(bootstrapSettings?.theme ?? 'system'));
+window.__PLACE_MILL_THEME_APPLIED__ = 'module';
 
 function Root() {
   const { settings } = useSettings();
@@ -37,7 +43,7 @@ function Root() {
 
   return (
     <ConfigProvider locale={ANTD_LOCALE[locale]} theme={buildTheme(dark)}>
-      <AntdApp>
+      <AntdApp message={{ top: TOAST_TOP }}>
         <App />
       </AntdApp>
     </ConfigProvider>

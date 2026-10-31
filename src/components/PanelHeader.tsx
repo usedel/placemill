@@ -1,7 +1,8 @@
-import { Button, Segmented, Tooltip } from 'antd';
+import { Button, Dropdown, Segmented, Tooltip } from 'antd';
 import {
   BugOutlined,
   EnvironmentFilled,
+  MoreOutlined,
   PlusOutlined,
   QuestionCircleOutlined,
   SettingOutlined,
@@ -30,6 +31,13 @@ interface Props {
    * "paused".
    */
   collectedThisSession: boolean;
+  /**
+   * UI-14: under `BREAKPOINTS.compact` there is no room for four icon buttons
+   * beside the view switch, so the three secondary ones collapse into one menu.
+   * "New task" stays out of it — it is the primary action and `grid.mjs`
+   * reaches for `.brand-bar .anticon-plus`.
+   */
+  compact: boolean;
   onOpenGrid: () => void;
   onOpenDiagnostics: () => void;
   onOpenSettings: () => void;
@@ -60,6 +68,7 @@ export default function PanelHeader({
   busy,
   sessionStartedAt,
   collectedThisSession,
+  compact,
   onOpenGrid,
   onOpenDiagnostics,
   onOpenSettings,
@@ -99,10 +108,14 @@ export default function PanelHeader({
 
       <div className={`status-pill${collecting ? ' is-live' : ''}`} title={statusBase}>
         <span className="status-dot" />
-        {statusBase}
-        {listening && sessionStartedAt !== null && (
-          <ElapsedText startedAt={sessionStartedAt} />
-        )}
+        {/* Wrapped so compact mode can hide the words and keep the dot; the
+            text stays in the DOM, so `textContent` is unchanged. */}
+        <span className="status-text">
+          {statusBase}
+          {listening && sessionStartedAt !== null && (
+            <ElapsedText startedAt={sessionStartedAt} />
+          )}
+        </span>
       </div>
 
       <Tooltip title={t('header.grid')}>
@@ -117,41 +130,71 @@ export default function PanelHeader({
         />
       </Tooltip>
 
-      <Tooltip title={t('header.help')}>
-        <Button
-          className="icon-btn"
-          type="text"
-          shape="circle"
-          size="small"
-          icon={<QuestionCircleOutlined />}
-          aria-label={t('header.help')}
-          onClick={onOpenHelp}
-        />
-      </Tooltip>
+      {compact ? (
+        <Dropdown
+          trigger={['click']}
+          placement="bottomRight"
+          menu={{
+            items: [
+              { key: 'help', icon: <QuestionCircleOutlined />, label: t('header.help') },
+              { key: 'diagnostics', icon: <BugOutlined />, label: t('header.diagnostics') },
+              { key: 'settings', icon: <SettingOutlined />, label: t('header.settings') },
+            ],
+            onClick: ({ key }) => {
+              if (key === 'help') onOpenHelp();
+              else if (key === 'diagnostics') onOpenDiagnostics();
+              else if (key === 'settings') onOpenSettings();
+            },
+          }}
+        >
+          <Button
+            className="icon-btn"
+            type="text"
+            shape="circle"
+            size="small"
+            icon={<MoreOutlined />}
+            aria-label={t('header.more')}
+          />
+        </Dropdown>
+      ) : (
+        <>
+          <Tooltip title={t('header.help')}>
+            <Button
+              className="icon-btn"
+              type="text"
+              shape="circle"
+              size="small"
+              icon={<QuestionCircleOutlined />}
+              aria-label={t('header.help')}
+              onClick={onOpenHelp}
+            />
+          </Tooltip>
 
-      <Tooltip title={t('header.settings')}>
-        <Button
-          className="icon-btn"
-          type="text"
-          shape="circle"
-          size="small"
-          icon={<SettingOutlined />}
-          aria-label={t('header.settings')}
-          onClick={onOpenSettings}
-        />
-      </Tooltip>
+          <Tooltip title={t('header.settings')}>
+            <Button
+              className="icon-btn"
+              type="text"
+              shape="circle"
+              size="small"
+              icon={<SettingOutlined />}
+              aria-label={t('header.settings')}
+              onClick={onOpenSettings}
+            />
+          </Tooltip>
 
-      <Tooltip title={t('header.diagnostics')}>
-        <Button
-          className="icon-btn"
-          type="text"
-          shape="circle"
-          size="small"
-          icon={<BugOutlined />}
-          aria-label={t('header.diagnostics')}
-          onClick={onOpenDiagnostics}
-        />
-      </Tooltip>
+          <Tooltip title={t('header.diagnostics')}>
+            <Button
+              className="icon-btn"
+              type="text"
+              shape="circle"
+              size="small"
+              icon={<BugOutlined />}
+              aria-label={t('header.diagnostics')}
+              onClick={onOpenDiagnostics}
+            />
+          </Tooltip>
+        </>
+      )}
     </header>
   );
 }

@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useState } from 'react';
-import { App, Button, Empty, Progress, Space, Table, Tabs, Tooltip } from 'antd';
+import { App, Button, Progress, Space, Table, Tabs, Tooltip } from 'antd';
 import type { ColumnsType } from 'antd/es/table';
 import {
   ArrowLeftOutlined,
@@ -14,6 +14,10 @@ import { jobStatusLabel } from '../lib/text';
 import { paneBusyMessageKey } from '../lib/busy';
 import type { Business, BusinessPage } from '../types/business';
 import type { Job, JobRun, JobTile } from '../types/job';
+import EmptyState from './ui/EmptyState';
+import HintText from './ui/HintText';
+import SectionLabel from './ui/SectionLabel';
+import StatusPill from './ui/StatusPill';
 
 const PROCESSED = (job: Job) => job.doneTiles + job.failedTiles;
 
@@ -245,9 +249,7 @@ export default function TaskDetail({
 
       {failedTiles.length > 0 && (
         <div className="task-failed">
-          <div className="task-failed-head">
-            {t('task.failedTiles', { count: failedTiles.length })}
-          </div>
+          <SectionLabel>{t('task.failedTiles', { count: failedTiles.length })}</SectionLabel>
           {failedTiles.slice(0, 8).map((tile) => (
             <div className="task-failed-row" key={tile.id}>
               <span className="task-failed-coord">
@@ -275,7 +277,7 @@ export default function TaskDetail({
         </div>
       )}
 
-      <div className="task-detail-note">{t('task.paramsLocked')}</div>
+      <HintText>{t('task.paramsLocked')}</HintText>
       <Button icon={<TableOutlined />} onClick={() => onViewAll(job.id)}>
         {t('task.openInData')}
       </Button>
@@ -291,7 +293,9 @@ export default function TaskDetail({
   const results = (
     <div className="task-detail-results">
       {total > rows.length && (
-        <div className="task-detail-more">{t('task.previewLimit', { shown: rows.length, total })}</div>
+        <HintText className="task-detail-more">
+          {t('task.previewLimit', { shown: rows.length, total })}
+        </HintText>
       )}
       <Table<Business>
         dataSource={rows}
@@ -301,7 +305,7 @@ export default function TaskDetail({
         loading={loading}
         pagination={false}
         locale={{
-          emptyText: <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description={t('task.noResults')} />,
+          emptyText: <EmptyState card={false} title={t('task.noResults')} />,
         }}
       />
     </div>
@@ -320,7 +324,7 @@ export default function TaskDetail({
   const runsTab = (
     <div className="task-runs">
       {runs.length === 0 ? (
-        <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description={t('task.noRuns')} />
+        <EmptyState card={false} title={t('task.noRuns')} />
       ) : (
         runs.map((run, index) => (
           <div className="task-run" key={run.id}>
@@ -331,9 +335,11 @@ export default function TaskDetail({
                   {formatTime(run.startedAt)}
                   {run.finishedAt ? ` – ${formatClock(run.finishedAt)}` : ''}
                 </span>
-                <span className={`task-run-status is-${run.status}`}>
-                  {jobStatusLabel(t, run.status)}
-                </span>
+                <StatusPill
+                  status={run.status}
+                  label={jobStatusLabel(t, run.status)}
+                  className="task-run-status"
+                />
               </div>
               <div className="task-run-meta">
                 {t('task.runLine', {
@@ -364,9 +370,11 @@ export default function TaskDetail({
           <span className="task-detail-name" title={job.name || job.keyword}>
             {job.name || job.keyword}
           </span>
-          <span className={`task-detail-status is-${job.status}`}>
-            {jobStatusLabel(t, job.status)}
-          </span>
+          <StatusPill
+            status={job.status}
+            label={jobStatusLabel(t, job.status)}
+            className="task-detail-status"
+          />
         </div>
         <Space size={2}>
           {(job.status === 'queued' || job.status === 'paused') && (

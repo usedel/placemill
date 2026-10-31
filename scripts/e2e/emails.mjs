@@ -34,6 +34,7 @@ import {
   launchApp,
   note,
   openPanel,
+  pollValue,
   preflight,
   printSummary,
   restoreDatabase,
@@ -252,6 +253,86 @@ async function main() {
       noweb.email_status === '' && noweb.emails.length === 0,
       noweb.email_status,
     );
+
+    // ---- UI: the list and the drawer actually show the result (M7) --------
+    // The backend checks above prove the data is stored; these prove the panel
+    // surfaces it. Skipped with `--keep-data`, where unknown rows can push the
+    // synthetic ones off page 1 and the ids are no longer on screen.
+    if (snapshot) {
+      await evalIn(
+        panel,
+        'document.querySelectorAll(".view-switch .ant-segmented-item")[1].click()',
+      );
+      await pollValue(panel, 'document.querySelector(".table-wrap") !== null', 15_000);
+      // The table pages its rows in after the view mounts; reading a badge
+      // before they land would report every row as "missing".
+      await pollValue(
+        panel,
+        `document.querySelector('tr[data-row-key="e2e-em-${RUN}-1"]') !== null`,
+        15_000,
+      );
+
+      const readContact = (placeId) => `(() => {
+        const row = document.querySelector('tr[data-row-key="${placeId}"]');
+        if (!row) return 'missing';
+        const badge = row.querySelector('[data-contact]');
+        return badge ? badge.getAttribute('data-contact') : 'none';
+      })()`;
+
+      const goodBadge = await evalIn(panel, readContact(`e2e-em-${RUN}-1`));
+      const blockedBadge = await evalIn(panel, readContact(`e2e-em-${RUN}-3`));
+      const unminedBadge = await evalIn(panel, readContact(`e2e-em-${RUN}-4`));
+      check(
+        'the list marks the mined row with an email glyph',
+        String(goodBadge).includes('email'),
+        String(goodBadge),
+      );
+      check(
+        'the list marks the blocked row as blocked, not as a hit',
+        String(blockedBadge) === 'blocked',
+        String(blockedBadge),
+      );
+      check(
+        'a never-mined row carries no contact glyph',
+        String(unminedBadge) === 'none',
+        String(unminedBadge),
+      );
+
+      const opened = await evalIn(
+        panel,
+        `(() => {
+           const row = document.querySelector('tr[data-row-key="e2e-em-${RUN}-1"]');
+           const cell = row && row.querySelectorAll('td')[1];
+           if (!cell) return false;
+           cell.click();
+           return true;
+         })()`,
+      );
+      const drawerReady = await pollValue(
+        panel,
+        `document.querySelector('.ant-drawer .detail-contacts') !== null`,
+        10_000,
+        200,
+      );
+      const drawerText = await evalIn(
+        panel,
+        `(document.querySelector('.ant-drawer-body') || {}).innerText || ''`,
+      );
+      check(
+        'the detail drawer lists the mined address',
+        opened === true &&
+          drawerReady === true &&
+          String(drawerText).includes('contact@hiddendental.com'),
+        String(drawerText).slice(0, 160),
+      );
+      await evalIn(
+        panel,
+        `(() => { const close = document.querySelector('.ant-drawer-close'); if (close) close.click(); return true; })()`,
+      );
+      await sleep(300);
+    } else {
+      note('UI checks skipped: --keep-data keeps unknown rows on the page');
+    }
 
     // ---- idempotency -----------------------------------------------------
     // C-15: an empty scope is an error that says *why* (`nothing_to_mine:*`),

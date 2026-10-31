@@ -17,7 +17,7 @@ export const es: Dict = {
   'bulk.exportJsonl': 'Exportar a JSONL',
   'bulk.mineConfirmContent':
     'Se visitarán hasta 4 páginas por sitio y esto puede tardar un buen rato. ¿Continuar?',
-  'bulk.mineConfirmTitle': '¿Extraer correos de {count} sitios?',
+  'bulk.mineConfirmTitle': '¿Extraer contactos de {count} sitios?',
   'bulk.selectAll': 'Seleccionar los {count}',
   'bulk.selectAllCapped':
     'Se seleccionaron las primeras {count} filas: reduce los filtros para seleccionar más.',
@@ -26,7 +26,7 @@ export const es: Dict = {
   // ===== Cerrar con trabajo en marcha =====
   'close.title': 'Hay una tarea en ejecución',
   'close.jobRunning': 'Cerrar ahora interrumpe la tarea que está desplazando el mapa.',
-  'close.emailMining': 'La extracción de correos sigue en marcha.',
+  'close.emailMining': 'La extracción de contactos sigue en marcha.',
   'close.hint':
     'Las filas recopiladas ya están guardadas. «Pausar y salir» detiene la tarea en una celda reanudable: retómala desde la lista de tareas al volver a abrir.',
   'close.pauseAndExit': 'Pausar y salir',
@@ -43,8 +43,18 @@ export const es: Dict = {
   'common.save': 'Guardar',
   'common.undo': 'Deshacer',
 
+  // ===== Mined contacts (M7) =====
+  'contacts.status.found': 'Correos encontrados',
+  'contacts.status.noneFound': 'Extraído, sin correo',
+  'contacts.status.blocked': 'Bloqueado por el sitio',
+  'contacts.status.error': 'Error al extraer',
+  'contacts.status.unmined': 'Sin extraer todavía',
+
   // ===== Detail drawer =====
   'detail.address': 'Dirección',
+  'detail.contactsTitle': 'Contactos (extraídos)',
+  'detail.emailSource': 'Página de origen',
+  'detail.minedAt': 'Extraído',
   'detail.enrichedTitle': 'Detalles enriquecidos (Tier-2)',
   'detail.plusCode': 'Plus Code',
   'detail.description': 'Descripción',
@@ -107,6 +117,9 @@ export const es: Dict = {
 
   // ===== Filter bar =====
   'filters.clear': 'Quitar filtros',
+  'filters.open': 'Filtros',
+  'filters.sheetTitle': 'Filtros',
+  'filters.apply': 'Listo',
   'filters.onlyNew': 'Solo nuevas desde la última exportación',
   'filters.contactAll': 'Todos los contactos',
   'filters.contactBoth': 'Teléfono + web',
@@ -271,6 +284,7 @@ export const es: Dict = {
   'header.diagnostics': 'Diagnósticos',
   'header.grid': 'Nueva tarea',
   'header.help': 'Atajos de teclado',
+  'header.more': 'Más',
   'header.settings': 'Ajustes',
   'header.statusCollecting': 'Recolectando',
   'header.statusIdle': 'Inactivo',
@@ -437,6 +451,7 @@ export const es: Dict = {
   'table.ownerName': 'Propietario',
   'table.closed': 'Cerrado',
   'table.columns': 'Columnas',
+  'table.contact': 'Contactos',
   'table.copyAddress': 'Copiar dirección',
   'table.copyPhone': 'Copiar teléfono',
   'table.email': 'Correo',
@@ -455,7 +470,7 @@ export const es: Dict = {
   'table.exportSaveAsJsonl': 'Guardar como JSONL…',
   'table.exportSelected': 'Exportar {count} seleccionados',
   'table.locate': 'Localizar en el mapa',
-  'table.mineEmails': 'Extraer correos',
+  'table.mineEmails': 'Extraer contactos',
   'table.mineEmailsForce': 'Volver a extraer',
   'table.mineEmailsHint':
     'Visita los sitios web de las filas seleccionadas —o de todo el conjunto filtrado— para recolectar correos y perfiles sociales',
@@ -510,8 +525,8 @@ export const es: Dict = {
   'toast.emailMineCancelled': 'Extracción cancelada ({done}/{total})',
   'toast.emailMineDone':
     'Extracción terminada: {found} de {done} sitios tienen correo ({total} en total)',
-  'toast.emailMineFailed': 'La extracción de correos falló: {error}',
-  'toast.emailMineRunning': 'La extracción de correos ya está en curso',
+  'toast.emailMineFailed': 'La extracción de contactos falló: {error}',
+  'toast.emailMineRunning': 'La extracción ya está en curso',
   'toast.emailNothingToMine': 'No hay filas con sitio web en este ámbito',
   'toast.emailAllMinedTitle': 'Estos {count} negocios ya se extrajeron',
   'toast.emailAllMinedBody':
@@ -564,4 +579,64 @@ export const es: Dict = {
   'update.checking': 'Buscando…',
   'update.currentVersion': 'Versión actual',
   'update.upToDate': 'Ya tienes la última versión (v{version})',
+
+  // ===== Verificación de correo (G-04) =====
+  'table.verifyEmails': 'Verificar correos',
+  'table.verifyEmailsHint':
+    'Comprueba la entregabilidad con reglas locales y DNS (MX). No se envía ningún correo.',
+  'table.verifyingProgress': 'Verificando {done}/{total}',
+  'table.verifyCancelHint': 'Haz clic para detener',
+  'table.verifyColumn': 'Estado del correo',
+  'table.verifyNone': 'Sin verificar',
+  'table.verifyStale': 'Obsoleto',
+  'table.verifyBlockedByMining':
+    'La extracción de contactos está en marcha: verifica cuando termine',
+  'table.mineBlockedByVerify':
+    'La verificación de correos está en marcha: extrae cuando termine',
+  'verify.status.valid': 'Válido',
+  'verify.status.risky': 'Con riesgo',
+  'verify.status.invalid': 'No válido',
+  'verify.status.unknown': 'Desconocido',
+  'verify.status.error': 'Error de consulta',
+  'verify.status.unverified': 'Sin verificar',
+  'verify.flag.syntax': 'formato no válido',
+  'verify.flag.ip_domain': 'dominio IP',
+  'verify.flag.role': 'buzón genérico',
+  'verify.flag.free_mail': 'correo gratuito',
+  'verify.flag.typo': 'posible errata',
+  'verify.flag.non_ascii': 'no ASCII',
+  'verify.flag.disposable': 'desechable',
+  'verify.flag.nxdomain': 'dominio inexistente',
+  'verify.flag.no_mx': 'sin servidor de correo',
+  'verify.flag.implicit_mx': 'MX implícito',
+  'verify.flag.null_mx': 'rechaza correo',
+  'verify.flag.same_domain': 'mismo dominio',
+  'toast.verifyPlanTitle': '¿Verificar {count} direcciones de correo?',
+  'toast.verifyPlanBody':
+    '{rows} comercios · {addresses} direcciones · {cached} en caché · {pending} por consultar. Solo se envían los dominios al resolutor DNS.',
+  'toast.verifyNothingNoEmails':
+    'Estos comercios aún no tienen correo: extrae los contactos primero.',
+  'toast.verifyAllFreshTitle': 'Todas las direcciones siguen vigentes',
+  'toast.verifyAllFreshBody':
+    'Todas las direcciones se verificaron hace poco. ¿Volver a comprobarlas?',
+  'toast.verifyForce': 'Volver a verificar',
+  'toast.verifyRunning': 'La verificación ya está en marcha',
+  'toast.verifyDone':
+    'Verificación terminada: {valid} válidos · {risky} con riesgo · {invalid} no válidos · {unknown} desconocidos · {error} fallidos',
+  'toast.verifyDoneWithErrors':
+    'Verificación terminada con {error} consulta(s) fallida(s): reintenta para completarlas',
+  'toast.verifyCancelled': 'Verificación detenida: {done}/{total} hechas',
+  'toast.verifyFatal': 'La verificación falló: {error}',
+  'toast.verifyTooMany':
+    'Demasiadas direcciones (límite {limit}): acota el filtro',
+  'toast.verifyMiningRunning':
+    'La extracción de contactos está en marcha: espera a que termine',
+  'toast.mineVerifyRunning':
+    'La verificación de correos está en marcha: espera a que termine',
+  'filters.verifyAll': 'Cualquier estado',
+  'filters.verifyValid': 'Solo válidos',
+  'filters.verifyUsable': 'Enviables (válidos o con riesgo)',
+  'filters.verifyInvalid': 'No válidos',
+  'filters.verifyUnverified': 'Sin verificar',
+  'close.emailVerifying': 'La verificación de correos sigue en marcha.',
 };

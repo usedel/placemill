@@ -3,6 +3,7 @@ import { Alert, App, Button, Collapse, Input, InputNumber, Modal, Space, Tooltip
 import { AimOutlined, PlayCircleOutlined } from '@ant-design/icons';
 import { invoke } from '@tauri-apps/api/core';
 import { useT } from '../i18n';
+import HintText from './ui/HintText';
 import type { Job } from '../types/job';
 
 interface MapView {
@@ -360,7 +361,7 @@ export default function GridDialog({
       }
     >
       <Space direction="vertical" size={10} style={{ width: '100%' }}>
-        <div className="grid-note">{t('grid.subtitle')}</div>
+        <HintText>{t('grid.subtitle')}</HintText>
 
         <label className="grid-field">
           <span>{t('grid.keywords')}</span>
@@ -447,7 +448,7 @@ export default function GridDialog({
           </label>
         </Space>
 
-        <div className="grid-note">{t('grid.cellHint')}</div>
+        <HintText>{t('grid.cellHint')}</HintText>
 
         <Collapse
           size="small"
@@ -469,7 +470,7 @@ export default function GridDialog({
                       style={{ width: 120 }}
                     />
                   </label>
-                  <div className="grid-note">{t('grid.splitHint')}</div>
+                  <HintText>{t('grid.splitHint')}</HintText>
                 </>
               ),
             },

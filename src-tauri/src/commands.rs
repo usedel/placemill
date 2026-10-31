@@ -69,6 +69,86 @@ fn clear_mining_slot(state: &AppState) {
     }
 }
 
+fn clear_verify_slot(state: &AppState) {
+    if let Ok(mut slot) = state.email_verifying.lock() {
+        *slot = None;
+    }
+}
+
+/// Which of the two mutually exclusive contact jobs a caller wants to start.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ContactJob {
+    Mining,
+    Verification,
+}
+
+/// Claim one contact slot, refusing while the other job runs — atomically.
+///
+/// "Verification saw the mining slot empty, so it starts" plus "mining saw the
+/// verification slot empty, so it starts" is a textbook check-then-act: both
+/// commands run on their own async thread, both pass the check, both install
+/// their flag, and the two progress bars spin at once. The fix is one critical
+/// section around *check and claim*, which is what `contact_lock` is for.
+///
+/// Takes the three mutexes rather than `&AppState` so the race can be tested
+/// without building the whole application state.
+fn claim_exclusive(
+    lock: &std::sync::Mutex<()>,
+    mining: &std::sync::Mutex<Option<Arc<AtomicBool>>>,
+    verifying: &std::sync::Mutex<Option<Arc<AtomicBool>>>,
+    want: ContactJob,
+) -> Result<Arc<AtomicBool>, String> {
+    let _critical = lock
+        .lock()
+        .map_err(|_| "contact state poisoned".to_string())?;
+    let mining_busy = mining
+        .lock()
+        .map(|slot| slot.is_some())
+        .unwrap_or(false);
+    let verifying_busy = verifying
+        .lock()
+        .map(|slot| slot.is_some())
+        .unwrap_or(false);
+
+    let cancel = Arc::new(AtomicBool::new(false));
+    match want {
+        ContactJob::Mining => {
+            if mining_busy {
+                return Err("already-running".to_string());
+            }
+            if verifying_busy {
+                return Err("verify_running".to_string());
+            }
+            let mut slot = mining
+                .lock()
+                .map_err(|_| "mining state poisoned".to_string())?;
+            *slot = Some(cancel.clone());
+        }
+        ContactJob::Verification => {
+            if verifying_busy {
+                return Err("already-running".to_string());
+            }
+            if mining_busy {
+                return Err("mining_running".to_string());
+            }
+            let mut slot = verifying
+                .lock()
+                .map_err(|_| "verify state poisoned".to_string())?;
+            *slot = Some(cancel.clone());
+        }
+    }
+    Ok(cancel)
+}
+
+fn claim_contact_slot(state: &AppState, want: ContactJob) -> Result<Arc<AtomicBool>, String> {
+    claim_exclusive(
+        &state.contact_lock,
+        &state.email_mining,
+        &state.email_verifying,
+        want,
+    )
+}
+
 fn clear_enrich_slot(state: &AppState) {
     if let Ok(mut slot) = state.enrich_job.lock() {
         *slot = None;
@@ -452,17 +532,9 @@ pub async fn start_email_mining(
     // Reserve the single-flight slot BEFORE any other work: two rapid
     // invocations run on separate runtime threads and can interleave between
     // sync statements, so a check-then-later-set pattern would let both pass.
-    let cancel = Arc::new(AtomicBool::new(false));
-    {
-        let mut slot = state
-            .email_mining
-            .lock()
-            .map_err(|_| "mining state poisoned".to_string())?;
-        if slot.is_some() {
-            return Err("already-running".to_string());
-        }
-        *slot = Some(cancel.clone());
-    }
+    // Since G-04 the claim also excludes a running verification, in the same
+    // critical section (see `claim_exclusive`).
+    let cancel = claim_contact_slot(state.inner(), ContactJob::Mining)?;
     // The guard owns the slot from here on: every `?` below, the empty-target
     // return and the spawned worker all release it on the way out (R-01).
     let guard = SlotGuard::new(&app, clear_mining_slot);
@@ -599,6 +671,237 @@ pub async fn cancel_email_mining(state: tauri::State<'_, AppState>) -> Result<()
 }
 
 // ---------------------------------------------------------------------------
+// Email verification (G-04)
+// ---------------------------------------------------------------------------
+
+/// Scope of one verification run — the same two scopes mining and export use.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EmailVerifyRequest {
+    #[serde(default)]
+    pub place_ids: Vec<String>,
+    pub filter: Option<BusinessQueryRequest>,
+    /// Re-check addresses that are still fresh. Default keeps the run cheap:
+    /// anything with an unexpired verdict is skipped.
+    #[serde(default)]
+    pub force: bool,
+}
+
+/// What a run would do, decided in Rust so the panel never carries a second
+/// copy of a threshold (D10).
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VerifyPlan {
+    pub rows: u64,
+    pub addresses: u64,
+    pub cached: u64,
+    pub pending: u64,
+    pub local_invalid: u64,
+    pub lookups: u64,
+    pub too_many: bool,
+    pub limit: u64,
+    /// The backend decides whether the UI must confirm: filter scope and
+    /// `pending` above `CONFIRM_VERIFY_ADDRESSES`. Keeping the threshold in
+    /// Rust means the panel never carries a second copy of it.
+    pub confirm: bool,
+}
+
+/// The plan plus the addresses it was computed from — `start` needs both, and
+/// recomputing the scope between the two would let them disagree.
+struct VerifyTarget {
+    plan: VerifyPlan,
+    addresses: Vec<String>,
+}
+
+fn verify_rules(state: &AppState) -> crate::remote_config::VerifyRules {
+    state
+        .remote_field_map
+        .lock()
+        .ok()
+        .and_then(|guard| guard.as_ref().map(|remote| remote.verify_rules.clone()))
+        .unwrap_or_default()
+}
+
+/// Read the scope and derive the plan. Read-only: no slot, no network.
+fn verify_target(state: &AppState, request: &EmailVerifyRequest) -> Result<VerifyTarget, String> {
+    use crate::email_verify::{CONFIRM_VERIFY_ADDRESSES, MAX_RUN_ADDRESSES};
+
+    let ids = (!request.place_ids.is_empty()).then_some(request.place_ids.as_slice());
+    let filter = request
+        .filter
+        .as_ref()
+        .filter(|_| ids.is_none())
+        .map(|request| request.filter());
+    let rules = verify_rules(state);
+
+    // A read-only connection: scanning 20k addresses out of JSON arrays is fast
+    // but there is no reason for the collector or the panel to queue behind it.
+    let conn = db::open_read_connection(std::path::Path::new(&state.db_path))
+        .map_err(|error| format!("verify_scope: {}", error))?;
+    let now = now_ms() as i64;
+    let scope = db::verify_scope(&conn, ids, filter.as_ref(), MAX_RUN_ADDRESSES, now)
+        .map_err(|error| error.to_string())?;
+
+    if scope.addresses.len() as u64 > MAX_RUN_ADDRESSES {
+        return Ok(VerifyTarget {
+            plan: VerifyPlan {
+                rows: scope.rows,
+                addresses: scope.addresses_total,
+                cached: 0,
+                pending: 0,
+                local_invalid: 0,
+                lookups: 0,
+                too_many: true,
+                limit: MAX_RUN_ADDRESSES,
+                confirm: false,
+            },
+            addresses: Vec::new(),
+        });
+    }
+
+    let fresh: std::collections::HashSet<String> = if request.force {
+        std::collections::HashSet::new()
+    } else {
+        db::fresh_verifications(&conn, &scope.addresses, now)
+            .map_err(|error| error.to_string())?
+            .into_iter()
+            .map(|(address, _)| address)
+            .collect()
+    };
+    let pending: Vec<String> = scope
+        .addresses
+        .iter()
+        .filter(|address| !fresh.contains(*address))
+        .cloned()
+        .collect();
+
+    let mut local_invalid = 0u64;
+    let mut domains: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for address in &pending {
+        let analysis = crate::email_verify::analyze_with(address, &rules.disposable_domains);
+        if analysis.settled.is_some() {
+            local_invalid += 1;
+        } else if !analysis.ascii_domain.is_empty() {
+            domains.insert(analysis.ascii_domain);
+        }
+    }
+    let domain_list: Vec<String> = domains.into_iter().collect();
+    let lookups = if request.force || domain_list.is_empty() {
+        domain_list.len() as u64
+    } else {
+        let cached = db::domain_checks(&conn, &domain_list).map_err(|error| error.to_string())?;
+        let fresh_domains = cached.iter().filter(|check| check.expires_at > now).count() as u64;
+        (domain_list.len() as u64).saturating_sub(fresh_domains)
+    };
+
+    Ok(VerifyTarget {
+        plan: VerifyPlan {
+            rows: scope.rows,
+            addresses: scope.addresses_total,
+            cached: scope.cached,
+            pending: pending.len() as u64,
+            local_invalid,
+            lookups,
+            too_many: false,
+            limit: MAX_RUN_ADDRESSES,
+            // A selection is an explicit act; a filter can be "everything".
+            confirm: ids.is_none() && pending.len() as u64 > CONFIRM_VERIFY_ADDRESSES,
+        },
+        addresses: scope.addresses,
+    })
+}
+
+/// Preflight: what would a run over this scope do? Read-only, no slot.
+#[tauri::command(async)]
+pub fn verify_email_plan(
+    state: tauri::State<'_, AppState>,
+    request: EmailVerifyRequest,
+) -> Result<VerifyPlan, String> {
+    Ok(verify_target(state.inner(), &request)?.plan)
+}
+
+/// Start a verification run: claim the slot, enumerate the scope, spawn.
+///
+/// The returned plan is the one this run actually accepted — the panel uses it
+/// to label the progress bar and must not recompute it.
+#[tauri::command(async)]
+pub async fn start_email_verification(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+    request: EmailVerifyRequest,
+) -> Result<VerifyPlan, String> {
+    let cancel = claim_contact_slot(state.inner(), ContactJob::Verification)?;
+    // The guard owns the slot from here on: every `?` below releases it.
+    let guard = SlotGuard::new(&app, clear_verify_slot);
+
+    let target = verify_target(state.inner(), &request)?;
+    if target.plan.too_many {
+        return Err("too_many".to_string());
+    }
+    if target.addresses.is_empty() {
+        return Err("nothing_to_verify:no_emails".to_string());
+    }
+    if target.plan.pending == 0 && !request.force {
+        return Err("nothing_to_verify:already_verified".to_string());
+    }
+
+    let rules = verify_rules(state.inner());
+    let run = crate::email_verify::VerifyRun {
+        addresses: target.addresses,
+        endpoints: crate::email_verify::resolve_endpoints(&rules.doh_endpoints),
+        disposable_extra: rules.disposable_domains,
+        force: request.force,
+        epoch: state.verification_epoch.load(Ordering::SeqCst),
+    };
+    let plan = target.plan;
+
+    let worker_app = app.clone();
+    let worker_cancel = cancel.clone();
+    std::thread::spawn(move || {
+        let _slot_guard = guard;
+        // A panic must not leave the single-flight slot set until restart.
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            crate::email_verify::run_verification(&worker_app, run, &worker_cancel)
+        }));
+        if let Err(panic) = outcome {
+            let reason = panic
+                .downcast_ref::<&str>()
+                .map(|text| text.to_string())
+                .or_else(|| panic.downcast_ref::<String>().cloned())
+                .unwrap_or_else(|| "unknown panic".to_string());
+            log_error!("verification engine panicked: {}", reason);
+            let _ = worker_app.emit(
+                "email:verify:done",
+                serde_json::json!({
+                    "total": 0, "done": 0, "cached": 0, "lookups": 0,
+                    "valid": 0, "risky": 0, "invalid": 0, "unknown": 0, "error": 0,
+                    "cancelled": true, "reason": "", "fatal": "panic",
+                }),
+            );
+        }
+    });
+
+    log_info!(
+        "verification started: {} address(es), {} pending, {} lookups",
+        plan.addresses,
+        plan.pending,
+        plan.lookups
+    );
+    Ok(plan)
+}
+
+/// Ask the running verification to stop. No run = a harmless no-op.
+#[tauri::command]
+pub async fn cancel_email_verification(state: tauri::State<'_, AppState>) -> Result<(), String> {
+    if let Ok(slot) = state.email_verifying.lock() {
+        if let Some(cancel) = slot.as_ref() {
+            cancel.store(true, Ordering::Relaxed);
+        }
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // Paged browsing (M6)
 // ---------------------------------------------------------------------------
 
@@ -625,6 +928,10 @@ pub struct BusinessQueryRequest {
     /// Epoch milliseconds; `0` (the default) means no time dimension.
     #[serde(default)]
     pub collected_since: i64,
+    /// G-04: `all` | `valid` | `usable` | `invalid` | `unverified`. Unknown
+    /// values mean "no filter", like every other dimension.
+    #[serde(default)]
+    pub verify: String,
     #[serde(default)]
     pub sort: String,
     #[serde(default)]
@@ -646,6 +953,7 @@ impl BusinessQueryRequest {
             unassigned: self.unassigned,
             job_seen_since: self.job_seen_since,
             collected_since: self.collected_since,
+            verify: self.verify.clone(),
         }
     }
 
@@ -1420,7 +1728,7 @@ struct ExportColumn {
     numeric: bool,
 }
 
-const EXPORT_COLUMNS: [ExportColumn; 32] = [
+const EXPORT_COLUMNS: [ExportColumn; 34] = [
     ExportColumn { key: "name", header: "Name", table_key: Some("name"), numeric: false },
     ExportColumn { key: "address", header: "Address", table_key: Some("address"), numeric: false },
     ExportColumn { key: "phone", header: "Phone", table_key: Some("phone"), numeric: false },
@@ -1455,6 +1763,12 @@ const EXPORT_COLUMNS: [ExportColumn; 32] = [
     ExportColumn { key: "description", header: "Description", table_key: None, numeric: false },
     ExportColumn { key: "reviews_per_rating", header: "Rating Distribution", table_key: None, numeric: false },
     ExportColumn { key: "photos", header: "Photos", table_key: None, numeric: false },
+    // G-04: verification. Appended for the same R-03 reason as every other
+    // addition — a CRM mapping must not shift under an existing column. Both
+    // hang off the `email_verify` table column, so hiding the column drops the
+    // pair together ("hide what you see hidden").
+    ExportColumn { key: "email_verify", header: "Email Status", table_key: Some("email_verify"), numeric: false },
+    ExportColumn { key: "email_verify_detail", header: "Email Verification", table_key: Some("email_verify"), numeric: false },
 ];
 
 /// The columns an export keeps, given the panel's visible table keys.
@@ -1594,15 +1908,78 @@ fn export_value(b: &Business, key: &str) -> String {
     }
 }
 
-/// One export row as strings, in `EXPORT_COLUMNS` order (R-03). The full 32 —
+/// One export column's value, with the two verification columns filled from
+/// `cell`.
+///
+/// `export_value` stays a pure function of the row: the verification verdict
+/// lives in a different table, keyed by address, and threading a database
+/// handle through the pure value mapper would make every other column pay for
+/// it. This wrapper is the only place that knows the two new keys exist.
+fn export_value_with_verify(b: &Business, key: &str, cell: &crate::email_verify::VerifyCell) -> String {
+    match key {
+        "email_verify" => cell.summary.clone(),
+        "email_verify_detail" => cell.detail.clone(),
+        _ => export_value(b, key),
+    }
+}
+
+/// Per-row verification cells for one export (G-04 §8.3).
+///
+/// Reads through a **second, read-only connection** (P2-12): the export must
+/// never hold `state.db` while writing a 100k-row file, or the panel and the
+/// collector queue behind it. The lookup is a primary-key equality over at most
+/// five addresses per row — tens to hundreds of milliseconds for a whole file,
+/// well under one Excel write.
+struct VerifyLookup {
+    conn: Option<rusqlite::Connection>,
+    now: i64,
+}
+
+impl VerifyLookup {
+    fn new(state: &AppState) -> Self {
+        let conn = db::open_read_connection(std::path::Path::new(&state.db_path)).ok();
+        if conn.is_none() {
+            log_warn!("export: verification cache unavailable; the two email columns stay empty");
+        }
+        VerifyLookup {
+            conn,
+            now: now_ms() as i64,
+        }
+    }
+
+    fn cell(&self, b: &Business) -> crate::email_verify::VerifyCell {
+        let Some(conn) = self.conn.as_ref() else {
+            return crate::email_verify::VerifyCell::default();
+        };
+        let addresses = crate::email_verify::normalize_all(&b.emails);
+        if addresses.is_empty() {
+            return crate::email_verify::VerifyCell::default();
+        }
+        match db::verification_records(conn, &addresses) {
+            Ok(records) => {
+                let map: std::collections::HashMap<String, db::AddressRecord> = records
+                    .into_iter()
+                    .map(|record| (record.address.clone(), record))
+                    .collect();
+                crate::email_verify::export_cell(&addresses, &map, self.now)
+            }
+            Err(error) => {
+                log_warn!("export: reading a verification row failed: {}", error);
+                crate::email_verify::VerifyCell::default()
+            }
+        }
+    }
+}
+
+/// One export row as strings, in `EXPORT_COLUMNS` order (R-03). The full 34 —
 /// visibility filtering happens on the resolved column list, not here.
 /// Test-only today: the writers resolve columns individually, but the layout
 /// assertion stays the cheapest whole-row check we have.
 #[cfg(test)]
-fn export_cells(b: &Business) -> Vec<String> {
+fn export_cells(b: &Business, cell: &crate::email_verify::VerifyCell) -> Vec<String> {
     EXPORT_COLUMNS
         .iter()
-        .map(|column| export_value(b, column.key))
+        .map(|column| export_value_with_verify(b, column.key, cell))
         .collect()
 }
 
@@ -1628,7 +2005,11 @@ fn collected_at_rfc3339(ms: u64) -> String {
 /// One export column as a JSON value (the JSON/JSONL exports keep types:
 /// numbers stay numbers, lists stay lists, `about`/`open_hours` stay
 /// structured — an agent reads the file without string surgery).
-fn export_json_value(b: &Business, column: &ExportColumn) -> serde_json::Value {
+fn export_json_value(
+    b: &Business,
+    column: &ExportColumn,
+    cell: &crate::email_verify::VerifyCell,
+) -> serde_json::Value {
     match column.key {
         "rating" => serde_json::json!(b.rating),
         "reviews_total" => serde_json::json!(b.reviews_total),
@@ -1645,7 +2026,7 @@ fn export_json_value(b: &Business, column: &ExportColumn) -> serde_json::Value {
         "reviews_per_rating" => serde_json::json!(b.reviews_per_rating),
         "photos" => serde_json::json!(b.photos),
         "collected_at" => serde_json::json!(collected_at_rfc3339(b.collected_at)),
-        other => serde_json::json!(export_value(b, other)),
+        other => serde_json::json!(export_value_with_verify(b, other, cell)),
     }
 }
 
@@ -1656,12 +2037,13 @@ fn export_row_object(
     b: &Business,
     columns: &[&'static ExportColumn],
     preset: &str,
+    cell: &crate::email_verify::VerifyCell,
 ) -> serde_json::Map<String, serde_json::Value> {
     let mut out = serde_json::Map::with_capacity(columns.len());
     for column in columns {
         out.insert(
             column_json_key(column, preset).to_string(),
-            export_json_value(b, column),
+            export_json_value(b, column, cell),
         );
     }
     out
@@ -1780,6 +2162,7 @@ pub async fn export_csv(
     // the async runtime the panel's commands share.
     let temp_path = sibling_temp_path(&file_path);
     let write_file = file_path.clone();
+    let verify = VerifyLookup::new(state.inner());
     let count = tauri::async_runtime::spawn_blocking(move || {
         let write_result: Result<usize, String> = (|| {
             // The BOM is what makes Excel read the file as UTF-8 instead of the ANSI code
@@ -1794,9 +2177,10 @@ pub async fn export_csv(
             let mut wtr = csv::Writer::from_writer(file);
             wtr.write_record(&headers).map_err(|e| e.to_string())?;
             let count = source.for_each(|b| {
+                let cell = verify.cell(b);
                 let cells: Vec<String> = columns
                     .iter()
-                    .map(|column| csv_cell(&export_value(b, column.key)))
+                    .map(|column| csv_cell(&export_value_with_verify(b, column.key, &cell)))
                     .collect();
                 wtr.write_record(cells.iter().map(String::as_str))
                     .map_err(|e| e.to_string())
@@ -2190,6 +2574,7 @@ pub async fn export_excel(
     // sheet is CPU-bound and must not occupy an async-runtime worker.
     let temp_path = sibling_temp_path(&file_path);
     let write_file = file_path.clone();
+    let verify = VerifyLookup::new(state.inner());
     let (count, failed_cells, failed_rows, first_error) =
         tauri::async_runtime::spawn_blocking(move || {
             let mut workbook = Workbook::new();
@@ -2230,6 +2615,7 @@ pub async fn export_excel(
                         let r = (rows_written + 1) as u32;
                         rows_written += 1;
                         let mut row_failed = false;
+                        let verify_cell = verify.cell(b);
                         for (col, column) in columns.iter().enumerate() {
                             // The numeric columns are the four values the app
                             // produces, not scraped text — `write_number` keeps
@@ -2238,7 +2624,7 @@ pub async fn export_excel(
                             // Excel never re-evaluates, so the CSV
                             // formula-injection escaping does not apply here
                             // (R-03).
-                            let cell = export_value(b, column.key);
+                            let cell = export_value_with_verify(b, column.key, &verify_cell);
                             let written = if column.numeric {
                                 match cell.parse::<f64>() {
                                     Ok(number) => {
@@ -2273,7 +2659,7 @@ pub async fn export_excel(
                     // Column widths travel with the column key, not the
                     // position: after the hiddenColumns linkage drops columns,
                     // the fixed indices would dress the wrong headers.
-                    const COLUMN_WIDTHS: [(&str, f64); 10] = [
+                    const COLUMN_WIDTHS: [(&str, f64); 12] = [
                         ("name", 32.0),
                         ("address", 46.0),
                         ("phone", 20.0),
@@ -2284,6 +2670,8 @@ pub async fn export_excel(
                         ("emails", 28.0),
                         ("socials", 28.0),
                         ("email_source_url", 30.0),
+                        ("email_verify", 14.0),
+                        ("email_verify_detail", 48.0),
                     ];
                     for (col, column) in columns.iter().enumerate() {
                         if let Some((_, width)) =
@@ -2435,6 +2823,7 @@ pub async fn export_json(
     let temp_path = sibling_temp_path(&file_path);
     let write_file = file_path.clone();
     let preset = settings.export_preset.clone();
+    let verify = VerifyLookup::new(state.inner());
     let count = tauri::async_runtime::spawn_blocking(move || {
         let write_result: Result<usize, String> = (|| {
             use serde::ser::{SerializeSeq, Serializer};
@@ -2447,7 +2836,8 @@ pub async fn export_json(
                 .serialize_seq(Some(expected))
                 .map_err(|e| e.to_string())?;
             let count = source.for_each(|b| {
-                let object = export_row_object(b, &columns, &preset);
+                let cell = verify.cell(b);
+                let object = export_row_object(b, &columns, &preset, &cell);
                 seq.serialize_element(&object).map_err(|e| e.to_string())
             })?;
             seq.end().map_err(|e| e.to_string())?;
@@ -2523,13 +2913,15 @@ pub async fn export_jsonl(
     let temp_path = sibling_temp_path(&file_path);
     let write_file = file_path.clone();
     let preset = settings.export_preset.clone();
+    let verify = VerifyLookup::new(state.inner());
     let count = tauri::async_runtime::spawn_blocking(move || {
         let write_result: Result<usize, String> = (|| {
             use std::io::Write as _;
             let file = std::fs::File::create(&temp_path).map_err(|e| e.to_string())?;
             let mut writer = std::io::BufWriter::new(file);
             let count = source.for_each(|b| {
-                let object = export_row_object(b, &columns, &preset);
+                let cell = verify.cell(b);
+                let object = export_row_object(b, &columns, &preset, &cell);
                 serde_json::to_writer(&mut writer, &object).map_err(|e| e.to_string())?;
                 writer.write_all(b"\n").map_err(|e| e.to_string())
             })?;
@@ -2562,9 +2954,10 @@ pub async fn export_jsonl(
 }
 
 /// How long a clear stays reversible (UI-02b). The panel's toast offers the
-/// button for the same 10 s; once it lapses the snapshot is dropped rather
-/// than kept — a later undo must not resurrect rows the user has moved on from.
-const UNDO_CLEAR_WINDOW: std::time::Duration = std::time::Duration::from_secs(10);
+/// button for exactly this long (`duration` in its `data:cleared` listener);
+/// once it lapses the snapshot is dropped rather than kept — a later undo must
+/// not resurrect rows the user has moved on from.
+const UNDO_CLEAR_WINDOW: std::time::Duration = std::time::Duration::from_secs(6);
 
 /// Clear all data (memory + SQLite + counters) and stop collecting.
 ///
@@ -2594,6 +2987,15 @@ pub fn clear_data(
         .fetch_add(1, Ordering::AcqRel)
         .wrapping_add(1);
     log_info!("clear: collection epoch -> {}", epoch);
+    // G-04: the verifier writes address verdicts that describe rows this clear
+    // is about to delete, and a batch may already be queued on the `db` lock.
+    // The epoch is what makes "cleared" mean "cleared" — the worker compares it
+    // inside the lock, right before its transaction.
+    let verify_epoch = state
+        .verification_epoch
+        .fetch_add(1, Ordering::AcqRel)
+        .wrapping_add(1);
+    log_info!("clear: verification epoch -> {}", verify_epoch);
     if let Err(error) = apply_listening(&app, state.inner(), false) {
         log_warn!("clear_data: could not stop the collector switch: {}", error);
     }
@@ -2619,6 +3021,14 @@ pub fn clear_data(
         let queued = db::pause_queued_jobs(&conn).map_err(|e| e.to_string())?;
         let captured = crate::db::snapshot_for_clear(&conn)
             .map_err(|e| format!("Failed to snapshot before clearing: {}", e))?;
+        // D9: the address caches describe the rows that just went away, so they
+        // go with them — a "clear" that leaves a searchable list of addresses
+        // behind is a privacy bug, not a cache. Same lock region as the business
+        // tables on purpose. A failure here is logged and ignored: the rows are
+        // already gone, and failing the whole command now would be worse.
+        if let Err(error) = crate::db::clear_verification_cache(&conn) {
+            log_warn!("clear_data: could not drop the verification cache: {}", error);
+        }
         (paused, queued, captured)
     };
     if queued > 0 {
@@ -2639,6 +3049,13 @@ pub fn clear_data(
     // A reviews fetch needs no flag: it owns no rows of its own (the reviews
     // table is not part of the clear) and its sequence ends by itself.
     if let Ok(slot) = state.email_mining.lock() {
+        if let Some(cancel) = slot.as_ref() {
+            cancel.store(true, Ordering::Relaxed);
+        }
+    }
+    // Same for the verifier: it writes only the two cache tables, but those are
+    // being emptied in this very command.
+    if let Ok(slot) = state.email_verifying.lock() {
         if let Some(cancel) = slot.as_ref() {
             cancel.store(true, Ordering::Relaxed);
         }
@@ -4813,7 +5230,7 @@ mod tests {
 
     #[test]
     fn export_cells_match_the_header_layout() {
-        let cells = export_cells(&business());
+        let cells = export_cells(&business(), &crate::email_verify::VerifyCell::default());
         assert_eq!(cells.len(), EXPORT_COLUMNS.len());
         assert_eq!(cells[0], "Downtown Dental");
         assert_eq!(cells[2], "+1 415-555-0123");
@@ -4836,7 +5253,7 @@ mod tests {
 
         let visible: Vec<String> = vec![
             "name", "phone", "rating", "reviews", "task", "collectedAt", "website", "types",
-            "emails", "socials", "open_hours", "owner_name", "actions",
+            "emails", "socials", "open_hours", "owner_name", "email_verify", "actions",
         ]
         .into_iter()
         .map(String::from)
@@ -4858,6 +5275,10 @@ mod tests {
         // column by accident.
         assert!(keys.contains(&"name"));
         assert!(keys.contains(&"open_hours"));
+        // G-04: both verification columns hang off the one `email_verify` table
+        // column, so they appear and disappear together.
+        assert!(keys.contains(&"email_verify"));
+        assert!(keys.contains(&"email_verify_detail"));
         assert_eq!(keys.len(), EXPORT_COLUMNS.len() - 2);
     }
 
@@ -4900,7 +5321,7 @@ mod tests {
         }];
 
         let columns = resolve_export_columns(None);
-        let object = export_row_object(&row, &columns, "default");
+        let object = export_row_object(&row, &columns, "default", &crate::email_verify::VerifyCell::default());
         assert_eq!(object.get("name").and_then(|v| v.as_str()), Some("Downtown Dental"));
         assert_eq!(object.get("rating").and_then(|v| v.as_f64()), Some(4.5));
         assert_eq!(object.get("reviews_total").and_then(|v| v.as_u64()), Some(120));
@@ -4920,7 +5341,7 @@ mod tests {
         // RFC 3339 (UTC) for agents, not the local display form.
         assert!(object.get("collected_at").and_then(|v| v.as_str()).unwrap_or("").ends_with("Z"));
 
-        let hubspot = export_row_object(&row, &columns, "hubspot");
+        let hubspot = export_row_object(&row, &columns, "hubspot", &crate::email_verify::VerifyCell::default());
         assert!(hubspot.contains_key("domain"));
         assert!(hubspot.contains_key("zip"));
         assert!(!hubspot.contains_key("website"));
@@ -5071,7 +5492,7 @@ mod tests {
             },
         ];
 
-        let cells = export_cells(&row);
+        let cells = export_cells(&row, &crate::email_verify::VerifyCell::default());
         assert_eq!(cells.len(), EXPORT_COLUMNS.len());
         assert_eq!(cells[15], "281 Columbia Ave");
         assert_eq!(cells[16], "Los Angeles");
@@ -5206,5 +5627,83 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&target).expect("read"), "keep me");
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ===== G-04: contact slots and export columns =====
+
+    /// §4.3.1: two jobs that each check "the other slot is free" then claim
+    /// their own would both start. The critical section is what makes exactly
+    /// one win, and this test races the two claims for real.
+    #[test]
+    fn contact_slots_exclude_each_other_atomically() {
+        use std::sync::{Arc, Barrier, Mutex};
+
+        for _round in 0..50 {
+            let lock = Arc::new(Mutex::new(()));
+            let mining: Arc<Mutex<Option<Arc<AtomicBool>>>> = Arc::new(Mutex::new(None));
+            let verifying: Arc<Mutex<Option<Arc<AtomicBool>>>> = Arc::new(Mutex::new(None));
+            let barrier = Arc::new(Barrier::new(2));
+
+            let mut handles = Vec::new();
+            for want in [ContactJob::Mining, ContactJob::Verification] {
+                let lock = Arc::clone(&lock);
+                let mining = Arc::clone(&mining);
+                let verifying = Arc::clone(&verifying);
+                let barrier = Arc::clone(&barrier);
+                handles.push(std::thread::spawn(move || {
+                    barrier.wait();
+                    claim_exclusive(&lock, &mining, &verifying, want).is_ok()
+                }));
+            }
+            let winners = handles
+                .into_iter()
+                .map(|handle| handle.join().expect("join"))
+                .filter(|claimed| *claimed)
+                .count();
+            assert_eq!(winners, 1, "exactly one contact job may start");
+        }
+    }
+
+    #[test]
+    fn a_second_claim_reports_which_job_is_running() {
+        use std::sync::Mutex;
+
+        let lock = Mutex::new(());
+        let mining: Mutex<Option<Arc<AtomicBool>>> = Mutex::new(None);
+        let verifying: Mutex<Option<Arc<AtomicBool>>> = Mutex::new(None);
+
+        assert!(claim_exclusive(&lock, &mining, &verifying, ContactJob::Mining).is_ok());
+        assert_eq!(
+            claim_exclusive(&lock, &mining, &verifying, ContactJob::Mining).unwrap_err(),
+            "already-running"
+        );
+        assert_eq!(
+            claim_exclusive(&lock, &mining, &verifying, ContactJob::Verification).unwrap_err(),
+            "mining_running"
+        );
+
+        // Release the mining slot, take the verification one, and check the
+        // other direction reports the mirror-image code.
+        *mining.lock().expect("mining") = None;
+        assert!(claim_exclusive(&lock, &mining, &verifying, ContactJob::Verification).is_ok());
+        assert_eq!(
+            claim_exclusive(&lock, &mining, &verifying, ContactJob::Mining).unwrap_err(),
+            "verify_running"
+        );
+    }
+
+    /// R-03: the two verification columns are *appended*, so a user's existing
+    /// CRM mapping keeps pointing at the same field.
+    #[test]
+    fn export_columns_append_without_moving_existing() {
+        let keys: Vec<&str> = EXPORT_COLUMNS.iter().map(|column| column.key).collect();
+        assert_eq!(keys[0], "name");
+        assert_eq!(keys[1], "address");
+        assert_eq!(keys[12], "emails");
+        // The pre-G-04 tail is still the tail of the pre-G-04 columns.
+        let tail = &keys[keys.len() - 4..keys.len() - 2];
+        assert_eq!(tail, &["reviews_per_rating", "photos"]);
+        assert_eq!(keys[keys.len() - 2], "email_verify");
+        assert_eq!(keys[keys.len() - 1], "email_verify_detail");
     }
 }

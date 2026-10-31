@@ -524,6 +524,19 @@ fn discover_contact_pages(
     PageDoc::parse(html).contact_pages(base_url, keywords)
 }
 
+/// Mailboxes that belong to a role rather than a person.
+///
+/// One list, two consumers (G-04): the miner scores them up (a business's
+/// `info@` is the address you want), the verifier downgrades them to `risky`
+/// (nobody maintains `sales@` reliably). Keeping two copies is exactly the
+/// "change one, forget the other" bug this constant exists to prevent —
+/// widening the list therefore changes both behaviours on purpose.
+pub(crate) const ROLE_MAILBOXES: &[&str] = &[
+    "info", "contact", "hello", "office", "sales", "admin", "support", "team", "mail",
+    "enquiries", "inquiries", "billing", "accounts", "hr", "jobs", "careers", "privacy",
+    "press", "marketing", "webmaster",
+];
+
 /// Rank addresses: same-domain first, then role mailboxes, then anything not
 /// on the blocklist. The blocklist is a hard filter — one hit disqualifies.
 pub fn rank_emails(
@@ -551,11 +564,7 @@ pub fn rank_emails(
             score += 100;
         }
         let local = lowered.split('@').next().unwrap_or("");
-        if matches!(
-            local,
-            "info" | "contact" | "hello" | "office" | "sales" | "admin" | "support" | "team"
-                | "mail" | "enquiries" | "inquiries"
-        ) {
+        if ROLE_MAILBOXES.contains(&local) {
             score += 50;
         }
         scored.push((score, usize::MAX - position, lowered));
@@ -915,7 +924,12 @@ fn domain_key(url: &Url) -> String {
 /// one site's emails to all of them (see `group_by_domain` /
 /// `update_email_mining`). The embedded Public Suffix List, including its
 /// private section, is the only correct source for this boundary.
-fn registrable_domain(host: &str) -> String {
+///
+/// `pub(crate)` since G-04: the verifier's same-domain evidence compares the
+/// address domain against the row's website with the same boundary, and two
+/// eTLD+1 implementations would disagree on exactly the exotic suffixes this
+/// comment is about.
+pub(crate) fn registrable_domain(host: &str) -> String {
     let host = host.trim().trim_end_matches('.').to_lowercase();
     if host.is_empty() {
         return host;

@@ -82,6 +82,38 @@ export interface BusinessJobRef {
   timesSeen: number;
 }
 
+/**
+ * One address of a row, with its own verdict (G-04).
+ *
+ * `sameDomain` is row-level evidence — the same `info@foo.com` can belong to a
+ * business whose site is `bar.com` — so it is computed per row and never
+ * stored with the address.
+ */
+export interface AddressVerification {
+  address: string;
+  /** `valid` | `risky` | `invalid` | `unknown` | `error` | `unverified`. */
+  status: string;
+  /** Stable machine tokens (`role`, `typo`, `free_mail`, …) — translated in the UI. */
+  flags: string[];
+  /** Epoch ms; `0` when the address was never checked. */
+  checkedAt: number;
+  /** The verdict exists but has expired. */
+  stale: boolean;
+  sameDomain: boolean;
+}
+
+/** One row's aggregated verdict (G-04). Sidecar to `BusinessPage.rows`. */
+export interface BusinessVerificationRef {
+  placeId: string;
+  /** `valid` | `risky` | `invalid` | `unknown` | `unverified` | `none`. */
+  status: string;
+  /** At least one address has no fresh verdict. */
+  stale: boolean;
+  /** Largest `checkedAt` among the fresh records; `0` when none. */
+  checkedAt: number;
+  addresses: AddressVerification[];
+}
+
 /** One page plus the aggregates the strip used to compute from a full list. */
 export interface BusinessPage {
   rows: Business[];
@@ -95,6 +127,8 @@ export interface BusinessPage {
   types: { label: string; count: number }[];
   /** Attribution for the rows on this page only. */
   jobRefs: BusinessJobRef[];
+  /** Email-verification state for the rows on this page only (G-04). */
+  verifyRefs: BusinessVerificationRef[];
 }
 
 export interface BusinessStats {

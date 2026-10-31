@@ -10,6 +10,7 @@
 - **任务队列**：多个关键词一次入队，自动逐个执行；程序崩溃或重启后可从断点继续，已完成的格子不会重跑；地图停在同意页/验证码等死页时任务会自动暂停，不会白烧请求
 - **数据管理**：按名称/评分/联系方式/类型筛选，SQL 分页浏览（十万行级别依然流畅），一键导出 Excel / CSV，或复制电话
 - **邮箱与社媒挖掘**：访问商家网站及其联系页，提取邮箱与社媒链接（可选，默认关闭）
+- **邮箱验证**：对挖到的地址做离线规则 + DNS（DoH）MX 校验，结果按地址缓存并随表格展示，导出时带 `Email Status` / `Email Verification` 两列；不占用地图面板
 - **可观测**：诊断抽屉实时显示采集状态、数据库行数、分页查询 P95 与最近错误
 
 ## 系统要求
@@ -93,9 +94,11 @@ npm run e2e:grid        # 网格采集
 npm run e2e:queue       # 队列与断点续跑
 npm run e2e:tasks       # 任务视图
 npm run e2e:browse      # 分页浏览
+npm run e2e:compact     # 紧凑模式与窄面板
 npm run e2e:pane        # 地图面板占用互斥
 npm run e2e:interceptor # 注入脚本
 npm run e2e:emails      # 邮箱挖掘
+npm run e2e:verify      # 邮箱验证（本地 DoH 夹具）
 npm run e2e:real        # 真实抓取（网络依赖）
 npm run e2e:probe       # 字段索引探针（debug 构建）
 npm run bench:grid-ab   # 网格 A/B 基准
@@ -173,6 +176,8 @@ placemill/
 ├── src/                       # React 前端
 │   ├── App.tsx                # 主界面与数据编排（服务端分页取数）
 │   ├── components/            # 头部、指标、筛选、任务队列、抽屉、分割条
+│   ├── components/ui/         # 共用原语（状态圆点、空态、字段行）
+│   ├── design/                # 调色板/刻度令牌与面板断点
 │   ├── settings/ i18n/ types/ # 偏好、多语言、类型定义
 ├── src-tauri/                 # Rust 后端
 │   ├── src/
@@ -181,6 +186,8 @@ placemill/
 │   │   ├── collector.rs       # 任务 worker（单飞、重试、死页看门狗）
 │   │   ├── grid.rs            # 网格生成与自适应四分几何
 │   │   ├── db.rs              # SQLite（业务表 + 任务表 + 迁移）
+│   │   ├── email_miner.rs     # 站点/联系页邮箱与社媒提取
+│   │   ├── email_verify.rs    # 离线规则 + DoH MX 验证，按地址缓存
 │   │   └── settings.rs        # 偏好持久化
 │   ├── scripts/
 │   │   └── intercept.js       # Google Maps 注入脚本

@@ -19,6 +19,9 @@ import { useI18n } from '../i18n';
 import { jobStatusLabel } from '../lib/text';
 import { paneBusyMessageKey } from '../lib/busy';
 import type { Job } from '../types/job';
+import EmptyState from './ui/EmptyState';
+import HintText from './ui/HintText';
+import StatusPill from './ui/StatusPill';
 
 const PROCESSED = (job: Job) => job.doneTiles + job.failedTiles;
 
@@ -242,9 +245,7 @@ export default function JobQueue({
                 >
                   {t('queue.deleteExclusive', { count: exclusive })}
                 </Checkbox>
-                <div className="queue-delete-note">
-                  {t('queue.deleteSharedNote', { count: shared })}
-                </div>
+                <HintText>{t('queue.deleteSharedNote', { count: shared })}</HintText>
               </>
             )}
           </div>
@@ -387,13 +388,14 @@ export default function JobQueue({
         }}
       >
         <div className="task-card-line">
-          <span className={`task-dot is-${job.status}`} aria-hidden />
           <span className="task-card-name" title={job.name || job.keyword}>
             {job.name || job.keyword}
           </span>
-          <span className={`task-card-status is-${job.status}`}>
-            {jobStatusLabel(t, job.status)}
-          </span>
+          <StatusPill
+            status={job.status}
+            label={jobStatusLabel(t, job.status)}
+            className="task-card-status"
+          />
           <Dropdown
             trigger={['click']}
             menu={{
@@ -425,8 +427,10 @@ export default function JobQueue({
         </div>
 
         <div className="task-card-meta">
+          <span className="task-card-found">
+            {t('queue.found', { count: job.foundCount })}
+          </span>
           <span>{t('queue.progress', { done: processed, total: job.totalTiles })}</span>
-          <span>{t('queue.found', { count: job.foundCount })}</span>
           {etaMinutes > 0 && <span>{t('queue.eta', { minutes: etaMinutes })}</span>}
           {job.failedTiles > 0 && (
             <span className="task-card-failed">
@@ -521,45 +525,46 @@ export default function JobQueue({
     // product is used, which is the only thing a new user is missing here.
     return (
       <div className="queue-empty">
-        <div className="queue-empty-card">
-          <span className="queue-empty-icon" aria-hidden>
-            <AimOutlined />
-          </span>
-          <div className="queue-empty-title">{t('queue.emptyTitle')}</div>
-          <p className="queue-empty-desc">{t('queue.emptyDesc')}</p>
-          <ol className="queue-empty-steps">
-            <li>{t('queue.emptyStep1')}</li>
-            <li>{t('queue.emptyStep2')}</li>
-            <li>{t('queue.emptyStep3')}</li>
-          </ol>
-          <Button type="primary" icon={<PlusOutlined />} onClick={() => onNew()}>
-            {t('queue.emptyCta')}
-          </Button>
-          {/* Only on a true first run: with rows in the database the user has
-              already built a task and the steps above are all they need. */}
-          {totalRows === 0 && !rowsLoading && (
-            <div className="queue-empty-presets">
-              <span className="queue-empty-presets-label">{t('queue.presetsLabel')}</span>
-              <div className="queue-empty-chips">
-                {PRESET_KEYWORDS.map((key) => (
-                  <button
-                    key={key}
-                    type="button"
-                    className="queue-empty-chip"
-                    onClick={() => onNew(t(key))}
-                  >
-                    {t(key)}
-                  </button>
-                ))}
-              </div>
-            </div>
-          )}
-          {totalRows > 0 && onViewData && (
-            <Button type="link" size="small" onClick={onViewData}>
-              {t('queue.viewExisting', { count: totalRows.toLocaleString(tag) })}
+        <EmptyState
+          icon={<AimOutlined />}
+          title={t('queue.emptyTitle')}
+          description={t('queue.emptyDesc')}
+          steps={[t('queue.emptyStep1'), t('queue.emptyStep2'), t('queue.emptyStep3')]}
+          action={
+            <Button type="primary" icon={<PlusOutlined />} onClick={() => onNew()}>
+              {t('queue.emptyCta')}
             </Button>
-          )}
-        </div>
+          }
+          footnote={
+            <>
+              {/* Only on a true first run: with rows in the database the user
+                  has already built a task and the steps above are all they
+                  need. */}
+              {totalRows === 0 && !rowsLoading && (
+                <div className="queue-empty-presets">
+                  <span className="queue-empty-presets-label">{t('queue.presetsLabel')}</span>
+                  <div className="queue-empty-chips">
+                    {PRESET_KEYWORDS.map((key) => (
+                      <button
+                        key={key}
+                        type="button"
+                        className="queue-empty-chip"
+                        onClick={() => onNew(t(key))}
+                      >
+                        {t(key)}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+              )}
+              {totalRows > 0 && onViewData && (
+                <Button type="link" size="small" onClick={onViewData}>
+                  {t('queue.viewExisting', { count: totalRows.toLocaleString(tag) })}
+                </Button>
+              )}
+            </>
+          }
+        />
       </div>
     );
   }
@@ -610,7 +615,7 @@ export default function JobQueue({
         jobs.some(
           (job) =>
             job.status === 'running' || job.status === 'queued' || job.status === 'paused',
-        ) && <div className="task-single-flight">{t('queue.singleFlight')}</div>}
+        ) && <HintText className="task-single-flight">{t('queue.singleFlight')}</HintText>}
 
       <Modal
         open={renaming !== null}

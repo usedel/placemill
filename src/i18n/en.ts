@@ -20,7 +20,7 @@ export const en = {
   'bulk.exportJsonl': 'Export to JSONL',
   'bulk.mineConfirmContent':
     'Up to 4 pages per site are visited and this can take a while. Continue?',
-  'bulk.mineConfirmTitle': 'Mine emails from {count} sites?',
+  'bulk.mineConfirmTitle': 'Mine contacts from {count} sites?',
   'bulk.selectAll': 'Select all {count}',
   'bulk.selectAllCapped':
     'Selected the first {count} rows — narrow the filters to select more.',
@@ -29,7 +29,7 @@ export const en = {
   // ===== Close while work is running =====
   'close.title': 'A task is still running',
   'close.jobRunning': 'Closing now interrupts the task that is scrolling the map.',
-  'close.emailMining': 'Email mining is still running.',
+  'close.emailMining': 'Contact mining is still running.',
   'close.hint':
     'Collected rows are already saved. "Pause and exit" stops the task on a resumable tile — pick it up from the task list after the next start.',
   'close.pauseAndExit': 'Pause and exit',
@@ -46,8 +46,20 @@ export const en = {
   'common.save': 'Save',
   'common.undo': 'Undo',
 
+  // ===== Mined contacts (M7) =====
+  // `email_status` → words. `unmined` must stay distinct from `noneFound`: the
+  // first row can still be mined, the second already got an answer.
+  'contacts.status.found': 'Emails found',
+  'contacts.status.noneFound': 'Mined, no email found',
+  'contacts.status.blocked': 'Blocked by the site',
+  'contacts.status.error': 'Mining failed',
+  'contacts.status.unmined': 'Not mined yet',
+
   // ===== Detail drawer =====
   'detail.address': 'Address',
+  'detail.contactsTitle': 'Contacts (mined)',
+  'detail.emailSource': 'Source page',
+  'detail.minedAt': 'Mined',
   'detail.enrichedTitle': 'Enriched details (Tier-2)',
   'detail.plusCode': 'Plus Code',
   'detail.description': 'Description',
@@ -110,6 +122,9 @@ export const en = {
 
   // ===== Filter bar =====
   'filters.clear': 'Clear filters',
+  'filters.open': 'Filters',
+  'filters.sheetTitle': 'Filters',
+  'filters.apply': 'Done',
   'filters.onlyNew': 'Only new since export',
   'filters.contactAll': 'All contacts',
   'filters.contactBoth': 'Phone + website',
@@ -273,6 +288,7 @@ export const en = {
   'header.diagnostics': 'Diagnostics',
   'header.grid': 'New task',
   'header.help': 'Keyboard shortcuts',
+  'header.more': 'More',
   'header.settings': 'Settings',
   'header.statusCollecting': 'Collecting',
   'header.statusIdle': 'Idle',
@@ -439,6 +455,7 @@ export const en = {
   'table.ownerName': 'Owner',
   'table.closed': 'Closed',
   'table.columns': 'Columns',
+  'table.contact': 'Contacts',
   'table.copyAddress': 'Copy address',
   'table.copyPhone': 'Copy phone',
   'table.email': 'Email',
@@ -457,7 +474,7 @@ export const en = {
   'table.exportSaveAsJsonl': 'Save as JSONL…',
   'table.exportSelected': 'Export {count} selected',
   'table.locate': 'Locate on map',
-  'table.mineEmails': 'Mine emails',
+  'table.mineEmails': 'Mine contacts',
   'table.mineEmailsForce': 'Re-mine anyway',
   'table.mineEmailsHint':
     'Visit the websites of the selected rows — or the whole filtered set — to collect emails and social profiles',
@@ -512,8 +529,8 @@ export const en = {
   'toast.emailMineCancelled': 'Mining cancelled ({done}/{total})',
   'toast.emailMineDone':
     'Mining finished: {found} of {done} sites have emails ({total} total)',
-  'toast.emailMineFailed': 'Email mining failed: {error}',
-  'toast.emailMineRunning': 'Email mining is already running',
+  'toast.emailMineFailed': 'Contact mining failed: {error}',
+  'toast.emailMineRunning': 'Mining is already running',
   'toast.emailNothingToMine': 'No rows with a website in this scope',
   'toast.emailAllMinedTitle': 'These {count} businesses were already mined',
   'toast.emailAllMinedBody':
@@ -566,10 +583,70 @@ export const en = {
   'update.checking': 'Checking…',
   'update.currentVersion': 'Current version',
   'update.upToDate': 'Already the latest version (v{version})',
+
+  // ===== Email verification (G-04) =====
+  'table.verifyEmails': 'Verify emails',
+  'table.verifyEmailsHint':
+    'Check deliverability with offline rules and DNS (MX). No email is sent.',
+  'table.verifyingProgress': 'Verifying {done}/{total}',
+  'table.verifyCancelHint': 'Click to stop',
+  'table.verifyColumn': 'Email status',
+  'table.verifyNone': 'Not verified',
+  'table.verifyStale': 'Stale',
+  'table.verifyBlockedByMining':
+    'Contact mining is running — verify when it finishes',
+  'table.mineBlockedByVerify':
+    'Email verification is running — mine when it finishes',
+  'verify.status.valid': 'Valid',
+  'verify.status.risky': 'Risky',
+  'verify.status.invalid': 'Invalid',
+  'verify.status.unknown': 'Unknown',
+  'verify.status.error': 'Check failed',
+  'verify.status.unverified': 'Not verified',
+  'verify.flag.syntax': 'invalid format',
+  'verify.flag.ip_domain': 'IP domain',
+  'verify.flag.role': 'role mailbox',
+  'verify.flag.free_mail': 'free mailbox',
+  'verify.flag.typo': 'possible typo',
+  'verify.flag.non_ascii': 'non-ASCII',
+  'verify.flag.disposable': 'disposable',
+  'verify.flag.nxdomain': 'domain not found',
+  'verify.flag.no_mx': 'no mail server',
+  'verify.flag.implicit_mx': 'implicit MX',
+  'verify.flag.null_mx': 'rejects mail',
+  'verify.flag.same_domain': 'same domain',
+  'toast.verifyPlanTitle': 'Verify {count} email addresses?',
+  'toast.verifyPlanBody':
+    '{rows} businesses · {addresses} addresses · {cached} cached · {pending} to check. Only domain names are sent to the DNS resolver.',
+  'toast.verifyNothingNoEmails':
+    'These businesses have no emails yet — mine contacts first.',
+  'toast.verifyAllFreshTitle': 'All addresses are still fresh',
+  'toast.verifyAllFreshBody':
+    'Every address was verified recently. Re-check anyway?',
+  'toast.verifyForce': 'Re-check anyway',
+  'toast.verifyRunning': 'Verification is already running',
+  'toast.verifyDone':
+    'Verification finished: {valid} valid · {risky} risky · {invalid} invalid · {unknown} unknown · {error} failed',
+  'toast.verifyDoneWithErrors':
+    'Verification finished with {error} failed lookup(s) — retry to finish them',
+  'toast.verifyCancelled': 'Verification stopped: {done}/{total} done',
+  'toast.verifyFatal': 'Verification failed: {error}',
+  'toast.verifyTooMany': 'Too many addresses (limit {limit}) — narrow the filter',
+  'toast.verifyMiningRunning':
+    'Contact mining is running — wait for it to finish',
+  'toast.mineVerifyRunning':
+    'Email verification is running — wait for it to finish',
+  'filters.verifyAll': 'Any email status',
+  'filters.verifyValid': 'Valid only',
+  'filters.verifyUsable': 'Sendable (valid or risky)',
+  'filters.verifyInvalid': 'Invalid',
+  'filters.verifyUnverified': 'Not verified',
+  'close.emailVerifying': 'Email verification is still running.',
 } as const;
 
 /** Shape every locale dictionary must implement. */
 export type Dict = { readonly [K in keyof typeof en]: string };
+
 
 /** Every valid message key. */
 export type MessageKey = keyof typeof en;

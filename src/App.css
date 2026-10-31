@@ -1,5 +1,5 @@
 /* ============================================================
-   Design tokens (light / dark)
+   Design tokens
    ============================================================ */
 
 /* UI-16: one visible focus ring for everything the antd defaults leave faint.
@@ -9,53 +9,15 @@
   outline-offset: 1px;
 }
 
-:root {
-  --app-bg: #f4f6fb;
-  --panel-bg: #ffffff;
-  --panel-bg-soft: #f8fafc;
-  --panel-border: rgba(15, 23, 42, 0.07);
-  --panel-border-strong: rgba(15, 23, 42, 0.12);
-  --text-1: #1f2937;
-  --text-2: #51607a;
-  /* UI-16: #8b97a8 measured ~3.0:1 on the panel background, too weak for the
-     11px muted copy it carries. #64748b clears 4.5:1 while staying lighter
-     than --text-2, so the three-step hierarchy survives. */
-  --text-3: #64748b;
-  --accent: #2563eb;
-  --accent-soft: rgba(37, 99, 235, 0.09);
-  /* Filled accent surface that carries white text (the new-rows pill). The
-     regular `--accent` goes light in dark mode, where white would be unreadable. */
-  --accent-solid: #2563eb;
-  --row-reveal: rgba(37, 99, 235, 0.14);
-  --live: #ef4444;
-  --live-soft: rgba(239, 68, 68, 0.1);
-  --star: #f59e0b;
-  --warning: #d97706;
-  --shadow-card: 0 1px 2px rgba(16, 24, 40, 0.04), 0 1px 3px rgba(16, 24, 40, 0.05);
-  --shadow-panel: 8px 0 24px rgba(15, 23, 42, 0.06);
-}
+/* Every custom property this file reads is written onto `<html>` at runtime by
+   `applyThemeAttribute` (src/theme.ts), sourced from `src/design/tokens.ts`.
+   That module is the only definition of the palette, the type scale, the
+   spacing steps and the radii — this file intentionally carries no hex and no
+   scale literal, so light and dark cannot drift apart and antd reads exactly
+   the same numbers.
 
-[data-theme='dark'] {
-  --app-bg: #0f1115;
-  --panel-bg: #171a21;
-  --panel-bg-soft: #1b1f27;
-  --panel-border: rgba(255, 255, 255, 0.08);
-  --panel-border-strong: rgba(255, 255, 255, 0.14);
-  --text-1: #e6eaf1;
-  --text-2: #a7b1c2;
-  --text-3: #7b8798;
-  --accent: #60a5fa;
-  --accent-soft: rgba(96, 165, 250, 0.14);
-  --accent-solid: #1d4ed8;
-  --row-reveal: rgba(96, 165, 250, 0.18);
-  --live: #f87171;
-  --live-soft: rgba(248, 113, 113, 0.14);
-  --star: #fbbf24;
-  --warning: #fbbf24;
-  --shadow-card: 0 1px 2px rgba(0, 0, 0, 0.4);
-  --shadow-panel: 8px 0 24px rgba(0, 0, 0, 0.45);
-}
-
+   Fallbacks are omitted on purpose. `var(--x, #123456)` would hide a missing
+   token behind a colour nobody chose; an empty value at least fails visibly. */
 html,
 body,
 #root {
@@ -68,20 +30,23 @@ body {
   overflow: hidden;
   background: var(--app-bg);
   color: var(--text-1);
-  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC',
-    'Hiragino Sans GB', 'Microsoft YaHei', 'Noto Sans SC', Roboto, sans-serif;
+  font-family: var(--font-sans);
+  font-size: var(--fs-base);
+  line-height: var(--lh-base);
   -webkit-font-smoothing: antialiased;
   text-rendering: optimizeLegibility;
 }
 
-/* Subtle, modern scrollbars */
+/* Subtle scrollbars: invisible until the region is actually scrollable, and
+   only the thumb moves. 8px matches the gutter antd reserves for its own
+   scrollable bodies. */
 ::-webkit-scrollbar {
   width: 8px;
   height: 8px;
 }
 ::-webkit-scrollbar-thumb {
   background: var(--panel-border-strong);
-  border-radius: 8px;
+  border-radius: var(--radius-full);
 }
 ::-webkit-scrollbar-thumb:hover {
   background: var(--text-3);
@@ -99,7 +64,6 @@ body {
   display: flex;
   flex-direction: column;
   background: var(--app-bg);
-  padding-bottom: 12px;
   overflow: hidden;
 }
 
@@ -114,47 +78,247 @@ body {
 }
 
 /* ============================================================
+   Primitives
+   ============================================================ */
+
+/* One section label. It existed four times — settings, diagnostics, the task
+   failure head and inline `<Text strong>` — at three different sizes. */
+.ui-section {
+  display: block;
+  margin-bottom: var(--space-3);
+  font-size: var(--fs-xs);
+  line-height: var(--lh-xs);
+  font-weight: 500;
+  letter-spacing: 0.04em;
+  color: var(--text-3);
+}
+
+/* For a label that sits in a flex row with its own controls, where the
+   bottom margin would push it off the baseline. */
+.ui-section.is-flush {
+  margin-bottom: 0;
+}
+
+/* One label+value row. `.settings-row` and `.diag-row` were the same rule with
+   a dashed border each; the row is a hairline now. */
+.ui-field {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-5);
+  padding: var(--space-3) 0;
+  font-size: var(--fs-base);
+  line-height: var(--lh-base);
+  border-bottom: 1px solid var(--panel-border);
+}
+
+.ui-field:last-child {
+  border-bottom: none;
+}
+
+.ui-field-label {
+  flex: 0 0 auto;
+  color: var(--text-3);
+}
+
+.ui-field-value {
+  flex: 1;
+  min-width: 0;
+  text-align: right;
+  overflow-wrap: anywhere;
+  font-variant-numeric: tabular-nums;
+}
+
+.ui-field-value.is-mono {
+  font-family: var(--font-mono);
+  font-size: var(--fs-xs);
+}
+
+/* The right-hand side is a cluster of controls, not a value: keep them on one
+   baseline and flush with the row's end. */
+.ui-field-value.is-control {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: var(--space-1);
+}
+
+/* One status pill, six states. The three blocks this replaces were byte
+   identical except for a colour, and `cancelled` had no rule at all — it was
+   indistinguishable from `completed`. The dot is a pseudo-element so the
+   element's text content stays exactly the status word, which is what the e2e
+   suites assert on. */
+.ui-status {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
+  font-size: var(--fs-xs);
+  line-height: var(--lh-xs);
+  color: var(--text-3);
+  white-space: nowrap;
+}
+
+.ui-status::before {
+  content: '';
+  width: 6px;
+  height: 6px;
+  flex: 0 0 6px;
+  border-radius: 50%;
+  background: currentColor;
+}
+
+.ui-status--running {
+  color: var(--accent);
+}
+
+.ui-status--running::before {
+  animation: pulse 2s ease-in-out infinite;
+}
+
+.ui-status--paused {
+  color: var(--warning);
+}
+
+.ui-status--failed {
+  color: var(--danger);
+}
+
+.ui-status--completed {
+  color: var(--text-2);
+}
+
+.ui-status--completed::before {
+  background: var(--success);
+}
+
+.ui-status--queued,
+.ui-status--cancelled {
+  color: var(--text-3);
+}
+
+/* Hollow dot: queued has not started, cancelled stopped without finishing.
+   Filled would claim a state they do not have. */
+.ui-status--queued::before,
+.ui-status--cancelled::before {
+  box-sizing: border-box;
+  background: transparent;
+  border: 1px solid var(--text-3);
+}
+
+/* One muted hint. Six classes carried this role, at 11/11.5/12px. */
+.ui-hint {
+  font-size: var(--fs-xs);
+  line-height: var(--lh-xs);
+  color: var(--text-3);
+}
+
+.ui-hint.is-warn {
+  color: var(--warning);
+}
+
+.ui-hint.is-danger {
+  color: var(--danger);
+}
+
+/* One empty state, two densities: a card that owns the first screen, and an
+   inline block for a table with no rows. */
+.ui-empty {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: var(--space-4);
+  text-align: center;
+}
+
+.ui-empty.is-card {
+  box-sizing: border-box;
+  width: 100%;
+  max-width: 450px;
+  padding: var(--space-8) var(--space-7) var(--space-7);
+  background: var(--panel-bg);
+  border: 1px solid var(--panel-border);
+  border-radius: var(--radius-lg);
+}
+
+.ui-empty-icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 40px;
+  height: 40px;
+  border-radius: var(--radius-lg);
+  background: var(--accent-soft);
+  color: var(--accent);
+  font-size: var(--fs-lg);
+}
+
+.ui-empty-title {
+  font-size: var(--fs-md);
+  line-height: var(--lh-md);
+  font-weight: 500;
+  color: var(--text-1);
+}
+
+.ui-empty-desc {
+  margin: 0;
+  max-width: 400px;
+  font-size: var(--fs-sm);
+  line-height: var(--lh-sm);
+  color: var(--text-2);
+  text-wrap: pretty;
+}
+
+/* ============================================================
    Brand header
    ============================================================ */
+/* The header is a surface, not a floating card: it owns the top of the panel
+   and separates itself with one hairline. Before this it sat directly on
+   `--app-bg` with a gradient tile, which read as a template rather than a tool. */
 .brand-bar {
   display: flex;
   align-items: center;
-  gap: 10px;
-  padding: 13px 16px 11px;
+  gap: var(--space-3);
   flex: 0 0 auto;
+  padding: var(--space-5) var(--space-6) var(--space-4);
+  background: var(--panel-bg);
+  border-bottom: 1px solid var(--panel-border);
 }
 
+/* A flat mark. The gradient + coloured shadow it used to carry was the single
+   loudest thing on the panel and fought the accent for attention. */
 .brand-logo {
-  width: 34px;
-  height: 34px;
-  flex: 0 0 34px;
-  border-radius: 11px;
+  width: 22px;
+  height: 22px;
+  flex: 0 0 22px;
+  border-radius: var(--radius-md);
   display: grid;
   place-items: center;
-  color: #fff;
-  font-size: 17px;
-  background: linear-gradient(135deg, #2563eb 0%, #22d3ee 100%);
-  box-shadow: 0 4px 12px rgba(37, 99, 235, 0.28);
+  color: var(--accent);
+  font-size: var(--fs-xs);
+  background: var(--panel-bg-soft);
+  border: 1px solid var(--panel-border);
 }
 
 .brand-text {
   min-width: 0;
-  line-height: 1.25;
+  line-height: 1.3;
 }
 
 .brand-title {
   display: block;
-  font-size: 15px;
-  font-weight: 650;
-  letter-spacing: 0.2px;
+  font-size: var(--fs-base);
+  font-weight: 500;
+  letter-spacing: -0.01em;
   white-space: nowrap;
 }
 
 .brand-sub {
   display: block;
-  font-size: 11px;
+  font-size: var(--fs-xs);
   color: var(--text-3);
   white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 .brand-spacer {
@@ -164,11 +328,12 @@ body {
 .status-pill {
   display: inline-flex;
   align-items: center;
-  gap: 6px;
-  height: 26px;
-  padding: 0 10px;
-  border-radius: 999px;
-  font-size: 12px;
+  gap: var(--space-2);
+  height: 22px;
+  padding: 0 var(--space-4);
+  border-radius: var(--radius-full);
+  font-size: var(--fs-xs);
+  line-height: 1;
   font-variant-numeric: tabular-nums;
   color: var(--text-2);
   background: var(--panel-bg-soft);
@@ -176,34 +341,37 @@ body {
   white-space: nowrap;
 }
 
+/* Collecting is a normal state, not an alarm. Red is reserved for failure
+   (`.is-failed`), so the live pill reads accent like every other "working"
+   signal in the panel. */
 .status-pill.is-live {
-  color: var(--live);
-  background: var(--live-soft);
-  border-color: transparent;
+  color: var(--accent);
+  background: var(--accent-soft);
+  border-color: var(--accent-border);
   font-weight: 500;
 }
 
 .status-dot {
-  width: 6px;
-  height: 6px;
+  width: 5px;
+  height: 5px;
   border-radius: 50%;
   background: currentColor;
-  flex: 0 0 6px;
+  flex: 0 0 5px;
 }
 
 .status-pill.is-live .status-dot {
-  animation: pulse 1.6s ease-in-out infinite;
+  animation: pulse 2s ease-in-out infinite;
 }
 
+/* A quiet opacity breath. The old version expanded a coloured ring, which at
+   this size read as a notification badge. */
 @keyframes pulse {
-  0% {
-    box-shadow: 0 0 0 0 rgba(239, 68, 68, 0.5);
-  }
-  70% {
-    box-shadow: 0 0 0 6px rgba(239, 68, 68, 0);
-  }
+  0%,
   100% {
-    box-shadow: 0 0 0 0 rgba(239, 68, 68, 0);
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.3;
   }
 }
 
@@ -214,76 +382,102 @@ body {
 /* ============================================================
    Metrics strip
    ============================================================ */
+/* Flush strip, not a card. Three bordered cards stacked under a bordered
+   header is what made every surface the same weight; the numbers are separated
+   by hairlines instead, and the hero figure carries the hierarchy. */
 .metrics {
   display: flex;
-  align-items: stretch;
-  margin: 0 16px 12px;
+  align-items: flex-end;
+  margin: 0;
+  padding: var(--space-5) var(--space-6) var(--space-6);
   background: var(--panel-bg);
-  border: 1px solid var(--panel-border);
-  border-radius: 12px;
-  box-shadow: var(--shadow-card);
-  overflow: hidden;
+  border-bottom: 1px solid var(--panel-border);
   flex: 0 0 auto;
 }
 
 .metric {
   flex: 1 1 0;
   min-width: 0;
-  padding: 9px 6px 8px;
-  text-align: center;
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+}
+
+/* The count of collected places is what the user is here for; it gets twice
+   the room and the only display-size type on the panel. */
+.metric.is-hero {
+  flex: 2 1 0;
 }
 
 .metric + .metric {
+  padding-left: var(--space-6);
   border-left: 1px solid var(--panel-border);
 }
 
 .metric-value {
-  font-size: 19px;
-  font-weight: 650;
-  line-height: 1.15;
+  display: flex;
+  align-items: baseline;
+  gap: var(--space-2);
+  font-size: var(--fs-md);
+  line-height: var(--lh-md);
+  font-weight: 500;
+  letter-spacing: -0.01em;
   font-variant-numeric: tabular-nums;
   white-space: nowrap;
 }
 
+.metric.is-hero .metric-value {
+  font-size: var(--fs-xl);
+  line-height: var(--lh-xl);
+}
+
 .metric-value .star {
   color: var(--star);
-  font-size: 13px;
-  margin-right: 3px;
-  vertical-align: 1px;
+  font-size: var(--fs-xs);
+  margin: 0;
+  align-self: center;
 }
 
 .metric-unit {
-  font-size: 11px;
-  color: var(--text-3);
-  margin-left: 2px;
+  font-size: var(--fs-xs);
   font-weight: 400;
+  color: var(--text-3);
 }
 
 .metric-label {
-  margin-top: 2px;
-  font-size: 11px;
+  font-size: var(--fs-xs);
+  line-height: var(--lh-xs);
   color: var(--text-3);
+  letter-spacing: 0.01em;
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
 }
 
+/* The streaming delta: a small accent chip that appears, holds, then leaves.
+   It used to be bare coloured text, which read as part of the number. */
 .metric-bump {
-  margin-left: 4px;
-  font-size: 11px;
-  font-weight: 600;
+  font-size: var(--fs-xs);
+  font-weight: 500;
+  line-height: 1;
+  padding: var(--space-1) var(--space-2);
+  border-radius: var(--radius-sm);
   color: var(--accent);
-  animation: bump 1.6s ease-out;
+  background: var(--accent-soft);
+  animation: bump 2.4s var(--ease) both;
 }
 
 @keyframes bump {
   0% {
     opacity: 0;
-    transform: translateY(4px);
+    transform: translateY(2px);
   }
-  25% {
+  15% {
     opacity: 1;
     transform: translateY(0);
+  }
+  70% {
+    opacity: 1;
   }
   100% {
     opacity: 0;
@@ -296,13 +490,14 @@ body {
 .listen-card {
   display: flex;
   align-items: center;
-  gap: 12px;
-  margin: 0 16px 12px;
-  padding: 11px 12px;
+  gap: var(--space-5);
+  /* `.collect-view` already insets by `--space-6`; a second margin here made
+     this card narrower than every sibling in the column. */
+  margin: 0 0 var(--space-5);
+  padding: var(--space-5);
   background: var(--panel-bg);
   border: 1px solid var(--panel-border);
-  border-radius: 12px;
-  box-shadow: var(--shadow-card);
+  border-radius: var(--radius-lg);
   flex: 0 0 auto;
 }
 
@@ -312,15 +507,15 @@ body {
 }
 
 .listen-title {
-  font-size: 13px;
-  font-weight: 600;
-  line-height: 1.3;
+  font-size: var(--fs-base);
+  line-height: var(--lh-base);
+  font-weight: 500;
 }
 
 .listen-hint {
-  margin-top: 2px;
-  font-size: 11px;
-  line-height: 1.45;
+  margin-top: var(--space-1);
+  font-size: var(--fs-xs);
+  line-height: var(--lh-xs);
   color: var(--text-3);
   display: -webkit-box;
   -webkit-line-clamp: 2;
@@ -354,8 +549,8 @@ body {
 .grid-field {
   display: flex;
   flex-direction: column;
-  gap: 4px;
-  font-size: 12px;
+  gap: var(--space-2);
+  font-size: var(--fs-sm);
   color: var(--text-3);
 }
 
@@ -364,7 +559,7 @@ body {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  gap: 8px;
+  gap: var(--space-4);
 }
 
 .grid-field-inline {
@@ -376,21 +571,15 @@ body {
   min-width: 0;
 }
 
-.grid-note {
-  font-size: 11px;
-  line-height: 1.5;
-  color: var(--text-3);
-}
-
 .grid-plan {
-  font-size: 12px;
+  font-size: var(--fs-sm);
   color: var(--accent);
 }
 
 .grid-status {
   display: flex;
   align-items: center;
-  gap: 8px;
+  gap: var(--space-4);
 }
 
 .grid-status-keyword {
@@ -403,8 +592,8 @@ body {
 .grid-stats {
   display: flex;
   flex-wrap: wrap;
-  gap: 12px;
-  font-size: 12px;
+  gap: var(--space-5);
+  font-size: var(--fs-sm);
   color: var(--text-3);
 }
 
@@ -419,82 +608,36 @@ body {
   align-items: center;
   justify-content: center;
   min-height: 100%;
-  padding: 24px 8px 40px;
+  padding: var(--space-8) var(--space-4) var(--space-9);
 }
 
-.queue-empty-card {
-  box-sizing: border-box;
+/* Numbered steps inside an `EmptyState`. The counter keeps the list semantic
+   without shipping three styled spans per item. A hairline, not a dashed rule —
+   dashes were doing the job of "secondary" on five different surfaces. */
+.ui-empty-steps {
+  counter-reset: empty-step;
   display: flex;
   flex-direction: column;
-  align-items: center;
-  gap: 8px;
+  gap: var(--space-3);
   width: 100%;
-  /* Padding + border included (see `.queue-empty`). 450 leaves a 400px text
-     column, which is what keeps the one-line description unbroken. */
-  max-width: 450px;
-  padding: 26px 24px 20px;
-  text-align: center;
-  background: var(--panel-bg);
-  border: 1px solid var(--panel-border);
-  border-radius: 14px;
-  box-shadow: var(--shadow-card);
-}
-
-.queue-empty-icon {
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  width: 44px;
-  height: 44px;
-  margin-bottom: 2px;
-  border-radius: 50%;
-  background: var(--accent-soft);
-  color: var(--accent);
-  font-size: 20px;
-}
-
-.queue-empty-title {
-  font-size: 14.5px;
-  font-weight: 600;
-  color: var(--text-1);
-}
-
-.queue-empty-desc {
   margin: 0;
-  font-size: 12.5px;
-  line-height: 1.6;
-  color: var(--text-2);
-  /* Stops a two-line sentence from leaving one orphan character behind. */
-  text-wrap: pretty;
-}
-
-/* Numbered steps: the counter keeps the list semantic without shipping three
-   styled spans per item. The divider uses the strong border because the regular
-   one is invisible as a dashed line at this width. */
-.queue-empty-steps {
-  counter-reset: queue-step;
-  display: flex;
-  flex-direction: column;
-  gap: 7px;
-  width: 100%;
-  margin: 6px 0 4px;
-  padding: 13px 0 0;
+  padding: var(--space-5) 0 0;
   list-style: none;
-  border-top: 1px dashed var(--panel-border-strong);
+  border-top: 1px solid var(--panel-border);
   text-align: left;
 }
 
-.queue-empty-steps li {
+.ui-empty-steps li {
   position: relative;
-  counter-increment: queue-step;
-  padding-left: 24px;
-  font-size: 12px;
-  line-height: 1.55;
+  counter-increment: empty-step;
+  padding-left: var(--space-7);
+  font-size: var(--fs-sm);
+  line-height: var(--lh-sm);
   color: var(--text-2);
 }
 
-.queue-empty-steps li::before {
-  content: counter(queue-step);
+.ui-empty-steps li::before {
+  content: counter(empty-step);
   position: absolute;
   top: 1px;
   left: 0;
@@ -506,15 +649,15 @@ body {
   border-radius: 50%;
   background: var(--accent-soft);
   color: var(--accent);
-  font-size: 10px;
-  font-weight: 600;
+  font-size: var(--fs-micro);
+  font-weight: 500;
   font-variant-numeric: tabular-nums;
 }
 
 .queue-empty .ant-btn-link {
   height: auto;
   padding: 0;
-  font-size: 12px;
+  font-size: var(--fs-sm);
 }
 
 /* Preset keywords: a row of secondary entry points, deliberately quieter than
@@ -523,12 +666,12 @@ body {
   display: flex;
   flex-direction: column;
   align-items: center;
-  gap: 6px;
-  margin-top: 4px;
+  gap: var(--space-3);
+  margin-top: var(--space-2);
 }
 
 .queue-empty-presets-label {
-  font-size: 11px;
+  font-size: var(--fs-xs);
   color: var(--text-3);
 }
 
@@ -536,17 +679,17 @@ body {
   display: flex;
   flex-wrap: wrap;
   justify-content: center;
-  gap: 6px;
+  gap: var(--space-3);
 }
 
 .queue-empty-chip {
-  padding: 2px 10px;
+  padding: var(--space-1) var(--space-5);
   border: 1px solid var(--panel-border-strong);
-  border-radius: 999px;
+  border-radius: var(--radius-full);
   background: var(--panel-bg);
   color: var(--text-2);
   font: inherit;
-  font-size: 11.5px;
+  font-size: var(--fs-xs);
   line-height: 1.7;
   cursor: pointer;
   transition: border-color 0.15s ease, color 0.15s ease, background 0.15s ease;
@@ -561,21 +704,21 @@ body {
 .queue-row {
   display: flex;
   flex-direction: column;
-  gap: 4px;
-  padding: 8px 10px;
+  gap: var(--space-2);
+  padding: var(--space-4) var(--space-5);
   border: 1px solid var(--panel-border);
-  border-radius: 8px;
+  border-radius: var(--radius-lg);
 }
 
 .queue-line {
   display: flex;
   align-items: center;
-  gap: 8px;
+  gap: var(--space-4);
   min-width: 0;
 }
 
 .queue-keyword {
-  font-size: 13px;
+  font-size: var(--fs-base);
   font-weight: 600;
   overflow: hidden;
   text-overflow: ellipsis;
@@ -583,7 +726,7 @@ body {
 }
 
 .queue-city {
-  font-size: 11px;
+  font-size: var(--fs-xs);
   color: var(--text-3);
   overflow: hidden;
   text-overflow: ellipsis;
@@ -593,8 +736,8 @@ body {
 .queue-meta {
   display: flex;
   justify-content: space-between;
-  gap: 8px;
-  font-size: 11px;
+  gap: var(--space-4);
+  font-size: var(--fs-xs);
   color: var(--text-3);
 }
 
@@ -604,7 +747,7 @@ body {
 
 /* A paused job after a crash: informational, not an error. */
 .resume-banner {
-  margin-bottom: 8px;
+  margin-bottom: var(--space-4);
 }
 
 /* ============================================================
@@ -613,28 +756,87 @@ body {
 .filter-bar {
   display: flex;
   align-items: center;
-  gap: 8px;
+  gap: var(--space-3);
   flex-wrap: wrap;
-  margin: 0 16px 10px;
+  margin: var(--space-5) var(--space-6) var(--space-4);
   flex: 0 0 auto;
 }
 
 .filter-bar .ant-select {
-  min-width: 92px;
+  min-width: 96px;
+}
+
+/* Stable hook for the e2e suite (the task picker is also an `<input>`), and
+   the flexible cell of the row: it takes whatever the fixed-width selects
+   leave behind. */
+.filter-search {
+  flex: 1 1 160px;
+  min-width: 120px;
+}
+
+/* Widths used to be inline on each `Select`. They live here now so the sheet
+   variant can override them with one rule instead of a second set of styles. */
+.filter-task {
+  width: 168px;
+}
+
+.filter-time {
+  width: 112px;
+}
+
+.filter-rating,
+.filter-contact {
+  min-width: 96px;
+}
+
+.filter-types {
+  min-width: 96px;
+  max-width: 160px;
+}
+
+/* Compact mode: one search field plus a single trigger, because six 26px
+   controls cannot share 374px without clipping. The sheet that opens holds
+   the same controls, so nothing is lost — see `FilterBar`'s `variant`. */
+.filter-trigger {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
+  flex: 0 0 auto;
+}
+
+.filter-sheet {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-4);
+  padding-bottom: var(--space-4);
+}
+
+.filter-sheet .ant-select {
+  width: 100%;
+}
+
+
+.filter-sheet-footer {
+  display: flex;
+  justify-content: flex-end;
+  gap: var(--space-3);
+  padding-top: var(--space-4);
+  border-top: 1px solid var(--panel-border);
 }
 
 /* ============================================================
    Table region
    ============================================================ */
+/* The data region is the panel's main surface, so it runs full-bleed and is
+   separated by one hairline instead of being the fourth rounded card in a
+   column of rounded cards. */
 .table-wrap {
   position: relative;
   flex: 1 1 auto;
   min-height: 120px;
-  margin: 0 16px;
+  margin: 0;
   background: var(--panel-bg);
-  border: 1px solid var(--panel-border);
-  border-radius: 12px;
-  box-shadow: var(--shadow-card);
+  border-top: 1px solid var(--panel-border);
   overflow: hidden;
   display: flex;
   flex-direction: column;
@@ -644,24 +846,24 @@ body {
    the only thing that moves the viewport, so streaming never fights the user. */
 .new-rows-pill {
   position: absolute;
-  right: 14px;
+  right: var(--space-5);
   bottom: 52px;
   z-index: 5;
   display: inline-flex;
   align-items: center;
-  gap: 5px;
-  height: 26px;
-  padding: 0 11px;
+  gap: var(--space-2);
+  height: 24px;
+  padding: 0 var(--space-4);
   border: none;
-  border-radius: 999px;
-  font-size: 12px;
+  border-radius: var(--radius-full);
+  font-size: var(--fs-xs);
   font-weight: 500;
   font-variant-numeric: tabular-nums;
-  color: #fff;
+  color: var(--accent-fg);
   background: var(--accent-solid);
-  box-shadow: 0 4px 14px rgba(37, 99, 235, 0.32);
+  box-shadow: var(--shadow-overlay);
   cursor: pointer;
-  animation: slide-up 0.18s ease-out;
+  animation: slide-up var(--dur-base) var(--ease);
 }
 
 .new-rows-pill:hover {
@@ -677,9 +879,9 @@ body {
   display: flex;
   align-items: center;
   justify-content: center;
-  gap: 4px;
+  gap: var(--space-2);
   flex-wrap: wrap;
-  padding: 8px 0;
+  padding: var(--space-4) 0;
 }
 
 .table-wrap .ant-table-wrapper,
@@ -697,11 +899,16 @@ body {
   min-height: 0;
 }
 
+/* A header that states the columns and then gets out of the way: small,
+   muted, no fill, no per-column separators. */
 .table-wrap .ant-table-thead > tr > th {
-  font-size: 12px;
-  font-weight: 600;
-  letter-spacing: 0.2px;
+  font-size: var(--fs-xs);
+  line-height: var(--lh-xs);
+  font-weight: 500;
+  letter-spacing: 0.02em;
+  color: var(--text-3) !important;
   border-bottom: 1px solid var(--panel-border) !important;
+  white-space: nowrap;
 }
 
 .table-wrap .ant-table-tbody > tr {
@@ -709,12 +916,19 @@ body {
 }
 
 .table-wrap .ant-table-tbody > tr > td {
-  font-size: 12.5px;
+  font-size: var(--fs-base);
   white-space: nowrap;
+  border-bottom: 1px solid var(--panel-border) !important;
+}
+
+/* A selected row keeps a left bar as well as antd's tint: on a row that is
+   already hovering, the tint alone is easy to miss. */
+.table-wrap .ant-table-tbody > tr.ant-table-row-selected > td:first-child {
+  box-shadow: inset 2px 0 0 var(--accent);
 }
 
 .table-wrap .ant-table-pagination.ant-pagination {
-  margin: 8px 12px !important;
+  margin: var(--space-4) var(--space-5) !important;
 }
 
 /* Rows revealed one by one while the collector streams in data: the cell fades
@@ -751,7 +965,7 @@ body {
 .name-cell {
   display: flex;
   align-items: center;
-  gap: 6px;
+  gap: var(--space-3);
   min-width: 0;
 }
 
@@ -765,7 +979,7 @@ body {
 .name-icon {
   flex: 0 0 auto;
   color: var(--accent);
-  font-size: 12px;
+  font-size: var(--fs-sm);
   opacity: 0.85;
 }
 
@@ -773,12 +987,83 @@ body {
   color: var(--text-3);
 }
 
+/* M7: the mined-contact glyphs. Filled marks at 13px: a line glyph reads as a
+   smudge at this size, and these are the icons that have to answer "did the run
+   get this row?" without being hovered. */
+.contact-cell {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-3);
+  font-size: var(--fs-base);
+  line-height: 1;
+}
+
+.contact-icon {
+  font-size: var(--fs-base);
+}
+
+/* A found email is the one "hit" signal in the column. Accent, not a green
+   envelope: the panel's palette already means something by green, and a mail
+   icon is not a status. */
+.contact-icon.is-email {
+  color: var(--accent);
+}
+
+.contact-icon.is-blocked {
+  color: var(--warning);
+}
+
+.contact-icon.is-error {
+  color: var(--danger);
+}
+
+/* "Checked, nothing there" stays quiet on purpose: it must be readable, but it
+   must never look like a result. */
+.contact-icon.is-empty {
+  color: var(--text-3);
+  opacity: 0.7;
+}
+
+/* Official brand marks, same colour in both themes (design/tokens.ts). X is
+   `currentColor` — its mark is black on light and white on dark. */
+.social-glyph.is-linkedin {
+  color: var(--brand-linkedin);
+}
+
+.social-glyph.is-facebook {
+  color: var(--brand-facebook);
+}
+
+.social-glyph.is-instagram {
+  color: var(--brand-instagram);
+}
+
+.social-glyph.is-x,
+.social-glyph.is-other {
+  color: var(--text-2);
+}
+
+/* Identifiers, coordinates and phone numbers: fixed-width digits so a column
+   of them can be scanned vertically instead of read character by character. */
+.cell-mono {
+  font-family: var(--font-mono);
+  font-size: var(--fs-xs);
+  color: var(--text-2);
+}
+
+/* Type chips in the table: one neutral chip, not a blue tag per value. */
+.cell-tag {
+  margin: 0 !important;
+  font-size: var(--fs-xs);
+  line-height: var(--lh-xs);
+}
+
 /* T-02: the task cell is a filter shortcut, not a link. It stays plain text
    until hovered so a table of task names does not read as a wall of buttons. */
 .task-cell {
   display: inline-flex;
   align-items: center;
-  gap: 4px;
+  gap: var(--space-2);
   max-width: 100%;
   padding: 0;
   border: 0;
@@ -802,7 +1087,7 @@ body {
 
 .task-cell-more {
   flex: 0 0 auto;
-  font-size: 11px;
+  font-size: var(--fs-xs);
   color: var(--text-3);
 }
 
@@ -824,9 +1109,10 @@ body {
   overflow: hidden;
   white-space: normal;
   overflow-wrap: anywhere;
-  font-size: 12px;
-  line-height: 1.35;
-  min-height: 33px;
+  font-size: var(--fs-sm);
+  line-height: var(--lh-sm);
+  color: var(--text-2);
+  min-height: 34px;
 }
 
 /* UI-04: the header column picker. A popover rather than a dropdown menu, so
@@ -834,7 +1120,7 @@ body {
 .column-picker {
   display: flex;
   flex-direction: column;
-  gap: 2px;
+  gap: var(--space-1);
   min-width: 132px;
 }
 
@@ -843,19 +1129,19 @@ body {
   display: flex;
   align-items: center;
   justify-content: flex-end;
-  gap: 2px;
+  gap: var(--space-1);
 }
 
 .rating-cell {
   display: inline-flex;
   align-items: center;
-  gap: 4px;
+  gap: var(--space-2);
   font-variant-numeric: tabular-nums;
 }
 
 .rating-cell .anticon {
   color: var(--star);
-  font-size: 11px;
+  font-size: var(--fs-xs);
 }
 
 .rating-cell.is-empty {
@@ -873,28 +1159,30 @@ body {
 /* ============================================================
    Bulk action bar
    ============================================================ */
+/* Stays inline rather than floating: a floating bar would cover the pagination
+   it sits next to, and the panel is too short for that trade. */
 .bulk-bar {
   display: flex;
   align-items: center;
   flex-wrap: wrap;
-  gap: 6px;
-  padding: 7px 10px;
-  margin: 8px 16px 0;
-  border: 1px solid rgba(37, 99, 235, 0.22);
-  border-radius: 10px;
+  gap: var(--space-3);
+  padding: var(--space-4) var(--space-5);
+  margin: var(--space-4) var(--space-6);
+  border: 1px solid var(--accent-border);
+  border-radius: var(--radius-lg);
   background: var(--accent-soft);
   flex: 0 0 auto;
-  animation: slide-up 0.18s ease-out;
+  animation: slide-up var(--dur-base) var(--ease);
 }
 
 .bulk-link {
   height: auto !important;
-  padding: 0 2px !important;
-  font-size: 12px;
+  padding: 0 var(--space-1) !important;
+  font-size: var(--fs-sm);
 }
 
 .bulk-note {
-  font-size: 11.5px;
+  font-size: var(--fs-xs);
   color: var(--text-3);
   white-space: nowrap;
 }
@@ -902,21 +1190,32 @@ body {
 /* ============================================================
    Table toolbar (count + export + clear)
    ============================================================ */
+/* `flex-wrap` is not cosmetic: this row carries six controls plus the count,
+   and without it the last buttons were clipped by `.app-shell`'s
+   `overflow: hidden` the moment the panel went under ~700px. */
 .table-toolbar {
   display: flex;
   align-items: center;
-  gap: 6px;
-  margin: 0 16px 8px;
+  flex-wrap: wrap;
+  gap: var(--space-2);
+  row-gap: var(--space-2);
+  margin: 0 var(--space-6) var(--space-4);
   min-height: 24px;
   flex: 0 0 auto;
 }
 
 .table-toolbar-count {
-  font-size: 12px;
+  font-size: var(--fs-sm);
   color: var(--text-3);
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
+  font-variant-numeric: tabular-nums;
+}
+
+/* Icon-only below `tight`: the label is dropped, not the control. */
+.toolbar-label {
+  margin-left: var(--space-1);
 }
 
 /* UI-02a: clear confirmation carries a count, a warning and a way out. */
@@ -925,8 +1224,8 @@ body {
 }
 
 .clear-confirm-desc {
-  margin: 0 0 8px;
-  font-size: 12px;
+  margin: 0 0 var(--space-4);
+  font-size: var(--fs-sm);
   line-height: 1.5;
 }
 
@@ -942,14 +1241,14 @@ body {
 }
 
 .bulk-count {
-  font-size: 12px;
+  font-size: var(--fs-sm);
   font-weight: 600;
   color: var(--accent);
   white-space: nowrap;
 }
 
 .bulk-bar .ant-btn {
-  font-size: 12px;
+  font-size: var(--fs-sm);
 }
 
 /* ============================================================
@@ -960,7 +1259,7 @@ body {
   display: flex;
   align-items: center;
   justify-content: center;
-  padding: 24px 20px;
+  padding: var(--space-8) var(--space-7);
 }
 
 .empty-guide-inner {
@@ -970,45 +1269,46 @@ body {
 }
 
 .empty-badge {
-  width: 52px;
-  height: 52px;
-  margin: 0 auto 14px;
-  border-radius: 16px;
+  width: 44px;
+  height: 44px;
+  margin: 0 auto var(--space-5);
+  border-radius: var(--radius-lg);
   display: grid;
   place-items: center;
-  font-size: 24px;
+  font-size: var(--fs-lg);
   color: var(--accent);
   background: var(--accent-soft);
 }
 
 .empty-title {
-  font-size: 14px;
-  font-weight: 600;
-  margin-bottom: 6px;
+  font-size: var(--fs-md);
+  line-height: var(--lh-md);
+  font-weight: 500;
+  margin-bottom: var(--space-2);
 }
 
 .empty-desc {
-  font-size: 12px;
-  color: var(--text-3);
-  line-height: 1.6;
-  margin-bottom: 16px;
+  font-size: var(--fs-sm);
+  line-height: var(--lh-sm);
+  color: var(--text-2);
+  margin-bottom: var(--space-6);
 }
 
 .empty-steps {
   display: flex;
   flex-direction: column;
-  gap: 9px;
+  gap: var(--space-4);
   text-align: left;
-  margin-bottom: 18px;
+  margin-bottom: var(--space-6);
 }
 
 .empty-step {
   display: flex;
   align-items: flex-start;
-  gap: 9px;
-  font-size: 12px;
+  gap: var(--space-4);
+  font-size: var(--fs-sm);
+  line-height: var(--lh-sm);
   color: var(--text-2);
-  line-height: 1.5;
 }
 
 .empty-step-index {
@@ -1018,8 +1318,8 @@ body {
   border-radius: 50%;
   display: grid;
   place-items: center;
-  font-size: 11px;
-  font-weight: 600;
+  font-size: var(--fs-xs);
+  font-weight: 500;
   color: var(--accent);
   background: var(--accent-soft);
   margin-top: 1px;
@@ -1031,10 +1331,10 @@ body {
 .detail-title {
   display: flex;
   align-items: center;
-  gap: 8px;
-  font-size: 15px;
+  gap: var(--space-4);
+  font-size: var(--fs-md);
   font-weight: 600;
-  padding-right: 24px;
+  padding-right: var(--space-8);
   /* Long names must wrap instead of squeezing the nav cluster in `extra`. */
   min-width: 0;
 }
@@ -1044,12 +1344,12 @@ body {
 .detail-nav {
   display: flex;
   align-items: center;
-  gap: 2px;
+  gap: var(--space-1);
 }
 
 .detail-nav-count {
-  margin-right: 4px;
-  font-size: 12px;
+  margin-right: var(--space-2);
+  font-size: var(--fs-sm);
   font-weight: 400;
   font-variant-numeric: tabular-nums;
   color: var(--text-3);
@@ -1059,12 +1359,12 @@ body {
 .detail-type-tag {
   display: inline-flex;
   align-items: center;
-  gap: 4px;
+  gap: var(--space-2);
   cursor: pointer;
 }
 
 .detail-type-add {
-  font-size: 9px;
+  font-size: var(--fs-micro);
   opacity: 0.55;
 }
 
@@ -1083,55 +1383,137 @@ body {
 .detail-types {
   display: flex;
   flex-wrap: wrap;
-  gap: 4px;
+  gap: var(--space-2);
+}
+
+/* M7: mined social profiles. Icon and label travel together but the label is
+   the host, not the full URL — a LinkedIn path is unreadable at drawer width. */
+.detail-socials {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+}
+
+/* Brand colour comes from `.social-glyph`, so only the gap is set here. */
+.detail-social-label .social-glyph {
+  margin-right: var(--space-3);
+}
+
+/* Long addresses would otherwise push the drawer's value column wider than the
+   panel; `break-word` keeps a 60-character email inside its row. */
+.detail-contacts .ant-descriptions-item-content {
+  overflow-wrap: anywhere;
 }
 
 .detail-actions {
   display: flex;
-  gap: 8px;
+  gap: var(--space-4);
   flex-wrap: wrap;
-  padding-top: 4px;
+  padding-top: var(--space-2);
 }
+
+/* The review list had no rules at all — it was a stack of inline styles that
+   inherited the drawer's default type. */
+.detail-section-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-4);
+  margin-bottom: var(--space-4);
+}
+
+.detail-reviews {
+  display: flex;
+  flex-direction: column;
+}
+
+.detail-review {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+  padding: var(--space-4) 0;
+  border-bottom: 1px solid var(--panel-border);
+}
+
+.detail-review:last-child {
+  border-bottom: none;
+}
+
+.detail-review-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: var(--space-4);
+}
+
+.detail-review-stars {
+  font-size: var(--fs-xs);
+}
+
+.detail-title .rating-cell {
+  font-size: var(--fs-xs);
+}
+
+/* `Descriptions` without `bordered` still draws its own label/value grid. These
+   rules give it the same rhythm as `.ui-field`, so the drawer reads as one list
+   rather than two systems stacked. */
+.detail-facts .ant-descriptions-item {
+  padding-bottom: var(--space-3);
+}
+
+.detail-facts .ant-descriptions-item-label {
+  width: 92px;
+  font-size: var(--fs-sm);
+  color: var(--text-3);
+}
+
+.detail-facts .ant-descriptions-item-content {
+  font-size: var(--fs-sm);
+  color: var(--text-1);
+}
+
+.detail-review-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: var(--space-4);
+}
+
+.detail-review-author {
+  font-size: var(--fs-base);
+  font-weight: 500;
+  color: var(--text-1);
+}
+
+.detail-review-time {
+  flex: 0 0 auto;
+  font-size: var(--fs-xs);
+  color: var(--text-3);
+}
+
+.detail-review-body {
+  font-size: var(--fs-base);
+  line-height: var(--lh-base);
+  color: var(--text-2);
+}
+
+.detail-review-reply {
+  margin-top: var(--space-2);
+  padding: var(--space-3) var(--space-4);
+  border-left: 2px solid var(--panel-border-strong);
+  background: var(--panel-bg-soft);
+  border-radius: 0 var(--radius-sm) var(--radius-sm) 0;
+  font-size: var(--fs-sm);
+  line-height: var(--lh-sm);
+  color: var(--text-2);
+}
+
 
 /* ============================================================
    Diagnostics drawer
    ============================================================ */
 .diag-section + .diag-section {
-  margin-top: 18px;
-}
-
-.diag-section-title {
-  font-size: 12px;
-  font-weight: 600;
-  color: var(--text-3);
-  text-transform: uppercase;
-  letter-spacing: 0.6px;
-  margin-bottom: 8px;
-}
-
-.diag-row {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 12px;
-  padding: 7px 0;
-  font-size: 12.5px;
-  border-bottom: 1px dashed var(--panel-border);
-}
-
-.diag-row:last-child {
-  border-bottom: none;
-}
-
-.diag-row .diag-key {
-  color: var(--text-3);
-  flex: 0 0 auto;
-}
-
-.diag-row .diag-value {
-  text-align: right;
-  word-break: break-all;
-  font-variant-numeric: tabular-nums;
+  margin-top: var(--space-7);
 }
 
 /* ============================================================
@@ -1140,85 +1522,67 @@ body {
 .bootstrap-error {
   display: flex;
   flex-direction: column;
-  gap: 10px;
+  gap: var(--space-5);
   max-width: 560px;
   margin: 80px auto;
-  padding: 24px;
-  font-size: 13px;
+  padding: var(--space-8);
+  font-size: var(--fs-base);
   line-height: 1.6;
   color: var(--text-1);
 }
 
 .bootstrap-error h1 {
-  font-size: 18px;
+  font-size: var(--fs-lg);
   margin: 0;
 }
 
 .bootstrap-error pre {
   margin: 0;
-  padding: 10px;
-  border-radius: 8px;
+  padding: var(--space-5);
+  border-radius: var(--radius-lg);
   background: var(--panel-border);
   white-space: pre-wrap;
   word-break: break-all;
-  font-size: 12px;
+  font-size: var(--fs-sm);
 }
 
 /* ============================================================
    Settings drawer
    ============================================================ */
-.settings-section-title {
-  font-size: 12px;
-  font-weight: 600;
-  color: var(--text-3);
-  text-transform: uppercase;
-  letter-spacing: 0.6px;
-  margin-bottom: 8px;
-}
-
+/* The only group rule left that is specific to this drawer: a second group
+   needs air above it. */
 .settings-section-title--spaced {
-  margin-top: 22px;
+  margin-top: var(--space-7);
 }
 
 /* UI-08: the tabs carry the group titles; keep the bar tight in the narrow
    drawer so the first rows are visible without scrolling. */
 .settings-tabs .ant-tabs-nav {
-  margin-bottom: 2px;
+  margin-bottom: var(--space-1);
 }
 
 .settings-tabs .ant-tabs-tab {
-  padding: 6px 9px;
-  font-size: 12.5px;
+  padding: var(--space-3) var(--space-4);
+  font-size: var(--fs-sm);
 }
 
 .settings-tabs .ant-tabs-tab + .ant-tabs-tab {
-  margin-left: 4px;
+  margin-left: var(--space-2);
 }
 
 .settings-tabs .ant-tabs-content-holder {
-  padding-top: 6px;
+  padding-top: var(--space-3);
 }
 
 .settings-radio-col {
   display: flex;
   flex-direction: column;
-  gap: 2px;
+  gap: var(--space-1);
 }
 
 .settings-radio-col .ant-radio-wrapper {
-  font-size: 12.5px;
+  font-size: var(--fs-sm);
   margin-inline-end: 0;
-}
-
-.settings-hint {
-  padding: 2px 0 6px;
-  font-size: 11.5px;
-  line-height: 1.5;
-  color: var(--text-3);
-}
-
-.settings-hint--warn {
-  color: var(--warning);
 }
 
 /* Long export paths must not push the buttons out of the drawer. */
@@ -1228,58 +1592,44 @@ body {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
-  font-size: 11.5px;
+  font-size: var(--fs-xs);
   color: var(--text-2);
 }
 
 .settings-dash {
-  margin: 0 2px;
+  margin: 0 var(--space-1);
   color: var(--text-3);
 }
 
 /* Running build version in the settings update row (G-06). */
 .settings-version {
-  font-size: 12px;
+  font-size: var(--fs-sm);
   font-variant-numeric: tabular-nums;
   color: var(--text-2);
 }
 
 /* Release notes inside the update offer modal (G-06). */
 .update-notes {
-  margin-bottom: 12px;
-  font-size: 12.5px;
+  margin-bottom: var(--space-5);
+  font-size: var(--fs-sm);
   line-height: 1.6;
   white-space: pre-wrap;
   color: var(--text-2);
 }
 
 .update-notes-title {
-  margin-bottom: 4px;
+  margin-bottom: var(--space-2);
   font-weight: 600;
   color: var(--text-1);
 }
 
 .update-installing {
-  font-size: 12.5px;
+  font-size: var(--fs-sm);
   color: var(--text-2);
 }
 
 .update-installing .ant-progress {
-  margin-top: 8px;
-}
-
-.settings-row {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 12px;
-  padding: 8px 0;
-  font-size: 12.5px;
-  border-bottom: 1px dashed var(--panel-border);
-}
-
-.settings-row:last-of-type {
-  border-bottom: none;
+  margin-top: var(--space-4);
 }
 
 /* ============================================================
@@ -1290,7 +1640,7 @@ body {
   min-height: 0;
   display: flex;
   flex-direction: column;
-  padding: 0 16px;
+  padding: 0 var(--space-6) var(--space-5);
 }
 
 .collect-toolbar {
@@ -1298,12 +1648,12 @@ body {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  gap: 8px;
-  padding: 2px 0 8px;
+  gap: var(--space-4);
+  padding: var(--space-1) 0 var(--space-4);
 }
 
 .collect-count {
-  font-size: 11.5px;
+  font-size: var(--fs-xs);
   color: var(--text-3);
   font-variant-numeric: tabular-nums;
 }
@@ -1312,14 +1662,20 @@ body {
   flex: 1 1 auto;
   min-height: 0;
   overflow-y: auto;
-  padding-right: 2px;
+  padding-right: var(--space-1);
 }
 
 .task-group-label {
-  font-size: 11px;
-  letter-spacing: 0.3px;
+  margin: var(--space-5) 0 var(--space-3);
+  font-size: var(--fs-xs);
+  line-height: var(--lh-xs);
+  letter-spacing: 0.02em;
   color: var(--text-3);
-  margin: 10px 0 6px;
+}
+
+.task-list {
+  display: flex;
+  flex-direction: column;
 }
 
 .task-group:first-child .task-group-label {
@@ -1328,16 +1684,17 @@ body {
 
 .task-card {
   border: 1px solid var(--panel-border);
-  border-radius: 10px;
+  border-radius: var(--radius-lg);
   background: var(--panel-bg);
-  padding: 8px 10px;
-  margin-bottom: 8px;
+  padding: var(--space-4) var(--space-5);
+  margin-bottom: var(--space-3);
   cursor: pointer;
-  transition: border-color 0.15s ease, box-shadow 0.15s ease;
+  transition: border-color var(--dur-fast) var(--ease), background var(--dur-fast) var(--ease);
 }
 
 .task-card:hover {
   border-color: var(--panel-border-strong);
+  background: var(--panel-bg-soft);
 }
 
 .task-card:focus-visible {
@@ -1345,6 +1702,9 @@ body {
   outline-offset: 1px;
 }
 
+/* The running task is the one thing on this page that changes by itself, so it
+   keeps the accent bar. No shadow: the bar is enough, and a shadow would put
+   this card on a different elevation than its neighbours. */
 .task-card.is-running {
   box-shadow: inset 2px 0 0 var(--accent);
 }
@@ -1352,72 +1712,26 @@ body {
 .task-card-line {
   display: flex;
   align-items: center;
-  gap: 6px;
+  gap: var(--space-3);
   min-width: 0;
-}
-
-.task-dot {
-  flex: 0 0 auto;
-  width: 7px;
-  height: 7px;
-  border-radius: 50%;
-  background: var(--panel-border-strong);
-}
-
-.task-dot.is-running {
-  background: var(--accent);
-  animation: task-pulse 1.6s ease-in-out infinite;
-}
-
-.task-dot.is-completed {
-  background: var(--text-3);
-}
-
-.task-dot.is-paused {
-  background: var(--warning);
-}
-
-.task-dot.is-failed {
-  background: var(--live);
-}
-
-@keyframes task-pulse {
-  0%,
-  100% {
-    opacity: 1;
-  }
-  50% {
-    opacity: 0.35;
-  }
 }
 
 .task-card-name {
   flex: 1 1 auto;
   min-width: 0;
-  font-size: 13px;
-  font-weight: 600;
+  font-size: var(--fs-base);
+  line-height: var(--lh-base);
+  font-weight: 500;
   color: var(--text-1);
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
 
+/* Layout only. The colour, the dot and the pulse come from `.ui-status` — the
+   class stays because `scripts/e2e/tasks.mjs` reads this element's text. */
 .task-card-status {
   flex: 0 0 auto;
-  font-size: 11px;
-  color: var(--text-3);
-}
-
-.task-card-status.is-running {
-  color: var(--accent);
-}
-
-.task-card-status.is-paused {
-  color: var(--warning);
-}
-
-.task-card-status.is-failed {
-  color: var(--live);
 }
 
 .task-card-more {
@@ -1427,27 +1741,36 @@ body {
 .task-card-meta {
   display: flex;
   flex-wrap: wrap;
-  gap: 8px;
-  margin-top: 2px;
-  font-size: 11px;
+  align-items: baseline;
+  gap: var(--space-3);
+  margin-top: var(--space-2);
+  font-size: var(--fs-xs);
+  line-height: var(--lh-xs);
   color: var(--text-3);
   font-variant-numeric: tabular-nums;
 }
 
+/* The one figure the user opened this page for. It used to sit in the same
+   11px grey run as "4/12 tiles". */
+.task-card-found {
+  color: var(--text-1);
+  font-weight: 500;
+}
+
 .task-card-failed {
-  color: var(--live);
+  color: var(--danger);
 }
 
 .task-card-actions {
   display: flex;
   flex-wrap: wrap;
-  gap: 2px;
-  margin-top: 2px;
+  gap: var(--space-1);
+  margin-top: var(--space-2);
 }
 
 .task-card-actions .ant-btn {
-  padding-inline: 6px;
-  font-size: 12px;
+  padding-inline: var(--space-3);
+  font-size: var(--fs-sm);
 }
 
 /* Single-flight is a product rule: a disabled start button must still explain
@@ -1460,25 +1783,23 @@ body {
   color: var(--text-3);
 }
 
+/* Layout only; the type comes from `.ui-hint`. */
 .task-single-flight {
-  margin: 8px 0 4px;
-  padding-top: 8px;
-  border-top: 1px dashed var(--panel-border);
-  font-size: 11px;
-  line-height: 1.5;
-  color: var(--text-3);
+  margin: var(--space-4) 0 var(--space-2);
+  padding-top: var(--space-4);
+  border-top: 1px solid var(--panel-border);
 }
 
 .task-batch-head {
   width: 100%;
   display: flex;
   align-items: center;
-  gap: 6px;
-  padding: 6px 4px;
+  gap: var(--space-3);
+  padding: var(--space-3) var(--space-2);
   border: none;
   background: none;
   cursor: pointer;
-  font-size: 12px;
+  font-size: var(--fs-sm);
   color: var(--text-2);
   text-align: left;
 }
@@ -1504,24 +1825,19 @@ body {
 
 .task-batch-count {
   flex: 0 0 auto;
-  font-size: 11px;
+  font-size: var(--fs-xs);
   color: var(--text-3);
 }
 
 .task-batch-body {
-  padding-left: 10px;
-  border-left: 1px dashed var(--panel-border);
+  padding-left: var(--space-5);
+  border-left: 1px solid var(--panel-border);
 }
 
 .queue-delete-confirm {
   display: flex;
   flex-direction: column;
-  gap: 8px;
-}
-
-.queue-delete-note {
-  font-size: 11px;
-  color: var(--text-3);
+  gap: var(--space-4);
 }
 
 /* ============================================================
@@ -1532,15 +1848,15 @@ body {
   min-height: 0;
   display: flex;
   flex-direction: column;
-  padding: 0 16px;
+  padding: 0 var(--space-6) var(--space-5);
 }
 
 .task-detail-head {
   flex: 0 0 auto;
   display: flex;
   align-items: center;
-  gap: 6px;
-  padding: 6px 0;
+  gap: var(--space-3);
+  padding: var(--space-3) 0;
 }
 
 .task-detail-title {
@@ -1551,29 +1867,18 @@ body {
 }
 
 .task-detail-name {
-  font-size: 14px;
-  font-weight: 600;
+  font-size: var(--fs-md);
+  line-height: var(--lh-md);
+  font-weight: 500;
   color: var(--text-1);
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
 
+/* Layout only; colour and dot come from `.ui-status`. */
 .task-detail-status {
-  font-size: 11px;
-  color: var(--text-3);
-}
-
-.task-detail-status.is-running {
-  color: var(--accent);
-}
-
-.task-detail-status.is-paused {
-  color: var(--warning);
-}
-
-.task-detail-status.is-failed {
-  color: var(--live);
+  flex: 0 0 auto;
 }
 
 .task-detail-tabs {
@@ -1584,40 +1889,40 @@ body {
 }
 
 .task-detail-tabs .ant-tabs-nav {
-  margin-bottom: 8px;
+  margin-bottom: var(--space-4);
 }
 
 .task-detail-tabs .ant-tabs-content-holder {
   overflow-y: auto;
-  padding-right: 2px;
+  padding-right: var(--space-1);
 }
 
 .task-detail-overview {
   display: flex;
   flex-direction: column;
-  gap: 10px;
-  padding-bottom: 12px;
+  gap: var(--space-5);
+  padding-bottom: var(--space-5);
 }
 
 .task-detail-progress-head {
   display: flex;
   align-items: baseline;
   justify-content: space-between;
-  gap: 8px;
-  font-size: 12px;
+  gap: var(--space-4);
+  font-size: var(--fs-sm);
   color: var(--text-2);
   font-variant-numeric: tabular-nums;
 }
 
 .task-detail-muted {
-  font-size: 11px;
+  font-size: var(--fs-xs);
   color: var(--text-3);
 }
 
 .task-detail-facts {
   display: grid;
   grid-template-columns: 1fr 1fr;
-  gap: 6px 14px;
+  gap: var(--space-2) var(--space-6);
   margin: 0;
 }
 
@@ -1625,8 +1930,9 @@ body {
   display: flex;
   align-items: baseline;
   justify-content: space-between;
-  gap: 8px;
-  font-size: 12px;
+  gap: var(--space-4);
+  font-size: var(--fs-sm);
+  line-height: var(--lh-sm);
 }
 
 .task-detail-facts dt {
@@ -1640,21 +1946,14 @@ body {
   font-variant-numeric: tabular-nums;
 }
 
-.task-detail-note {
-  font-size: 11px;
-  color: var(--text-3);
-}
-
 /* Sits above the preview table: below it, the note was only reachable after
-   scrolling through all 50 rows. */
+   scrolling through all 50 rows. Layout only. */
 .task-detail-more {
-  padding-bottom: 6px;
-  font-size: 11px;
-  color: var(--text-3);
+  padding-bottom: var(--space-3);
 }
 
 .grid-field-error {
-  font-size: 11px;
+  font-size: var(--fs-xs);
   color: var(--live);
 }
 
@@ -1672,14 +1971,9 @@ body {
   display: flex;
   flex-direction: column;
   align-items: center;
-  gap: 10px;
-  padding: 32px 16px;
+  gap: var(--space-5);
+  padding: var(--space-9) var(--space-6);
   text-align: center;
-}
-
-.empty-data-note {
-  font-size: 12px;
-  color: var(--text-3);
 }
 
 /* ============================================================
@@ -1688,21 +1982,21 @@ body {
 .task-runs {
   display: flex;
   flex-direction: column;
-  gap: 8px;
-  padding-bottom: 12px;
+  gap: var(--space-4);
+  padding-bottom: var(--space-5);
 }
 
 .task-run {
   display: flex;
-  gap: 8px;
-  padding: 8px 10px;
+  gap: var(--space-4);
+  padding: var(--space-4) var(--space-5);
   border: 1px solid var(--panel-border);
-  border-radius: 8px;
+  border-radius: var(--radius-lg);
 }
 
 .task-run-index {
   flex: 0 0 auto;
-  font-size: 11px;
+  font-size: var(--fs-xs);
   color: var(--text-3);
   font-variant-numeric: tabular-nums;
 }
@@ -1716,46 +2010,33 @@ body {
   display: flex;
   align-items: baseline;
   justify-content: space-between;
-  gap: 8px;
-  font-size: 12px;
+  gap: var(--space-4);
+  font-size: var(--fs-sm);
   color: var(--text-2);
   font-variant-numeric: tabular-nums;
 }
 
+/* Layout only; colour and dot come from `.ui-status`. */
 .task-run-status {
   flex: 0 0 auto;
-  font-size: 11px;
-  color: var(--text-3);
-}
-
-.task-run-status.is-running {
-  color: var(--accent);
-}
-
-.task-run-status.is-paused {
-  color: var(--warning);
-}
-
-.task-run-status.is-failed {
-  color: var(--live);
 }
 
 .task-run-meta {
-  margin-top: 2px;
-  font-size: 11px;
+  margin-top: var(--space-1);
+  font-size: var(--fs-xs);
   color: var(--text-3);
   font-variant-numeric: tabular-nums;
 }
 
 .task-failed {
   border: 1px solid var(--panel-border);
-  border-radius: 8px;
-  padding: 8px 10px;
+  border-radius: var(--radius-lg);
+  padding: var(--space-4) var(--space-5);
 }
 
-.task-failed-head {
-  margin-bottom: 4px;
-  font-size: 12px;
+/* The shared section label, tinted for the one place where the group means
+   "something went wrong". */
+.task-failed > .ui-section {
   color: var(--warning);
 }
 
@@ -1763,8 +2044,8 @@ body {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  gap: 8px;
-  font-size: 11.5px;
+  gap: var(--space-4);
+  font-size: var(--fs-sm);
   color: var(--text-2);
 }
 
@@ -1774,8 +2055,8 @@ body {
 
 /* A5: the short failure code sits right after the coordinates. */
 .task-failed-reason {
-  margin-left: 6px;
-  color: var(--danger, #cf1322);
+  margin-left: var(--space-3);
+  color: var(--danger);
 }
 
 .task-failed-coord .task-failed-reason::before {
@@ -1785,30 +2066,16 @@ body {
 
 @media (max-width: 640px) {
   .view-switch .ant-segmented-item-label {
-    padding: 0 6px;
-    font-size: 12px;
+    padding: 0 var(--space-3);
+    font-size: var(--fs-sm);
   }
-}
-
-.settings-label {
-  color: var(--text-3);
-  flex: 0 0 auto;
-}
-
-.settings-control {
-  flex: 1;
-  min-width: 0;
-  display: flex;
-  align-items: center;
-  justify-content: flex-end;
-  gap: 4px;
 }
 
 .settings-footer {
   display: flex;
   justify-content: flex-end;
-  margin-top: 20px;
-  padding-top: 14px;
+  margin-top: var(--space-7);
+  padding-top: var(--space-5);
   border-top: 1px solid var(--panel-border);
 }
 
@@ -1835,7 +2102,7 @@ body {
   width: 3px;
   height: 38px;
   margin-top: -19px;
-  border-radius: 3px;
+  border-radius: var(--radius-sm);
   background: var(--panel-border-strong);
   opacity: 0;
   transition: opacity 0.15s ease;
@@ -1872,10 +2139,10 @@ body {
   height: 28px;
   padding: 0;
   border: none;
-  border-radius: 4px 0 0 4px;
+  border-radius: var(--radius-sm) 0 0 var(--radius-sm);
   background: var(--accent-solid);
-  color: #ffffff;
-  font-size: 9px;
+  color: var(--accent-fg);
+  font-size: var(--fs-micro);
   cursor: pointer;
   opacity: 0;
   transition: opacity 0.15s ease;
@@ -1887,8 +2154,11 @@ body {
   opacity: 1;
 }
 
+/* Not `--accent`: in dark mode that is a light lavender, and the white label on
+   it drops to 2.5:1. Brightening the solid keeps the pair readable in both
+   themes, the same way `.new-rows-pill:hover` does. */
 .split-collapse-btn:hover {
-  background: var(--accent);
+  filter: brightness(1.06);
 }
 
 /* UI-11: restore strip while the map is collapsed. 12px wide, full height,
@@ -1916,7 +2186,7 @@ body {
   border: none;
   background: transparent;
   color: var(--text-3);
-  font-size: 9px;
+  font-size: var(--fs-micro);
   cursor: pointer;
 }
 
@@ -1930,40 +2200,49 @@ body {
    Shortcut reference (UI-10)
    ============================================================ */
 .shortcut-group + .shortcut-group {
-  margin-top: 14px;
+  margin-top: var(--space-6);
 }
 
+/* Sentence case, not caps. Chinese has no uppercase form, so a caps-only
+   micro-label reads as a different style in `zh` than in `en`/`es`. */
 .shortcut-group-title {
-  font-size: 11px;
-  font-weight: 600;
-  text-transform: uppercase;
-  letter-spacing: 0.04em;
+  margin-bottom: var(--space-2);
+  font-size: var(--fs-xs);
+  line-height: var(--lh-xs);
+  font-weight: 500;
+  letter-spacing: 0.02em;
   color: var(--text-3);
-  margin-bottom: 4px;
 }
 
 .shortcut-row {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  gap: 12px;
-  padding: 3px 0;
-  font-size: 12px;
+  gap: var(--space-5);
+  padding: var(--space-1) 0;
+  font-size: var(--fs-sm);
+}
+
+.shortcut-label {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .shortcut-keys {
   display: inline-flex;
-  gap: 3px;
+  gap: var(--space-1);
   flex-shrink: 0;
 }
 
 .shortcut-key {
-  font-family: inherit;
-  font-size: 11px;
+  font-family: var(--font-mono);
+  font-size: var(--fs-xs);
   line-height: 1;
-  padding: 3px 5px;
+  padding: var(--space-1) var(--space-2);
   border: 1px solid var(--panel-border-strong);
-  border-radius: 4px;
+  border-radius: var(--radius-sm);
   background: var(--panel-bg-soft);
   color: var(--text-2);
   white-space: nowrap;
@@ -1979,15 +2258,189 @@ body.is-resizing * {
 }
 
 /* ============================================================
-   Responsive tweaks for a narrow panel
+   Business cards — the compact replacement for the table (UI-14)
    ============================================================ */
-@media (max-width: 520px) {
-  .brand-sub {
-    display: none;
-  }
-  .listen-hint {
-    display: none;
-  }
+
+/* Below `BREAKPOINTS.compact` a seven-column grid cannot be read, so each row
+   becomes a two-line card. Same data, same selection model, same row menu. */
+.business-cards {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+}
+
+.business-card {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--space-3);
+  padding: var(--space-4) var(--space-5);
+  border-bottom: 1px solid var(--panel-border);
+}
+
+.business-card:hover {
+  background: var(--hover);
+}
+
+.business-card.is-selected {
+  background: var(--accent-soft);
+  box-shadow: inset 2px 0 0 var(--accent);
+}
+
+.business-card-check {
+  flex: 0 0 auto;
+  padding-top: 1px;
+}
+
+/* The body is the clickable target and a real button, so the checkbox and the
+   row menu stay outside it instead of nesting one control in another. */
+.business-card-body {
+  flex: 1 1 auto;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+  padding: 0;
+  border: none;
+  background: none;
+  font: inherit;
+  color: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+
+.business-card-body:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+.business-card-head {
+  display: flex;
+  align-items: baseline;
+  gap: var(--space-3);
+  min-width: 0;
+}
+
+.business-card-name {
+  flex: 1 1 auto;
+  min-width: 0;
+  font-size: var(--fs-base);
+  line-height: var(--lh-base);
+  font-weight: 500;
+  color: var(--text-1);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.business-card-rating {
+  flex: 0 0 auto;
+  font-size: var(--fs-xs);
+  color: var(--text-2);
+  font-variant-numeric: tabular-nums;
+}
+
+.business-card-address {
+  font-size: var(--fs-sm);
+  line-height: var(--lh-sm);
+  color: var(--text-2);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.business-card-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-3);
+  font-size: var(--fs-xs);
+  line-height: var(--lh-xs);
+  color: var(--text-3);
+  font-variant-numeric: tabular-nums;
+}
+
+.business-card-actions {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  gap: var(--space-1);
+}
+
+.business-card-empty {
+  padding: var(--space-8) var(--space-5);
+}
+
+/* ============================================================
+   Compact panel (UI-14)
+   ============================================================ */
+
+/* `is-tight` and `is-compact` are set by `usePanelLayout`, which reads
+   `BREAKPOINTS` in `src/design/breakpoints.ts`. The panel webview's viewport is
+   the panel width, so a media query would work too — but then the numbers
+   would live twice, and the table swap needs the flag in JS anyway. */
+
+.app-shell.is-tight .brand-sub {
+  display: none;
+}
+
+.app-shell.is-tight .listen-hint {
+  display: none;
+}
+
+.app-shell.is-tight .toolbar-label {
+  display: none;
+}
+
+.app-shell.is-compact .brand-bar {
+  gap: var(--space-2);
+  padding: var(--space-4) var(--space-5);
+}
+
+.app-shell.is-compact .brand-text {
+  display: none;
+}
+
+/* The status words are the first thing to give up room when the panel gets
+   close to the split floor: the dot still says "collecting", the tooltip still
+   carries the sentence. */
+.app-shell.is-compact .status-pill {
+  min-width: 0;
+}
+
+.app-shell.is-compact .status-text {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.app-shell.is-compact .metrics {
+  padding: var(--space-4) var(--space-5);
+}
+
+.app-shell.is-compact .metric + .metric {
+  padding-left: var(--space-4);
+}
+
+.app-shell.is-compact .metric.is-hero .metric-value {
+  font-size: var(--fs-lg);
+  line-height: var(--lh-lg);
+}
+
+.app-shell.is-compact .filter-bar,
+.app-shell.is-compact .table-toolbar {
+  margin-left: var(--space-4);
+  margin-right: var(--space-4);
+}
+
+.app-shell.is-compact .collect-view,
+.app-shell.is-compact .task-detail {
+  padding: 0 var(--space-4) var(--space-4);
+}
+
+.app-shell.is-compact .bulk-bar {
+  margin-left: var(--space-4);
+  margin-right: var(--space-4);
 }
 
 /* ============================================================

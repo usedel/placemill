@@ -10,6 +10,7 @@ A Windows desktop tool that collects Google Maps business data (Tauri v2 + React
 - **Job queue** — queue many keywords at once; jobs run sequentially and survive app restarts (finished cells are never re-run). Dead pages such as consent screens or CAPTCHAs pause the job instead of burning requests.
 - **Data management** — filter by name/rating/contact/type, SQL-backed pagination that stays fast at 100k+ rows, one-click Excel/CSV export.
 - **Email & social mining** — visit a business website and its contact pages to extract emails and social links (optional, off by default).
+- **Email verification** — mined addresses are checked with offline rules plus DNS (DoH) MX lookups, cached per address and shown next to the rows; exports carry `Email Status` / `Email Verification`. Does not occupy the map pane.
 - **Observability** — a diagnostics drawer with live collector state, row counts, query P95 and recent errors.
 - **Local-first** — everything is stored in a local SQLite file; nothing leaves the machine.
 
@@ -89,9 +90,11 @@ npm run e2e:grid       # grid collection
 npm run e2e:queue      # queue + resume
 npm run e2e:tasks      # task views
 npm run e2e:browse     # paginated browsing
+npm run e2e:compact    # compact layout / narrow panel
 npm run e2e:pane       # maps pane occupancy / single-flight
 npm run e2e:interceptor
 npm run e2e:emails
+npm run e2e:verify     # email verification (local DoH fixtures)
 npm run e2e:real       # real Google search (network-dependent)
 ```
 
@@ -156,6 +159,8 @@ placemill/
 ├── src/                       # React frontend
 │   ├── App.tsx                # main UI + data orchestration (server-side pagination)
 │   ├── components/            # header, metrics, filters, job queue, drawers, split handle
+│   ├── components/ui/         # shared primitives (pills, empty state, field rows)
+│   ├── design/                # palette/scale tokens + panel breakpoints
 │   ├── settings/ i18n/ types/ # preferences, localization (en/zh, es scaffold), types
 ├── src-tauri/                 # Rust backend
 │   ├── src/
@@ -165,6 +170,7 @@ placemill/
 │   │   ├── grid.rs            # grid generation + adaptive quadtree geometry
 │   │   ├── db.rs              # SQLite (business + job tables + migrations)
 │   │   ├── email_miner.rs     # website/contact-page email & social extraction
+│   │   ├── email_verify.rs    # offline rules + DoH MX verification, per-address cache
 │   │   └── remote_config.rs   # signed remote field-map config
 │   ├── scripts/
 │   │   └── intercept.js       # Google Maps injection script

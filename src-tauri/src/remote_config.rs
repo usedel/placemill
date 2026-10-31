@@ -198,6 +198,81 @@ pub struct RemoteFieldMap {
     pub channel: String,
     /// Optional miner heuristics (M7); `Default` when the document omits them.
     pub email_rules: EmailRules,
+    /// Optional verifier heuristics (G-04). `Default` (empty) means "built-in
+    /// lists and endpoints" — the same forward-compatible shape as
+    /// `email_rules`.
+    pub verify_rules: VerifyRules,
+}
+
+/// Hot-updatable inputs for the email verifier (G-04). Pure data, and the
+/// semantics are deliberately asymmetric:
+///
+/// - `disposableDomains` is **appended** to the built-in list: a wrong publish
+///   can only under-block, never switch the built-in protection off.
+/// - `dohEndpoints` **replaces** the list (order is priority). An empty array
+///   means "use the built-ins".
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct VerifyRules {
+    pub disposable_domains: Vec<String>,
+    pub doh_endpoints: Vec<String>,
+}
+
+impl Default for VerifyRules {
+    fn default() -> Self {
+        VerifyRules {
+            disposable_domains: Vec::new(),
+            doh_endpoints: Vec::new(),
+        }
+    }
+}
+
+impl VerifyRules {
+    fn validate(&self) -> Result<(), String> {
+        if self.disposable_domains.len() > 5_000 {
+            return Err(format!(
+                "verifyRules.disposableDomains has {} entries (max 5000)",
+                self.disposable_domains.len()
+            ));
+        }
+        for entry in &self.disposable_domains {
+            if entry.is_empty() || entry.len() > 253 || !is_domain_shaped(entry) {
+                return Err(format!(
+                    "verifyRules.disposableDomains entry is not a domain: {:?}",
+                    entry
+                ));
+            }
+        }
+        if self.doh_endpoints.len() > 4 {
+            return Err(format!(
+                "verifyRules.dohEndpoints has {} entries (max 4)",
+                self.doh_endpoints.len()
+            ));
+        }
+        for endpoint in &self.doh_endpoints {
+            // `https://` only: the debug hook covers local fixtures, and an
+            // `http://` endpoint from a signed config would be a plaintext
+            // query log waiting to be read.
+            if !endpoint.starts_with("https://") || endpoint.len() > 300 {
+                return Err(format!(
+                    "verifyRules.dohEndpoints entry must be https and <= 300 chars: {:?}",
+                    endpoint
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Lowercase letters, digits, hyphens and dots — no scheme, no path, no port.
+fn is_domain_shaped(value: &str) -> bool {
+    !value.is_empty()
+        && value
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || ch == '-' || ch == '.')
+        && !value.starts_with('.')
+        && !value.ends_with('.')
+        && !value.contains("..")
 }
 
 /// Hot-updatable heuristics for the site miner (M7). Pure data — string lists
@@ -269,6 +344,10 @@ struct RemoteConfig {
     field_map: FieldMap,
     #[serde(default, rename = "emailRules")]
     email_rules: EmailRules,
+    /// G-04: absent in every config published before the verifier shipped, so
+    /// the default is what keeps those documents loading.
+    #[serde(default, rename = "verifyRules")]
+    verify_rules: VerifyRules,
 }
 
 /// Parse and validate one config document. Every rule here also exists in
@@ -303,11 +382,13 @@ fn parse_config(body: &str, app_version: &str) -> Result<RemoteFieldMap, String>
     }
     config.field_map.validate()?;
     config.email_rules.validate()?;
+    config.verify_rules.validate()?;
     Ok(RemoteFieldMap {
         map: config.field_map,
         version,
         channel,
         email_rules: config.email_rules,
+        verify_rules: config.verify_rules,
     })
 }
 

@@ -3,6 +3,7 @@ import type {
   Key as ReactKey,
   KeyboardEvent as ReactKeyboardEvent,
   MouseEvent as ReactMouseEvent,
+  ReactNode,
 } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { listen, UnlistenFn } from '@tauri-apps/api/event';
@@ -12,7 +13,6 @@ import {
   Button,
   Checkbox,
   Dropdown,
-  Empty,
   Modal,
   Popconfirm,
   Popover,
@@ -34,18 +34,18 @@ import {
   DownloadOutlined,
   DownOutlined,
   EnvironmentFilled,
-  FacebookOutlined,
   FolderOpenOutlined,
   GlobalOutlined,
-  InstagramOutlined,
-  LinkedinOutlined,
+  MailFilled,
   MailOutlined,
+  SafetyCertificateOutlined,
   FileDoneOutlined,
   SyncOutlined,
   MoreOutlined,
   PlusOutlined,
   StarFilled,
-  XOutlined,
+  StopOutlined,
+  WarningOutlined,
 } from '@ant-design/icons';
 
 import PanelHeader from './components/PanelHeader';
@@ -56,7 +56,13 @@ import MetricStrip from './components/MetricStrip';
 import MapHealthNotice from './components/MapHealthNotice';
 import type { MapHealth, SessionSummary } from './types/collector';
 import FilterBar from './components/FilterBar';
-import type { ContactFilter, RatingFilter, TaskFilter, TimeRange } from './components/FilterBar';
+import type {
+  ContactFilter,
+  RatingFilter,
+  TaskFilter,
+  TimeRange,
+  VerifyFilter,
+} from './components/FilterBar';
 import BulkBar from './components/BulkBar';
 import DetailDrawer from './components/DetailDrawer';
 import DiagnosticsDrawer from './components/DiagnosticsDrawer';
@@ -64,16 +70,28 @@ import SettingsDrawer from './components/SettingsDrawer';
 import ShortcutsDialog from './components/ShortcutsDialog';
 import GridDialog from './components/GridDialog';
 import SplitHandle, { DEFAULT_SPLIT } from './components/SplitHandle';
-import type { Business, BusinessJobRef, BusinessPage, BusinessStats } from './types/business';
+import BusinessCardList from './components/BusinessCardList';
+import EmptyState from './components/ui/EmptyState';
+import { usePanelLayout } from './design/usePanelLayout';
+import type {
+  AddressVerification,
+  Business,
+  BusinessJobRef,
+  BusinessPage,
+  BusinessStats,
+  BusinessVerificationRef,
+} from './types/business';
 import type { Diagnostics } from './types/collector';
 import type { Job } from './types/job';
 import type { ExportCompleted } from './types/export';
 import { useSettings } from './settings/SettingsContext';
 import { renderFileName } from './settings/fileName';
 import { linkLabel, safeHttpUrl } from './lib/url';
+import { emailStatusKey, socialIcon } from './lib/contacts';
 import { typeLabel } from './lib/text';
 import { paneBusyMessageKey } from './lib/busy';
 import { useI18n } from './i18n';
+import type { MessageKey, TFunc } from './i18n';
 import { checkForUpdate, downloadAndInstall, type UpdateOffer } from './updater';
 
 const { Text } = Typography;
@@ -126,6 +144,8 @@ const EXPORTABLE_TABLE_KEYS = [
   'city',
   'open_hours',
   'owner_name',
+  // G-04: both export columns hang off this one table column.
+  'email_verify',
 ] as const;
 
 /**
@@ -176,6 +196,109 @@ const EMPTY_STATS: BusinessStats = {
 
 type SortState = { field: string; direction: 'asc' | 'desc' };
 
+/** Live progress of one verification run (G-04). */
+type VerifyProgress = {
+  done: number;
+  total: number;
+  cached: number;
+  valid: number;
+  risky: number;
+  invalid: number;
+  unknown: number;
+  error: number;
+  lookups: number;
+  /** The domain being resolved — never an address (privacy + width). */
+  current: string;
+};
+
+/** The preflight answer; every threshold in it is decided in Rust. */
+type VerifyPlan = {
+  rows: number;
+  addresses: number;
+  cached: number;
+  pending: number;
+  localInvalid: number;
+  lookups: number;
+  tooMany: boolean;
+  limit: number;
+  confirm: boolean;
+};
+
+/** The scope a run was started with, frozen at preflight time. */
+type VerifyScope = {
+  placeIds: string[];
+  filter: Record<string, unknown> | null;
+};
+
+/** The running state before the first event lands: counters all zero. */
+const EMPTY_VERIFY_PROGRESS: VerifyProgress = {
+  done: 0,
+  total: 0,
+  cached: 0,
+  valid: 0,
+  risky: 0,
+  invalid: 0,
+  unknown: 0,
+  error: 0,
+  lookups: 0,
+  current: '',
+};
+
+/** Status token → message key. Explicit so a new status cannot go untranslated. */
+const VERIFY_STATUS_KEYS: Record<string, MessageKey> = {
+  valid: 'verify.status.valid',
+  risky: 'verify.status.risky',
+  invalid: 'verify.status.invalid',
+  unknown: 'verify.status.unknown',
+  error: 'verify.status.error',
+  unverified: 'verify.status.unverified',
+};
+
+const VERIFY_FLAG_KEYS: Record<string, MessageKey> = {
+  syntax: 'verify.flag.syntax',
+  ip_domain: 'verify.flag.ip_domain',
+  role: 'verify.flag.role',
+  free_mail: 'verify.flag.free_mail',
+  typo: 'verify.flag.typo',
+  non_ascii: 'verify.flag.non_ascii',
+  disposable: 'verify.flag.disposable',
+  nxdomain: 'verify.flag.nxdomain',
+  no_mx: 'verify.flag.no_mx',
+  implicit_mx: 'verify.flag.implicit_mx',
+  null_mx: 'verify.flag.null_mx',
+  same_domain: 'verify.flag.same_domain',
+};
+
+/** Human label for a status token, shared by the cell and the email tooltip. */
+const verifyStatusText = (t: TFunc, status: string) =>
+  status === 'unverified'
+    ? t('table.verifyNone')
+    : t(VERIFY_STATUS_KEYS[status] ?? 'table.verifyNone');
+
+/** AntD semantic colours — never a hard-coded hex, so dark mode survives. */
+const VERIFY_TAG_COLOR: Record<string, string | undefined> = {
+  valid: 'success',
+  risky: 'warning',
+  invalid: 'error',
+  unknown: 'default',
+  error: 'default',
+};
+
+type VerifyDone = {
+  total: number;
+  done: number;
+  cached: number;
+  lookups: number;
+  valid: number;
+  risky: number;
+  invalid: number;
+  unknown: number;
+  error: number;
+  cancelled: boolean;
+  reason: string;
+  fatal: string;
+};
+
 // Collected-time formatting (UI-03). The cell shows the short form; the tooltip
 // carries the full local timestamp plus the source search.
 const pad2 = (value: number) => String(value).padStart(2, '0');
@@ -188,14 +311,51 @@ const formatCollectedFull = (ms: number) => {
   return `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())} ${pad2(d.getHours())}:${pad2(d.getMinutes())}:${pad2(d.getSeconds())}`;
 };
 
-/** Pick the matching social icon for a mined profile link (M7). */
-const socialIcon = (url: string) => {
-  const lowered = url.toLowerCase();
-  if (lowered.includes('linkedin.com')) return <LinkedinOutlined />;
-  if (lowered.includes('facebook.com') || lowered.includes('fb.com'))
-    return <FacebookOutlined />;
-  if (lowered.includes('instagram.com')) return <InstagramOutlined />;
-  return <XOutlined />;
+/**
+ * Stable tokens for a row's mined-contact state (M7).
+ *
+ * `email`/`social` say what was found; the third token is the raw
+ * `email_status`, so `none-found`, `blocked` and `error` stay distinguishable.
+ * It doubles as the e2e hook — the icon alone cannot be asserted on.
+ */
+function contactTokens(record: Business): string {
+  return [
+    record.emails.length > 0 ? 'email' : '',
+    record.socials.length > 0 ? 'social' : '',
+    record.email_status,
+  ]
+    .filter(Boolean)
+    .join(' ');
+}
+
+/**
+ * The glyphs for a row that has at least one contact; `null` otherwise.
+ *
+ * Shared by the table cell and the compact card so the two layouts cannot
+ * disagree about which row "has contacts".
+ */
+function contactGlyphs(record: Business): ReactNode {
+  if (record.emails.length === 0 && record.socials.length === 0) return null;
+  return (
+    <span className="contact-cell" data-contact={contactTokens(record)}>
+      {record.emails.length > 0 && <MailFilled className="contact-icon is-email" />}
+      {/* Two social marks fit next to the email glyph in the 72px column; the
+          tooltip lists the rest. A "+n" chip would push them past the cell
+          padding and clip. */}
+      {record.socials.slice(0, 2).map((url) => (
+        <span key={url} className="contact-icon">
+          {socialIcon(url)}
+        </span>
+      ))}
+    </span>
+  );
+}
+
+/** What a row that yielded *no* contact shows instead: why there is nothing. */
+const CONTACT_EMPTY_ICON: Record<string, ReactNode> = {
+  blocked: <StopOutlined className="contact-icon is-blocked" />,
+  error: <WarningOutlined className="contact-icon is-error" />,
+  'none-found': <MailOutlined className="contact-icon is-empty" />,
 };
 
 /** Last path segment, for "which file is this" labels in the panel. */
@@ -237,6 +397,15 @@ function timeWindowStart(
 const SEEN_LIMIT = 5000;
 
 /**
+ * The data region scrolls inside `.ant-table-body` on wide layouts and inside
+ * `.business-cards` once the panel is compact. Both are the same thing for
+ * follow-the-tail, so they are named once instead of in two call sites that
+ * would drift apart the day one of them is renamed.
+ */
+const DATA_SCROLLER_SELECTOR = '.ant-table-body, .business-cards';
+const isDataScroller = (node: HTMLElement) => node.matches(DATA_SCROLLER_SELECTOR);
+
+/**
  * Remember an id, dropping the oldest ones past `SEEN_LIMIT`. `Set` iterates in
  * insertion order, so deleting from the front is the cheapest trim available
  * without keeping a second structure.
@@ -255,7 +424,7 @@ function rememberSeen(seen: Set<string>, id: string): void {
 
 export default function App() {
   const { message, modal } = AntdApp.useApp();
-  const { t } = useI18n();
+  const { t, tag } = useI18n();
   const { settings, update } = useSettings();
 
   // Only the current page lives in the webview (M6): the table is a SQL query,
@@ -275,6 +444,22 @@ export default function App() {
     total: number;
     found: number;
   } | null>(null);
+  /** Live progress of the email verifier (G-04); null while idle. */
+  const [verifying, setVerifying] = useState<VerifyProgress | null>(null);
+  /**
+   * A preflight request is in flight. Separate from `verifyPlan` on purpose:
+   * the plan only exists once there is something to confirm, while this flag
+   * has to disable the button for the whole round trip.
+   */
+  const [preflightingVerify, setPreflightingVerify] = useState(false);
+  /** Last `limit` Rust reported, for the rare too-many race in `start`. */
+  const verifyLimitRef = useRef(0);
+  /**
+   * The preflight answer, while the confirmation dialog is being decided.
+   * Non-null also disables the button: a second click would start a second
+   * preflight against a scope the first one is already describing.
+   */
+  const [verifyPlan, setVerifyPlan] = useState<VerifyPlan | null>(null);
   /** Live progress of the detail-enrichment runner (Tier-2); null while idle. */
   const [enriching, setEnriching] = useState<{
     done: number;
@@ -301,6 +486,7 @@ export default function App() {
   const [debouncedQuery, setDebouncedQuery] = useState('');
   const [rating, setRating] = useState<RatingFilter>('all');
   const [contact, setContact] = useState<ContactFilter>('all');
+  const [verifyFilter, setVerifyFilter] = useState<VerifyFilter>('all');
   const [timeRange, setTimeRange] = useState<TimeRange>('all');
   const [typeFilter, setTypeFilter] = useState<string[]>([]);
   // Newest first by default (UI-03): the header shows an active "collected"
@@ -358,6 +544,12 @@ export default function App() {
   const [onlyNew, setOnlyNew] = useState(false);
   /** Job attribution for the rows currently on screen. */
   const [jobRefs, setJobRefs] = useState<BusinessJobRef[]>([]);
+  /**
+   * Email-verification state for the rows on the current page (G-04). Rebuilt
+   * from every page load, like `jobRefs` — the verdicts live in their own
+   * table, so the page query is the only thing that can assemble them.
+   */
+  const [verifyRefs, setVerifyRefs] = useState<BusinessVerificationRef[]>([]);
 
   /**
    * Clear every filter dimension.
@@ -374,6 +566,7 @@ export default function App() {
     setDebouncedQuery('');
     setRating('all');
     setContact('all');
+    setVerifyFilter('all');
     setTimeRange('all');
     setTypeFilter([]);
     setTaskFilter('all');
@@ -414,7 +607,6 @@ export default function App() {
     inserted: 0,
     dropped: 0,
   });
-  const [panelWidth, setPanelWidth] = useState(window.innerWidth);
   const [scrollY, setScrollY] = useState(400);
   // Path of the last export. Seeded from the persisted settings so the toolbar
   // entry survives a restart, then kept in sync by the `export:completed` event.
@@ -431,6 +623,7 @@ export default function App() {
   const [closePrompt, setClosePrompt] = useState<{
     jobRunning: boolean;
     emailMining: boolean;
+    emailVerifying: boolean;
   } | null>(null);
   /** Which button of the close prompt is in flight, so only it shows a spinner. */
   const [closingMode, setClosingMode] = useState<'pause' | 'force' | null>(null);
@@ -579,8 +772,9 @@ export default function App() {
     });
   }, [settings.mapCollapsed, update]);
 
-  const medium = panelWidth >= 700;
-  const wide = panelWidth >= 920;
+  // One listener, one source (UI-14). `medium`/`wide` still decide which
+  // columns are offered; `compact`/`tight` decide the layout.
+  const { width: panelWidth, compact, tight, medium, wide } = usePanelLayout();
 
   // ========== Page loading ==========
   // The request body is shared by browsing and "export everything that matches":
@@ -606,6 +800,7 @@ export default function App() {
       query: debouncedQuery,
       rating,
       contact,
+      verify: verifyFilter,
       types: typeFilter,
       // T-02: the task dimension is a real filter now; `__none__` asks for rows
       // no job has observed (free-listening leftovers).
@@ -623,6 +818,7 @@ export default function App() {
       debouncedQuery,
       rating,
       contact,
+      verifyFilter,
       typeFilter,
       taskFilter,
       jobSeenSince,
@@ -700,6 +896,7 @@ export default function App() {
       if (request !== requestIdRef.current) return;
       setRows(result.rows);
       setJobRefs(result.jobRefs);
+      setVerifyRefs(result.verifyRefs ?? []);
       setStats({
         total: result.total,
         all: result.all,
@@ -733,7 +930,18 @@ export default function App() {
   // them change which rows match.
   useEffect(() => {
     setPage(1);
-  }, [debouncedQuery, rating, contact, typeFilter, taskFilter, timeRange, onlyNew, sessionStartedAt, sort]);
+  }, [
+    debouncedQuery,
+    rating,
+    contact,
+    verifyFilter,
+    typeFilter,
+    taskFilter,
+    timeRange,
+    onlyNew,
+    sessionStartedAt,
+    sort,
+  ]);
 
   // Typing should not query per keystroke; the other filters fire immediately.
   useEffect(() => {
@@ -766,10 +974,10 @@ export default function App() {
   // ========== Backend events ==========
 
   /**
-   UI-02b: put back the rows of the last clear. Rust refuses once its 10 s
-   window lapses, and the error is surfaced as-is — "nothing to undo" is the
-   honest outcome, and the page refresh rides the `businesses:updated` event
-   Rust emits alongside the restore. */
+   UI-02b: put back the rows of the last clear. Rust refuses once its
+   `UNDO_CLEAR_WINDOW` lapses, and the error is surfaced as-is — "nothing to
+   undo" is the honest outcome, and the page refresh rides the
+   `businesses:updated` event Rust emits alongside the restore. */
   const handleUndoClear = useCallback(
     async (toastKey: string) => {
       try {
@@ -931,6 +1139,44 @@ export default function App() {
             });
         }
       }),
+      // G-04: the whole payload replaces the state — a late frame must never
+      // be added to a newer one (the counters are absolute, not deltas).
+      listen<VerifyProgress>('email:verify:progress', (event) => {
+        if (event.payload) setVerifying(event.payload);
+      }),
+      listen<VerifyDone>('email:verify:done', (event) => {
+        const payload = event.payload;
+        setVerifying(null);
+        if (!payload) return;
+        // Priority: fatal > cancelled > partial errors > success. One branch
+        // only — two toasts for one run read as two runs.
+        if (payload.fatal) {
+          message.error(tRef.current('toast.verifyFatal', { error: payload.fatal }));
+        } else if (payload.cancelled) {
+          message.info(
+            tRef.current('toast.verifyCancelled', {
+              done: payload.done,
+              total: payload.total,
+            }),
+          );
+        } else if (payload.error > 0) {
+          message.warning(tRef.current('toast.verifyDoneWithErrors', { error: payload.error }));
+        } else {
+          message.success(
+            tRef.current('toast.verifyDone', {
+              valid: payload.valid,
+              risky: payload.risky,
+              invalid: payload.invalid,
+              unknown: payload.unknown,
+              error: payload.error,
+            }),
+          );
+        }
+        // The verdicts live in their own table; only a reload brings them onto
+        // the page. The selection does not need a refresh: the export path
+        // re-reads each row's addresses from SQLite (plan §6.10).
+        void loadPageRef.current();
+      }),
       listen<{ received: number; inserted: number; dropped: number }>(
         'collector:batch',
         (event) => {
@@ -1074,6 +1320,12 @@ export default function App() {
         // The session totals describe rows that no longer exist (UI-09).
         setSummary({ received: 0, inserted: 0, dropped: 0 });
         setMapHealth('unknown');
+        // G-04: the cache tables are gone with the rows, and a run that was in
+        // flight stops through the epoch (its `done` event clears the state).
+        setVerifying(null);
+        setVerifyPlan(null);
+        setPreflightingVerify(false);
+        setVerifyRefs([]);
         // Reset filters too, otherwise a stale filter would hide the (now empty)
         // filter bar and leave the table stuck on "no matching records". One
         // helper, not eight setters: the hand-written list used to forget
@@ -1083,11 +1335,13 @@ export default function App() {
         // cleared table should come back in the default newest-first order.
         setSort({ field: 'collectedAt', direction: 'desc' });
         // UI-02b: the toast doubles as the undo entry, so it outlives the
-        // default 3 s — the window matches Rust's `UNDO_CLEAR_WINDOW`.
+        // default 3 s — the duration must stay equal to `UNDO_CLEAR_WINDOW`
+        // (commands.rs), or the undo entry disappears while Rust would still
+        // accept the call.
         const undoKey = `cleared-${Date.now()}`;
         message.success({
           key: undoKey,
-          duration: 10,
+          duration: 6,
           content: (
             <Space size={4}>
               <span>{tRef.current('toast.dataCleared')}</span>
@@ -1105,12 +1359,13 @@ export default function App() {
       }),
       // Rust refused the window close because work was running and is asking
       // what to do. Anything else (idle close) never reaches the panel.
-      listen<{ jobId: string | null; emailMining: boolean }>(
+      listen<{ jobId: string | null; emailMining: boolean; emailVerifying: boolean }>(
         'app:close-requested',
         (event) => {
           setClosePrompt({
             jobRunning: Boolean(event.payload?.jobId),
             emailMining: Boolean(event.payload?.emailMining),
+            emailVerifying: Boolean(event.payload?.emailVerifying),
           });
         },
       ),
@@ -1144,12 +1399,6 @@ export default function App() {
   }, [message, scheduleRefresh, revealExport, applyListening, handleUndoClear, resetFilters]);
 
   // ========== Layout measurements ==========
-  useEffect(() => {
-    const onResize = () => setPanelWidth(window.innerWidth);
-    window.addEventListener('resize', onResize);
-    return () => window.removeEventListener('resize', onResize);
-  }, []);
-
   // `scroll.y` 只约束表体，所以要从卡片高度里减掉表头和分页条真实占掉的部分。
   // 分页条在 App.css 里是 `margin: 8px 12px !important`，上下各 8px。
   const measureTableHeight = useCallback(() => {
@@ -1169,9 +1418,13 @@ export default function App() {
   // Track whether the table body is scrolled to the bottom, so streaming rows
   // only steal the scroll position while the user is already following them.
   // Capture phase: the scroll happens on `.ant-table-body`, not on the card.
+  // Both `.ant-table-body` and `.business-cards` are scroll containers — the
+  // compact layout has no table at all, and gating on the table alone left
+  // `followTailRef` pinned to its initial `true` there: the "N new" pill never
+  // appeared and a new batch never scrolled the list (silently, no error).
   const onTableScroll = useCallback((event: Event) => {
     const target = event.target as HTMLElement | null;
-    if (!target || !target.classList.contains('ant-table-body')) return;
+    if (!target || !isDataScroller(target)) return;
     const distance = target.scrollHeight - target.scrollTop - target.clientHeight;
     if (distance < 24) {
       // Reaching the bottom by hand means the backlog has been seen, and it
@@ -1648,6 +1901,17 @@ export default function App() {
     setDetail(end === 'first' ? rows[0] ?? null : rows[rows.length - 1] ?? null);
   }, [rows, detail]);
 
+  // The drawer holds the row object it was opened with, and a page reload
+  // replaces that object (a contact-mining run rewriting `emails` is the case
+  // that matters here: the drawer used to keep showing the pre-run row). Re-point
+  // it at the fresh copy whenever the id is still on the page; a row that left
+  // the page keeps the last truthful object, like the position counter does.
+  useEffect(() => {
+    if (!detail) return;
+    const fresh = rows.find((row) => row.place_id === detail.place_id);
+    if (fresh && fresh !== detail) setDetail(fresh);
+  }, [rows, detail]);
+
   // Closing hands focus back to the row the drawer was opened from. tabIndex
   // -1 makes the row script-focusable without becoming a tab stop, and a
   // short outline shows where the drawer left the user (programmatic focus
@@ -1703,12 +1967,13 @@ export default function App() {
   const showNextDetail = useCallback(() => goToDetail(1), [goToDetail]);
 
   // Two frames: the first flushes a new page into the DOM, the second scrolls
-  // the freshly mounted body.
+  // the freshly mounted body. The compact layout renders cards instead of a
+  // table, so `.business-cards` is the second container to try.
   const scrollTableToBottom = useCallback(() => {
     window.requestAnimationFrame(() => {
       window.requestAnimationFrame(() => {
-        const body = tableWrapRef.current?.querySelector<HTMLElement>('.ant-table-body');
-        if (body) body.scrollTop = body.scrollHeight;
+        const scroller = tableWrapRef.current?.querySelector<HTMLElement>(DATA_SCROLLER_SELECTOR);
+        if (scroller) scroller.scrollTop = scroller.scrollHeight;
       });
     });
   }, []);
@@ -1822,22 +2087,39 @@ export default function App() {
     selectAllRunRef.current += 1;
   }, [filterRequest]);
 
-  // M7: mine emails/socials for the current scope — the selection when rows
-  // are selected, the whole filtered set otherwise (mirroring the export
-  // button's two scopes). Large unselected runs get one confirmation, because
-  // they hit up to 4 pages per real website.
+  /**
+   * The scope a contact job runs on (M7 / G-04): the selection when there is
+   * one, the whole filtered set otherwise — the same two scopes export uses.
+   * Mining and verification share it, so the two buttons cannot disagree about
+   * "current scope".
+   */
+  const currentScope = useCallback(
+    (): {
+      kind: 'selection' | 'filter';
+      placeIds: string[];
+      filter: Record<string, unknown> | null;
+      count: number;
+    } => {
+      const selection = selectedKeys.map(String);
+      if (selection.length > 0) {
+        return { kind: 'selection', placeIds: selection, filter: null, count: selection.length };
+      }
+      return { kind: 'filter', placeIds: [], filter: filterRequest(), count: stats.total };
+    },
+    [selectedKeys, filterRequest, stats.total],
+  );
+
   const mineEmails = useCallback(() => {
-    if (emailMining) return;
-    const scope = selectedKeys.length > 0 ? 'selection' : 'filter';
-    const count = scope === 'selection' ? selectedKeys.length : stats.total;
+    // The backend refuses anyway; refusing here keeps the panel from flashing a
+    // toast for a click it knew was impossible.
+    if (emailMining || verifying) return;
+    const scope = currentScope();
+    const count = scope.count;
     if (count === 0) return;
     const start = async (force: boolean) => {
       try {
         const sites = await invoke<number>('start_email_mining', {
-          request:
-            scope === 'selection'
-              ? { placeIds: selectedKeys.map(String), force }
-              : { filter: filterRequest(), force },
+          request: { placeIds: scope.placeIds, filter: scope.filter, force },
         });
         if (sites === 0) {
           message.warning(t('toast.emailNothingToMine'));
@@ -1848,6 +2130,12 @@ export default function App() {
         const text = String(error);
         if (text.includes('already-running')) {
           message.warning(t('toast.emailMineRunning'));
+          return;
+        }
+        // G-04: verification holds the other contact slot, so a mining start is
+        // refused while it runs. Say which job is in the way.
+        if (text.includes('verify_running')) {
+          message.warning(t('toast.mineVerifyRunning'));
           return;
         }
         // C-15: an empty scope has three causes. "Already mined" is the common
@@ -1877,7 +2165,7 @@ export default function App() {
         message.error(t('toast.emailMineFailed', { error: text }));
       }
     };
-    if (scope === 'filter' && count > 500) {
+    if (scope.kind === 'filter' && count > 500) {
       modal.confirm({
         title: t('bulk.mineConfirmTitle', { count }),
         content: t('bulk.mineConfirmContent'),
@@ -1890,7 +2178,124 @@ export default function App() {
       return;
     }
     void start(false);
-  }, [emailMining, selectedKeys, stats.total, filterRequest, message, modal, t]);
+  }, [emailMining, verifying, currentScope, message, modal, t]);
+
+  // ========== Email verification (G-04) ==========
+  // Preflight -> confirm -> start. Every number the dialog shows comes from
+  // Rust, and the scope is frozen before the dialog opens: re-reading the
+  // filters in `onOk` would let the dialog describe one scope and run another.
+  const verifyEmails = useCallback(() => {
+    // `verifyPlan` non-null means the confirmation dialog is open: a second
+    // preflight would describe a second scope behind it.
+    if (verifying || emailMining || preflightingVerify || verifyPlan !== null) return;
+    const scope = currentScope();
+    if (scope.count === 0) return;
+    const frozen: VerifyScope = { placeIds: scope.placeIds, filter: scope.filter };
+
+    const start = async (force: boolean) => {
+      // Every exit path clears the preflight state: a stuck `verifyPlan` would
+      // leave the button permanently disabled (the easiest leak to miss).
+      setVerifyPlan(null);
+      setPreflightingVerify(false);
+      // The button enters the running state *before* the promise lands: a small
+      // scope can emit `progress` — even `done` — before `start` resolves, and
+      // setting the state afterwards would rewind a finished run.
+      setVerifying({ ...EMPTY_VERIFY_PROGRESS });
+      try {
+        const plan = await invoke<VerifyPlan>('start_email_verification', {
+          request: { ...frozen, force },
+        });
+        setVerifying((prev) =>
+          prev === null ? null : { ...prev, total: plan.addresses, cached: plan.cached },
+        );
+      } catch (error) {
+        // `done` may already have cleared the state; only a still-running
+        // panel needs the rollback.
+        setVerifying(null);
+        const text = String(error);
+        if (text.includes('already-running')) {
+          message.warning(t('toast.verifyRunning'));
+        } else if (text.includes('mining_running')) {
+          message.warning(t('toast.verifyMiningRunning'));
+        } else if (text.startsWith('nothing_to_verify:')) {
+          if (text.endsWith('no_emails')) {
+            message.warning(t('toast.verifyNothingNoEmails'));
+          } else {
+            message.info(t('toast.verifyAllFreshTitle'));
+          }
+        } else if (text.includes('too_many')) {
+          message.warning(t('toast.verifyTooMany', { limit: verifyLimitRef.current }));
+        } else {
+          message.error(t('toast.verifyFatal', { error: text }));
+        }
+      }
+    };
+
+    const preflight = async () => {
+      setPreflightingVerify(true);
+      try {
+        const plan = await invoke<VerifyPlan>('verify_email_plan', {
+          request: { ...frozen, force: false },
+        });
+        verifyLimitRef.current = plan.limit;
+        setPreflightingVerify(false);
+        if (plan.tooMany) {
+          message.warning(t('toast.verifyTooMany', { limit: plan.limit }));
+          return;
+        }
+        if (plan.addresses === 0) {
+          message.warning(t('toast.verifyNothingNoEmails'));
+          return;
+        }
+        if (plan.pending === 0 && plan.cached > 0) {
+          modal.confirm({
+            title: t('toast.verifyAllFreshTitle'),
+            content: t('toast.verifyAllFreshBody'),
+            okText: t('toast.verifyForce'),
+            cancelText: t('common.cancel'),
+            onOk: () => {
+              void start(true);
+            },
+          });
+          return;
+        }
+        if (plan.confirm) {
+          setVerifyPlan(plan);
+          modal.confirm({
+            title: t('toast.verifyPlanTitle', { count: plan.addresses }),
+            content: t('toast.verifyPlanBody', {
+              rows: plan.rows,
+              addresses: plan.addresses,
+              cached: plan.cached,
+              pending: plan.pending,
+            }),
+            okText: t('table.verifyEmails'),
+            cancelText: t('common.cancel'),
+            onOk: () => {
+              void start(false);
+            },
+            onCancel: () => setVerifyPlan(null),
+          });
+          return;
+        }
+        void start(false);
+      } catch (error) {
+        setPreflightingVerify(false);
+        message.error(t('toast.verifyFatal', { error: String(error) }));
+      }
+    };
+
+    void preflight();
+  }, [
+    verifying,
+    emailMining,
+    preflightingVerify,
+    verifyPlan,
+    currentScope,
+    message,
+    modal,
+    t,
+  ]);
 
   // ========== Tier-2 detail enrichment ==========
   // Selection-only by design: each place costs one full page load (~10 s), so
@@ -2142,6 +2547,7 @@ export default function App() {
     query.trim() !== '' ||
     rating !== 'all' ||
     contact !== 'all' ||
+    verifyFilter !== 'all' ||
     timeRange !== 'all' ||
     typeFilter.length > 0 ||
     taskFilter !== 'all' ||
@@ -2246,6 +2652,176 @@ export default function App() {
     return map;
   }, [jobRefs]);
 
+  /** Email-verification state, keyed by place id (G-04). */
+  const verifyRefsByPlace = useMemo(() => {
+    const map = new Map<string, BusinessVerificationRef>();
+    verifyRefs.forEach((ref) => map.set(ref.placeId, ref));
+    return map;
+  }, [verifyRefs]);
+
+  /**
+   * The per-row action cluster: locate + the row menu.
+   *
+   * Lifted out of the column definition because the compact card list shows the
+   * same two controls. One definition, two layouts — the menu state
+   * (`rowMenuKey`) is shared, so only one popup can be open at a time.
+   */
+  const renderRowActions = useCallback(
+    (record: Business) => (
+      <div className="row-actions">
+        <Tooltip title={t('table.locate')}>
+          <Button
+            className="link-icon-btn"
+            type="text"
+            size="small"
+            icon={<AimOutlined />}
+            aria-label={t('table.locate')}
+            onClick={(event) => {
+              event.stopPropagation();
+              void handleLocate(record);
+            }}
+          />
+        </Tooltip>
+        <Dropdown
+          trigger={['click']}
+          // UI-04: same menu the right-click and Shift+F10 open — the three
+          // entry points share `rowMenuKey`, so only one popup exists.
+          open={rowMenuKeyInPage === record.place_id}
+          onOpenChange={(open) => setRowMenuKey(open ? record.place_id : null)}
+          menu={{
+            items: rowMenuItems(record),
+            onClick: ({ key }) => {
+              setRowMenuKey(null);
+              void handleRowAction(key, record);
+            },
+          }}
+        >
+          <Button
+            className="link-icon-btn"
+            type="text"
+            size="small"
+            icon={<MoreOutlined />}
+            title={t('table.rowMenu')}
+            aria-label={t('table.rowMenu')}
+            onClick={(event) => event.stopPropagation()}
+          />
+        </Dropdown>
+      </div>
+    ),
+    [t, rowMenuKeyInPage, rowMenuItems, handleLocate, handleRowAction],
+  );
+
+  /** Task chip + collected date, for the compact card's meta line. */
+  /**
+   * The verification cell: one Tag plus a tooltip that explains the verdict per
+   * address (G-04 §6.6). A row with no address shows a dash — printing "not
+   * verified" across a column of rows that have no email at all is noise.
+   */
+  const renderVerifyCell = useCallback(
+    (record: Business) => {
+      const ref = verifyRefsByPlace.get(record.place_id);
+      if (!ref || ref.status === 'none') {
+        return <span className="cell-muted">{t('common.dash')}</span>;
+      }
+      const label = (status: string) => verifyStatusText(t, status);
+      const describe = (entry: AddressVerification) => {
+        const flags = [...entry.flags];
+        // Row-level evidence, so it is appended here rather than stored with
+        // the address.
+        if (entry.sameDomain) flags.push('same_domain');
+        const words = flags.map((flag) =>
+          VERIFY_FLAG_KEYS[flag] ? t(VERIFY_FLAG_KEYS[flag]) : flag,
+        );
+        return `${entry.address} — ${label(entry.status)}${
+          words.length > 0 ? ` (${words.join(', ')})` : ''
+        }`;
+      };
+      const lines: string[] = [];
+      if (ref.checkedAt > 0) {
+        lines.push(`${label(ref.status)} · ${formatCollectedShort(ref.checkedAt)}`);
+      }
+      ref.addresses.forEach((entry) => lines.push(describe(entry)));
+      if (ref.stale) lines.push(t('table.verifyStale'));
+      return (
+        <Tooltip title={<span style={{ whiteSpace: 'pre-line' }}>{lines.join('\n')}</span>}>
+          <Tag color={VERIFY_TAG_COLOR[ref.status]} style={{ fontSize: 11, margin: 0 }}>
+            {label(ref.status)}
+          </Tag>
+        </Tooltip>
+      );
+    },
+    [t, verifyRefsByPlace],
+  );
+
+  /**
+   * The contact cell (M7): one glyph per kind of contact the mining run
+   * produced, plus the addresses in the tooltip.
+   *
+   * The `emails`/`socials` columns only exist at the widest breakpoint, so at
+   * the default panel width a mined row and a never-mined one looked identical.
+   * This column is part of the base set: it answers "which of these did the run
+   * actually get?" while scrolling.
+   */
+  const renderContactCell = useCallback(
+    (record: Business) => {
+      const glyphs = contactGlyphs(record);
+      if (glyphs) {
+        const lines = [
+          ...record.emails,
+          ...record.socials.map((url) => linkLabel(url, safeHttpUrl(url))),
+          record.email_source_url,
+          record.mined_at > 0
+            ? `${t('detail.minedAt')}: ${formatCollectedFull(record.mined_at)}`
+            : '',
+        ].filter(Boolean);
+        return (
+          <Tooltip title={<span style={{ whiteSpace: 'pre-line' }}>{lines.join('\n')}</span>}>
+            {glyphs}
+          </Tooltip>
+        );
+      }
+      // No contact: say *why*. "Mined and found nothing", "blocked" and "never
+      // mined" are three different answers, and only the last one is retryable.
+      const empty = CONTACT_EMPTY_ICON[record.email_status];
+      if (!empty) return <span className="cell-muted">{t('common.dash')}</span>;
+      return (
+        <Tooltip title={t(emailStatusKey(record.email_status))}>
+          <span className="contact-cell" data-contact={contactTokens(record)}>
+            {empty}
+          </span>
+        </Tooltip>
+      );
+    },
+    [t],
+  );
+
+  const renderCardMeta = useCallback(
+    (record: Business) => {
+      const taskName = jobRefsByPlace.get(record.place_id)?.[0]?.name;
+      const verify = verifyRefsByPlace.get(record.place_id);
+      // Same rule as the table column: no email or nothing fresh is not worth a
+      // badge on a card that is already dense.
+      const showVerify =
+        verify !== undefined && verify.status !== 'none' && verify.status !== 'unverified';
+      return (
+        <>
+          {contactGlyphs(record)}
+          {taskName && <span>{taskName}</span>}
+          {showVerify && renderVerifyCell(record)}
+          {record.collected_at > 0 && (
+            <span>
+              {new Date(record.collected_at).toLocaleDateString(tag, {
+                month: 'short',
+                day: 'numeric',
+              })}
+            </span>
+          )}
+        </>
+      );
+    },
+    [jobRefsByPlace, verifyRefsByPlace, renderVerifyCell, tag],
+  );
+
   // R-18: built once per relevant change instead of once per render — the table
   // diffs its columns shallowly, so a fresh array every second (old root clock)
   // and every batch forced a full 200 × 11 cell diff. Width gates are inputs
@@ -2314,12 +2890,21 @@ export default function App() {
       width: 148,
       render: (value: string) =>
         value ? (
-          <Text copyable={{ text: value }} style={{ fontSize: 12 }}>
+          <Text copyable={{ text: value }} className="cell-mono">
             {value}
           </Text>
         ) : (
           <span className="cell-muted">{t('common.dash')}</span>
         ),
+    },
+    {
+      // M7: part of the base set on purpose — the emails/socials columns are
+      // `wide` only, and that is exactly the width where the panel is not.
+      title: t('table.contact'),
+      key: 'contact',
+      // 72: the header word has to fit at every locale (四个汉字 ≈ 48px).
+      width: 72,
+      render: (_, record) => renderContactCell(record),
     },
     ...(medium
       ? ([
@@ -2400,6 +2985,17 @@ export default function App() {
                 <span className="cell-muted">{t('common.dash')}</span>
               ),
           },
+          {
+            title: t('table.verifyColumn'),
+            // There is no per-row field behind this column: it describes the
+            // row's addresses, which live in their own table. `emails` keeps
+            // the sort/filter plumbing honest without inventing a field.
+            dataIndex: 'emails',
+            key: 'email_verify',
+            width: 96,
+            ellipsis: true,
+            render: (_, record) => renderVerifyCell(record),
+          },
         ] as ColumnsType<Business>)
       : []),
     ...(wide
@@ -2439,7 +3035,7 @@ export default function App() {
               types.length > 0 ? (
                 <Space size={4} wrap>
                   {types.slice(0, 2).map((type) => (
-                    <Tag key={type} color="blue" style={{ fontSize: 11, margin: 0 }}>
+                    <Tag key={type} className="cell-tag">
                       {typeLabel(type)}
                     </Tag>
                   ))}
@@ -2450,7 +3046,7 @@ export default function App() {
                         .map(typeLabel)
                         .join(t('common.listSeparator'))}
                     >
-                      <Tag style={{ fontSize: 11, margin: 0 }}>+{types.length - 2}</Tag>
+                      <Tag className="cell-tag">+{types.length - 2}</Tag>
                     </Tooltip>
                   )}
                 </Space>
@@ -2466,7 +3062,19 @@ export default function App() {
             ellipsis: true,
             render: (_, record) => {
               if (record.emails.length > 0) {
-                const tooltip = [...record.emails, record.email_source_url]
+                const verify = verifyRefsByPlace.get(record.place_id);
+                // G-04: each address keeps its own line, with the verdict
+                // appended. The source URL stays the last line — it is
+                // evidence for the whole row, not for one address.
+                const tooltip = [
+                  ...record.emails.map((email) => {
+                    const entry = verify?.addresses.find(
+                      (item) => item.address === email.trim().toLowerCase(),
+                    );
+                    return entry ? `${email} — ${verifyStatusText(t, entry.status)}` : email;
+                  }),
+                  record.email_source_url,
+                ]
                   .filter(Boolean)
                   .join('\n');
                 return (
@@ -2575,47 +3183,7 @@ export default function App() {
       key: 'actions',
       width: 86,
       fixed: wide ? 'right' : undefined,
-      render: (_, record) => (
-        <div className="row-actions">
-          <Tooltip title={t('table.locate')}>
-            <Button
-              className="link-icon-btn"
-              type="text"
-              size="small"
-              icon={<AimOutlined />}
-              aria-label={t('table.locate')}
-              onClick={(event) => {
-                event.stopPropagation();
-                void handleLocate(record);
-              }}
-            />
-          </Tooltip>
-          {/* UI-04: same menu the right-click and Shift+F10 open — the three
-              entry points share `rowMenuKey`, so only one popup exists. */}
-          <Dropdown
-            trigger={['click']}
-            open={rowMenuKeyInPage === record.place_id}
-            onOpenChange={(open) => setRowMenuKey(open ? record.place_id : null)}
-            menu={{
-              items: rowMenuItems(record),
-              onClick: ({ key }) => {
-                setRowMenuKey(null);
-                void handleRowAction(key, record);
-              },
-            }}
-          >
-            <Button
-              className="link-icon-btn"
-              type="text"
-              size="small"
-              icon={<MoreOutlined />}
-              title={t('table.rowMenu')}
-              aria-label={t('table.rowMenu')}
-              onClick={(event) => event.stopPropagation()}
-            />
-          </Dropdown>
-        </div>
-      ),
+      render: (_, record) => renderRowActions(record),
     },
     ],
     // `t` changes identity with the locale on purpose, so a language switch
@@ -2626,10 +3194,12 @@ export default function App() {
       t,
       sort,
       jobRefsByPlace,
-      rowMenuKeyInPage,
-      handleLocate,
-      rowMenuItems,
-      handleRowAction,
+      // Both Maps are rebuilt on every page load, so the columns have to
+      // re-render with them — a stale Map here shows yesterday's verdicts.
+      verifyRefsByPlace,
+      renderVerifyCell,
+      renderContactCell,
+      renderRowActions,
     ],
   );
 
@@ -2719,7 +3289,10 @@ export default function App() {
   // R-18: the table compares its props shallowly. Objects rebuilt on every
   // render (scroll/pagination/rowSelection/locale, the row factory and the
   // sort handler) missed that compare and re-diffed every cell.
-  const tableScroll = useMemo(() => ({ x: wide ? 948 : 610, y: scrollY }), [wide, scrollY]);
+  // G-04: +96 for the verification column in both width gates. Adding it to
+  // only one pushes the fixed action column out of view at the other.
+  // M7: +72 for the contact column, which exists in both sets.
+  const tableScroll = useMemo(() => ({ x: wide ? 1116 : 778, y: scrollY }), [wide, scrollY]);
 
   const tableOnChange = useCallback(
     (_: unknown, __: unknown, sorter: unknown) => {
@@ -2772,28 +3345,38 @@ export default function App() {
     [page, pageSize, stats.total, stats.all, hasFilters, t, update, message],
   );
 
+  /**
+   * The one place selection is applied. The table and the compact card list
+   * both go through here, so a page turn loses nothing and the bulk bar counts
+   * the same set in both layouts.
+   */
+  const applySelection = useCallback(
+    (keys: ReactKey[]) => {
+      // Remember the rows themselves: a page turn would otherwise lose
+      // everything needed to export a selection.
+      rows.forEach((row) => {
+        if (keys.includes(row.place_id)) {
+          selectedRowsRef.current.set(row.place_id, row);
+        }
+      });
+      const next = new Set(keys.map(String));
+      [...selectedRowsRef.current.keys()].forEach((id) => {
+        if (!next.has(id)) selectedRowsRef.current.delete(id);
+      });
+      setSelectedKeys(keys);
+      // R-23: the ref was just re-pointed at this page's objects.
+      setSelectionVersion((value) => value + 1);
+    },
+    [rows],
+  );
+
   const tableRowSelection = useMemo(
     () => ({
       selectedRowKeys: selectedKeys,
-      onChange: (keys: ReactKey[]) => {
-        // Remember the rows themselves: a page turn would otherwise lose
-        // everything needed to export a selection.
-        rows.forEach((row) => {
-          if (keys.includes(row.place_id)) {
-            selectedRowsRef.current.set(row.place_id, row);
-          }
-        });
-        const next = new Set(keys.map(String));
-        [...selectedRowsRef.current.keys()].forEach((id) => {
-          if (!next.has(id)) selectedRowsRef.current.delete(id);
-        });
-        setSelectedKeys(keys);
-        // R-23: the ref was just re-pointed at this page's objects.
-        setSelectionVersion((value) => value + 1);
-      },
+      onChange: applySelection,
       columnWidth: 38,
     }),
-    [selectedKeys, rows],
+    [selectedKeys, applySelection],
   );
 
   const tableOnRow = useCallback(
@@ -2886,7 +3469,7 @@ export default function App() {
   );
 
   return (
-    <div className="app-shell">
+    <div className={`app-shell${tight ? ' is-tight' : ''}${compact ? ' is-compact' : ''}`}>
       <SplitHandle
         ratio={split}
         onChange={setSplit}
@@ -2904,6 +3487,7 @@ export default function App() {
         // happens to have old rows in the database — "collected this session"
         // is what the word actually claims.
         collectedThisSession={summary.received > 0}
+        compact={compact}
         onOpenGrid={() => openNewTask()}
         onOpenDiagnostics={() => setDiagOpen(true)}
         onOpenSettings={() => setSettingsOpen(true)}
@@ -3016,6 +3600,7 @@ export default function App() {
           query={query}
           rating={rating}
           contact={contact}
+          verify={verifyFilter}
           timeRange={timeRange}
           typeOptions={typeOptions}
           types={typeFilter}
@@ -3025,9 +3610,11 @@ export default function App() {
           onlyNew={onlyNew}
           hasFilters={hasFilters}
           searchRef={searchRef}
+          variant={compact ? 'sheet' : 'inline'}
           onQuery={setQuery}
           onRating={setRating}
           onContact={setContact}
+          onVerify={setVerifyFilter}
           onTimeRange={setTimeRange}
           onTypes={setTypeFilter}
           onTaskFilter={handleTaskFilter}
@@ -3081,20 +3668,77 @@ export default function App() {
               aria-label={t('table.columns')}
             />
           </Popover>
-          <Tooltip title={t('table.mineEmailsHint')}>
+          <Tooltip
+            title={
+              verifying
+                ? t('table.mineBlockedByVerify')
+                : t('table.mineEmailsHint')
+            }
+          >
             <Button
               size="small"
               icon={<MailOutlined />}
               loading={!!emailMining}
+              // G-04: verification holds the other contact slot, so starting a
+              // mine now would be refused. Say so before the click.
+              disabled={!emailMining && Boolean(verifying)}
               onClick={mineEmails}
             >
-              {emailMining
-                ? t('table.miningProgress', {
-                    done: emailMining.done,
-                    total: emailMining.total,
-                    found: emailMining.found,
-                  })
-                : t('table.mineEmails')}
+              <span className="toolbar-label">
+                {emailMining
+                  ? t('table.miningProgress', {
+                      done: emailMining.done,
+                      total: emailMining.total,
+                      found: emailMining.found,
+                    })
+                  : t('table.mineEmails')}
+              </span>
+            </Button>
+          </Tooltip>
+          {/* G-04: the verification entry sits right after the miner. It uses
+              `SyncOutlined spin` rather than the button's `loading` prop: a
+              loading button does not fire `onClick`, and this button's click is
+              "cancel". */}
+          <Tooltip
+            title={
+              emailMining
+                ? t('table.verifyBlockedByMining')
+                : verifying
+                  ? t('table.verifyCancelHint')
+                  : t('table.verifyEmailsHint')
+            }
+          >
+            <Button
+              size="small"
+              icon={verifying ? <SyncOutlined spin /> : <SafetyCertificateOutlined />}
+              disabled={
+                !verifying &&
+                (Boolean(emailMining) || preflightingVerify || verifyPlan !== null)
+              }
+              aria-label={
+                verifying
+                  ? t('table.verifyingProgress', {
+                      done: verifying.done,
+                      total: verifying.total,
+                    })
+                  : t('table.verifyEmails')
+              }
+              onClick={() => {
+                if (verifying) {
+                  void invoke('cancel_email_verification').catch(() => {});
+                } else {
+                  verifyEmails();
+                }
+              }}
+            >
+              <span className="toolbar-label">
+                {verifying
+                  ? t('table.verifyingProgress', {
+                      done: verifying.done,
+                      total: verifying.total,
+                    })
+                  : t('table.verifyEmails')}
+              </span>
             </Button>
           </Tooltip>
           <Tooltip
@@ -3122,9 +3766,11 @@ export default function App() {
                 }
               }}
             >
-              {enriching
-                ? t('table.enrichProgress', { done: enriching.done, total: enriching.total })
-                : t('table.enrich')}
+              <span className="toolbar-label">
+                {enriching
+                  ? t('table.enrichProgress', { done: enriching.done, total: enriching.total })
+                  : t('table.enrich')}
+              </span>
             </Button>
           </Tooltip>
           <Dropdown
@@ -3142,10 +3788,15 @@ export default function App() {
               size="small"
               icon={<DownloadOutlined />}
               loading={exporting}
+              // Compact mode hides the label; the title keeps the action
+              // identifiable on hover.
+              title={t('table.exportCount', { count: stats.total })}
             >
-              {selectedKeys.length > 0
-                ? t('table.exportSelected', { count: selectedKeys.length })
-                : t('table.exportCount', { count: stats.total })}
+              <span className="toolbar-label">
+                {selectedKeys.length > 0
+                  ? t('table.exportSelected', { count: selectedKeys.length })
+                  : t('table.exportCount', { count: stats.total })}
+              </span>
               <DownOutlined style={{ fontSize: 9 }} />
             </Button>
           </Dropdown>
@@ -3197,12 +3848,28 @@ export default function App() {
       <div className="table-wrap" ref={attachTableWrap}>
         {showGuide ? (
           <div className="empty-data">
-            <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description={t('empty.dataTitle')} />
-            <div className="empty-data-note">{t('empty.dataNote')}</div>
-            <Button type="primary" onClick={() => changeView('collect')}>
-              {t('empty.goCollect')}
-            </Button>
+            <EmptyState
+              card={false}
+              title={t('empty.dataTitle')}
+              description={t('empty.dataNote')}
+              action={
+                <Button type="primary" onClick={() => changeView('collect')}>
+                  {t('empty.goCollect')}
+                </Button>
+              }
+            />
           </div>
+        ) : compact ? (
+          <BusinessCardList
+            rows={rows}
+            loading={loadingRows}
+            selectedKeys={selectedKeys}
+            onSelectionChange={applySelection}
+            onOpen={(business) => setDetail(business)}
+            renderActions={renderRowActions}
+            renderMeta={renderCardMeta}
+            emptyText={tableLocale.emptyText}
+          />
         ) : (
           <Table<Business>
             dataSource={rows}
@@ -3220,6 +3887,10 @@ export default function App() {
             // lets the many extra columns scroll a little.
             scroll={tableScroll}
             onChange={tableOnChange}
+            // AntD defaults to a "click to sort" bubble on every sortable
+            // header; it floated over the toolbar buttons above the table. The
+            // header already draws the up/down triangles, so the hint is noise.
+            showSorterTooltip={false}
             // Virtualization only pays off where the node count explodes: a
             // 100/200-row page renders ~1100/2200 cells, while 20/50 rows stay
             // small enough that full rendering keeps row heights and sticky
@@ -3271,12 +3942,14 @@ export default function App() {
         locateBlocked={paneBusyElsewhere}
         mapBusyName={runningJob ? runningJob.name || runningJob.keyword : null}
         onReviewsBusyChange={setReviewsBusy}
+        panelWidth={panelWidth}
       />
 
       <DiagnosticsDrawer
         open={diagOpen}
         loading={diagLoading}
         data={diag}
+        panelWidth={panelWidth}
         onClose={() => setDiagOpen(false)}
         onRefresh={() => void loadDiagnostics()}
       />
@@ -3346,6 +4019,7 @@ export default function App() {
       >
         {closePrompt?.jobRunning && <p>{t('close.jobRunning')}</p>}
         {closePrompt?.emailMining && <p>{t('close.emailMining')}</p>}
+        {closePrompt?.emailVerifying && <p>{t('close.emailVerifying')}</p>}
         <p>{t('close.hint')}</p>
       </Modal>
 

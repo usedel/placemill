@@ -9,6 +9,7 @@ mod collector;
 mod commands;
 mod db;
 mod email_miner;
+mod email_verify;
 mod grid;
 mod logging;
 mod remote_config;
@@ -138,7 +139,7 @@ pub struct Business {
 ///
 /// The rows themselves live in `*_backup` tables inside the database (R-13);
 /// this record only says a snapshot exists, how big it was, and when it was
-/// taken — the 10 s window is checked against `cleared_at`, and the snapshot
+/// taken — `UNDO_CLEAR_WINDOW` is checked against `cleared_at`, and the snapshot
 /// dies with the process exactly like the memory-based one did.
 #[derive(Clone)]
 pub struct ClearBackup {
@@ -300,6 +301,20 @@ pub struct AppState {
     /// single-flight: a second `start_email_mining` is refused until it is
     /// cleared.
     pub email_mining: Mutex<Option<Arc<AtomicBool>>>,
+    /// Cancel flag of the running email-verification job (G-04). Same
+    /// single-flight contract as `email_mining`, and mutually exclusive with it
+    /// (see `commands::claim_contact_slot`): verification reads the addresses
+    /// mining writes back, so running both would leave "verified, then a new
+    /// address appeared" with no explanation.
+    pub email_verifying: Mutex<Option<Arc<AtomicBool>>>,
+    /// Only used by the check-and-claim critical section that makes
+    /// "verification and mining exclude each other" atomic. Never held while
+    /// either job runs: the slots above stay the operational truth.
+    pub contact_lock: Mutex<()>,
+    /// Bumped by `clear_data` (G-04). The verifier compares it before every
+    /// batch write, inside the `db` lock — a batch that was already queued must
+    /// not resurrect the cache the clear just deleted.
+    pub verification_epoch: std::sync::atomic::AtomicU64,
     /// Cancel flag of the running detail-enrichment job (Tier-2). Same
     /// single-flight contract as `email_mining`: the runner owns the maps
     /// pane for the whole batch, so a second `enrich_businesses` is refused
@@ -1604,6 +1619,9 @@ pub fn run() {
                 remote_field_map: Mutex::new(None),
                 parse_degraded_at: Mutex::new(None),
                 email_mining: Mutex::new(None),
+                email_verifying: Mutex::new(None),
+                contact_lock: Mutex::new(()),
+                verification_epoch: std::sync::atomic::AtomicU64::new(0),
                 enrich_job: Mutex::new(None),
                 pane_owner: Mutex::new(None),
                 review_fetch: Mutex::new(false),
@@ -2219,13 +2237,22 @@ pub fn run() {
                         .lock()
                         .map(|slot| slot.is_some())
                         .unwrap_or(false);
-                    if job_id.is_none() && !mining {
+                    let verifying = state
+                        .email_verifying
+                        .lock()
+                        .map(|slot| slot.is_some())
+                        .unwrap_or(false);
+                    if job_id.is_none() && !mining && !verifying {
                         return;
                     }
                     api.prevent_close();
                     let _ = handle.emit(
                         "app:close-requested",
-                        serde_json::json!({ "jobId": job_id, "emailMining": mining }),
+                        serde_json::json!({
+                            "jobId": job_id,
+                            "emailMining": mining,
+                            "emailVerifying": verifying,
+                        }),
                     );
                 }
                 _ => {}
@@ -2294,6 +2321,9 @@ pub fn run() {
             commands::get_diagnostics,
             commands::start_email_mining,
             commands::cancel_email_mining,
+            commands::verify_email_plan,
+            commands::start_email_verification,
+            commands::cancel_email_verification,
             commands::ping,
         ])
         .run(tauri::generate_context!())

@@ -152,7 +152,7 @@ fn backup_broken_database(db_path: &PathBuf) -> Option<PathBuf> {
 /// The schema version this build knows how to produce. `PRAGMA user_version`
 /// on the database records how far it has come; `init_schema` walks the
 /// `MIGRATIONS` list from there (R-06).
-const LATEST_SCHEMA_VERSION: i32 = 6;
+const LATEST_SCHEMA_VERSION: i32 = 7;
 
 type Migration = fn(&Connection) -> Result<()>;
 
@@ -170,6 +170,7 @@ const MIGRATIONS: &[Migration] = &[
     migrate_v3_to_v4,
     migrate_v4_to_v5,
     migrate_v5_to_v6,
+    migrate_v6_to_v7,
 ];
 
 fn schema_version(conn: &Connection) -> Result<i32> {
@@ -187,7 +188,7 @@ fn schema_version(conn: &Connection) -> Result<i32> {
 /// Keep every BEGIN in this module going through this helper so the invariant
 /// has exactly one place to live — and so a future switch to `&mut` signatures
 /// is a one-function change.
-fn write_tx(conn: &Connection) -> Result<Transaction<'_>> {
+pub(crate) fn write_tx(conn: &Connection) -> Result<Transaction<'_>> {
     conn.unchecked_transaction()
 }
 
@@ -560,6 +561,37 @@ fn migrate_v4_to_v5(conn: &Connection) -> Result<()> {
 /// final failed state, cleared on a retry.
 fn migrate_v5_to_v6(conn: &Connection) -> Result<()> {
     ensure_column(conn, "search_tiles", "error_reason", "error_reason TEXT")?;
+    Ok(())
+}
+
+/// v6 → v7: the email-verification caches (G-04, 2026-10-31).
+///
+/// Two tables, both keyed by the thing that is actually verified: an address
+/// (shared across businesses and runs) and a domain (one lookup covers every
+/// address on it). No backfill — a fresh cache is empty by definition, and the
+/// P1/P2 rules are free to recompute.
+fn migrate_v6_to_v7(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS email_verifications (
+            address       TEXT PRIMARY KEY,
+            status        TEXT NOT NULL,
+            flags         TEXT NOT NULL DEFAULT '[]',
+            mx_host       TEXT NOT NULL DEFAULT '',
+            checked_at    INTEGER NOT NULL DEFAULT 0,
+            expires_at    INTEGER NOT NULL DEFAULT 0,
+            last_error    TEXT NOT NULL DEFAULT '',
+            last_error_at INTEGER NOT NULL DEFAULT 0,
+            provider      TEXT NOT NULL DEFAULT 'local'
+        );
+        CREATE TABLE IF NOT EXISTS email_domain_checks (
+            domain        TEXT PRIMARY KEY,
+            status        TEXT NOT NULL,
+            mx_host       TEXT NOT NULL DEFAULT '',
+            checked_at    INTEGER NOT NULL DEFAULT 0,
+            expires_at    INTEGER NOT NULL DEFAULT 0,
+            last_error    TEXT NOT NULL DEFAULT ''
+        );",
+    )?;
     Ok(())
 }
 
@@ -1545,10 +1577,10 @@ pub fn update_email_mining(
 
 /// The scope half of every mining query: explicit ids, or the browse filter.
 ///
-/// Shared by `mining_targets` (what to visit) and `mining_scope_summary` (what
-/// an empty result was made of), so the two can never disagree about which rows
-/// are in scope.
-fn mining_scope_clause(
+/// Shared by `mining_targets` (what to visit), `mining_scope_summary` (what
+/// an empty result was made of) and `verify_scope` (which addresses to check),
+/// so the three can never disagree about which rows are in scope.
+pub(crate) fn mining_scope_clause(
     ids: Option<&[String]>,
     filter: Option<&BusinessFilter>,
     values: &mut Vec<Value>,
@@ -1675,6 +1707,345 @@ pub fn mining_targets(
         }
     }
     Ok(targets)
+}
+
+// ---------------------------------------------------------------------------
+// Email verification cache (G-04)
+// ---------------------------------------------------------------------------
+//
+// Two tables, two keys. `email_verifications` is keyed by the normalized
+// address, `email_domain_checks` by the punycode domain — one lookup covers
+// every address on it. Both are pure caches: dropping either costs time, never
+// data. The judging rules live in `email_verify`; this module only stores what
+// they decided, and enforces the one write rule that is easy to get wrong
+// (`upsert_verification`).
+
+/// Which addresses a verification run would touch, and how many are already
+/// fresh. Shared by the preflight command and the run itself so the dialog and
+/// the worker can never disagree about the scope.
+#[derive(Debug, Clone, Default)]
+pub struct VerifyScope {
+    /// Rows in scope that carry at least one address.
+    pub rows: u64,
+    /// Deduplicated addresses, capped at `limit + 1` — one over the cap is how
+    /// `too_many` is detected without reading a huge list into memory.
+    pub addresses: Vec<String>,
+    /// `COUNT(DISTINCT …)`, for the "narrow the filter" message.
+    pub addresses_total: u64,
+    /// Addresses with a fresh, non-error verdict: nothing to do for them.
+    pub cached: u64,
+}
+
+/// The scope half of a verification query: rows with emails, expanded to the
+/// distinct addresses they carry.
+fn verify_scope_clause(
+    ids: Option<&[String]>,
+    filter: Option<&BusinessFilter>,
+    values: &mut Vec<Value>,
+) -> String {
+    let mut conditions = mining_scope_clause(ids, filter, values);
+    // `emails` is a JSON array or NULL. Both `NULL` and `'[]'` mean "no
+    // address", and the `trim` below drops the empty strings that historical
+    // rows can carry — an empty address would make the "addresses" figure in
+    // the confirmation dialog impossible to reconcile.
+    conditions.push("emails IS NOT NULL AND emails <> '[]'".to_string());
+    format!(" WHERE {}", conditions.join(" AND "))
+}
+
+pub fn verify_scope(
+    conn: &Connection,
+    ids: Option<&[String]>,
+    filter: Option<&BusinessFilter>,
+    limit: u64,
+    now: i64,
+) -> Result<VerifyScope> {
+    let mut values: Vec<Value> = Vec::new();
+    let where_sql = verify_scope_clause(ids, filter, &mut values);
+
+    let rows: i64 = conn.query_row(
+        &format!("SELECT COUNT(*) FROM businesses{}", where_sql),
+        params_from_iter(values.iter()),
+        |row| row.get(0),
+    )?;
+
+    let mut total_values: Vec<Value> = Vec::new();
+    let total_where = verify_scope_clause(ids, filter, &mut total_values);
+    let addresses_total: i64 = conn.query_row(
+        &format!(
+            "SELECT COUNT(DISTINCT lower(trim(e.value)))
+               FROM businesses, json_each(businesses.emails) e{}
+              AND trim(e.value) <> ''",
+            total_where
+        ),
+        params_from_iter(total_values.iter()),
+        |row| row.get(0),
+    )?;
+
+    let mut list_values: Vec<Value> = Vec::new();
+    let list_where = verify_scope_clause(ids, filter, &mut list_values);
+    list_values.push(Value::Integer(i64::try_from(limit.saturating_add(1)).unwrap_or(i64::MAX)));
+    let mut stmt = conn.prepare(&format!(
+        "SELECT DISTINCT lower(trim(e.value))
+           FROM businesses, json_each(businesses.emails) e{}
+          AND trim(e.value) <> ''
+          ORDER BY 1
+          LIMIT ?",
+        list_where
+    ))?;
+    let mapped = stmt.query_map(params_from_iter(list_values.iter()), |row| {
+        row.get::<_, String>(0)
+    })?;
+    let mut addresses: Vec<String> = Vec::new();
+    for row in mapped {
+        let address = row?;
+        if !address.is_empty() {
+            addresses.push(address);
+        }
+    }
+
+    // Counting only the addresses actually returned: when the list was capped
+    // the number is already unusable, and `cached` is reported as 0 there.
+    let cached = if addresses.len() as u64 > limit {
+        0
+    } else {
+        fresh_verifications(conn, &addresses, now)?.len() as u64
+    };
+
+    Ok(VerifyScope {
+        rows: rows.max(0) as u64,
+        addresses,
+        addresses_total: addresses_total.max(0) as u64,
+        cached,
+    })
+}
+
+/// `(address, status)` of every address with a verdict that is still fresh.
+///
+/// `error` rows carry `expires_at = 0` by construction, so the predicate alone
+/// excludes them — a failed lookup is never "cached".
+pub fn fresh_verifications(
+    conn: &Connection,
+    addresses: &[String],
+    now: i64,
+) -> Result<Vec<(String, String)>> {
+    const CHUNK: usize = 400;
+    let mut out: Vec<(String, String)> = Vec::new();
+    for chunk in addresses.chunks(CHUNK) {
+        let placeholders = vec!["?"; chunk.len()].join(", ");
+        let mut values: Vec<Value> = chunk.iter().map(|a| Value::Text(a.clone())).collect();
+        values.push(Value::Integer(now));
+        let mut stmt = conn.prepare(&format!(
+            "SELECT address, status FROM email_verifications
+              WHERE address IN ({}) AND expires_at > ?",
+            placeholders
+        ))?;
+        let mapped = stmt.query_map(params_from_iter(values.iter()), |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+        for row in mapped {
+            out.push(row?);
+        }
+    }
+    Ok(out)
+}
+
+/// One stored verdict, for the page sidecar and the export detail column.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AddressRecord {
+    pub address: String,
+    pub status: String,
+    pub flags: Vec<String>,
+    pub mx_host: String,
+    pub checked_at: i64,
+    pub expires_at: i64,
+    pub last_error: String,
+}
+
+impl Default for AddressRecord {
+    fn default() -> Self {
+        AddressRecord {
+            address: String::new(),
+            status: String::new(),
+            flags: Vec::new(),
+            mx_host: String::new(),
+            checked_at: 0,
+            expires_at: 0,
+            last_error: String::new(),
+        }
+    }
+}
+
+/// Full records for the given addresses (fresh or not). Chunked like every
+/// other `IN` list in this module: "select all filtered" can hold thousands.
+pub fn verification_records(
+    conn: &Connection,
+    addresses: &[String],
+) -> Result<Vec<AddressRecord>> {
+    const CHUNK: usize = 400;
+    let mut out: Vec<AddressRecord> = Vec::new();
+    for chunk in addresses.chunks(CHUNK) {
+        let placeholders = vec!["?"; chunk.len()].join(", ");
+        let values: Vec<Value> = chunk.iter().map(|a| Value::Text(a.clone())).collect();
+        let mut stmt = conn.prepare(&format!(
+            "SELECT address, status, flags, mx_host, checked_at, expires_at, last_error
+               FROM email_verifications WHERE address IN ({})",
+            placeholders
+        ))?;
+        let mapped = stmt.query_map(params_from_iter(values.iter()), |row| {
+            let flags: String = row.get(2)?;
+            Ok(AddressRecord {
+                address: row.get(0)?,
+                status: row.get(1)?,
+                flags: serde_json::from_str(&flags).unwrap_or_default(),
+                mx_host: row.get(3)?,
+                checked_at: row.get(4)?,
+                expires_at: row.get(5)?,
+                last_error: row.get(6)?,
+            })
+        })?;
+        for row in mapped {
+            out.push(row?);
+        }
+    }
+    Ok(out)
+}
+
+/// Store one verdict, with the rule that makes the cache trustworthy: **a
+/// network error must never erase a verdict that has not expired yet**.
+///
+/// Expressed as one upsert so the whole matrix lives in one place. The
+/// `CASE WHEN excluded.status = 'error' AND email_verifications.expires_at > ?`
+/// guard protects status, flags, mx host, checked_at and expires_at together;
+/// `last_error` / `last_error_at` are always written, which is what clears a
+/// stale `timeout` once the same address answers again.
+pub fn upsert_verification(conn: &Connection, record: &AddressRecord, now: i64) -> Result<()> {
+    let flags = serde_json::to_string(&record.flags).unwrap_or_else(|_| "[]".to_string());
+    conn.execute(
+        "INSERT INTO email_verifications
+             (address, status, flags, mx_host, checked_at, expires_at, last_error, last_error_at, provider)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'local')
+         ON CONFLICT(address) DO UPDATE SET
+             status        = CASE WHEN excluded.status = 'error'
+                                   AND email_verifications.expires_at > ?9
+                                  THEN email_verifications.status ELSE excluded.status END,
+             flags         = CASE WHEN excluded.status = 'error'
+                                   AND email_verifications.expires_at > ?9
+                                  THEN email_verifications.flags ELSE excluded.flags END,
+             mx_host       = CASE WHEN excluded.status = 'error'
+                                   AND email_verifications.expires_at > ?9
+                                  THEN email_verifications.mx_host ELSE excluded.mx_host END,
+             checked_at    = CASE WHEN excluded.status = 'error'
+                                   AND email_verifications.expires_at > ?9
+                                  THEN email_verifications.checked_at ELSE excluded.checked_at END,
+             expires_at    = CASE WHEN excluded.status = 'error'
+                                   AND email_verifications.expires_at > ?9
+                                  THEN email_verifications.expires_at ELSE excluded.expires_at END,
+             last_error    = excluded.last_error,
+             last_error_at = excluded.last_error_at,
+             provider      = excluded.provider",
+        rusqlite::params![
+            record.address,
+            record.status,
+            flags,
+            record.mx_host,
+            record.checked_at,
+            record.expires_at,
+            record.last_error,
+            if record.last_error.is_empty() { 0 } else { record.checked_at },
+            now,
+        ],
+    )?;
+    Ok(())
+}
+
+/// One cached domain answer.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DomainCheck {
+    /// `mx` | `null_mx` | `implicit` | `nxdomain` | `no_mx`
+    pub domain: String,
+    pub status: String,
+    pub mx_host: String,
+    pub checked_at: i64,
+    pub expires_at: i64,
+    pub last_error: String,
+}
+
+impl Default for DomainCheck {
+    fn default() -> Self {
+        DomainCheck {
+            domain: String::new(),
+            status: String::new(),
+            mx_host: String::new(),
+            checked_at: 0,
+            expires_at: 0,
+            last_error: String::new(),
+        }
+    }
+}
+
+pub fn domain_checks(conn: &Connection, domains: &[String]) -> Result<Vec<DomainCheck>> {
+    const CHUNK: usize = 400;
+    let mut out: Vec<DomainCheck> = Vec::new();
+    for chunk in domains.chunks(CHUNK) {
+        let placeholders = vec!["?"; chunk.len()].join(", ");
+        let values: Vec<Value> = chunk.iter().map(|d| Value::Text(d.clone())).collect();
+        let mut stmt = conn.prepare(&format!(
+            "SELECT domain, status, mx_host, checked_at, expires_at, last_error
+               FROM email_domain_checks WHERE domain IN ({})",
+            placeholders
+        ))?;
+        let mapped = stmt.query_map(params_from_iter(values.iter()), |row| {
+            Ok(DomainCheck {
+                domain: row.get(0)?,
+                status: row.get(1)?,
+                mx_host: row.get(2)?,
+                checked_at: row.get(3)?,
+                expires_at: row.get(4)?,
+                last_error: row.get(5)?,
+            })
+        })?;
+        for row in mapped {
+            out.push(row?);
+        }
+    }
+    Ok(out)
+}
+
+pub fn upsert_domain_check(conn: &Connection, check: &DomainCheck) -> Result<()> {
+    conn.execute(
+        "INSERT INTO email_domain_checks
+             (domain, status, mx_host, checked_at, expires_at, last_error)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+         ON CONFLICT(domain) DO UPDATE SET
+             status     = excluded.status,
+             mx_host    = excluded.mx_host,
+             checked_at = excluded.checked_at,
+             expires_at = excluded.expires_at,
+             last_error = excluded.last_error",
+        rusqlite::params![
+            check.domain,
+            check.status,
+            check.mx_host,
+            check.checked_at,
+            check.expires_at,
+            check.last_error,
+        ],
+    )?;
+    Ok(())
+}
+
+/// Drop both caches (`clear_data`, D9).
+///
+/// The verdicts describe addresses that are about to be deleted; keeping them
+/// would leave "cleared" data behind in a second table. Recomputing P1/P2 is
+/// free, so `undo_clear` deliberately does not restore them.
+pub fn clear_verification_cache(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        "DELETE FROM email_verifications; DELETE FROM email_domain_checks;",
+    )?;
+    Ok(())
 }
 
 /// Insert one batch. Returns how many rows were new, which is what the job's
@@ -1864,7 +2235,7 @@ pub fn snapshot_for_clear(conn: &Connection) -> Result<usize> {
 /// Restore the snapshot taken by `snapshot_for_clear`, then drop it (R-13).
 ///
 /// The businesses side keeps the original contract: `INSERT OR REPLACE`, the
-/// snapshot is the truth, so a row re-collected during the 10 s window comes
+/// snapshot is the truth, so a row re-collected during the undo window comes
 /// back exactly as it was cleared — `collected_at` and mined emails included —
 /// instead of keeping its newer copy. The links side uses OR IGNORE (see the
 /// inline note). Returns how many business rows were written.
@@ -2082,6 +2453,9 @@ pub struct BusinessFilter {
     /// Epoch milliseconds; rows collected before this instant are excluded.
     /// `0` disables the time dimension (UI-03: session / today / 7 days).
     pub collected_since: i64,
+    /// `all`, `valid`, `usable`, `invalid` or `unverified` (G-04). Anything else
+    /// means "no filter", like every other dimension here.
+    pub verify: String,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -2109,6 +2483,43 @@ pub struct BusinessPage {
     /// than a `Business` field: the entity is serialized to the maps script and
     /// the export writer, neither of which should carry a join result.
     pub job_refs: Vec<BusinessJobRef>,
+    /// Email-verification state for the rows on this page only (G-04). Same
+    /// reasoning as `job_refs`: a sidecar, rebuilt on every page turn from the
+    /// address cache, never stored on the row.
+    pub verify_refs: Vec<BusinessVerificationRef>,
+}
+
+/// One row's aggregated email verdict, attached to a page (G-04).
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BusinessVerificationRef {
+    pub place_id: String,
+    /// `valid` | `risky` | `invalid` | `unknown` | `unverified` | `none`.
+    /// `none` = the row carries no address at all (nothing to show).
+    pub status: String,
+    /// At least one address has no fresh verdict (only meaningful when
+    /// `status` is not `unverified`).
+    pub stale: bool,
+    /// Largest `checked_at` among the fresh records; `0` when none.
+    pub checked_at: i64,
+    pub addresses: Vec<AddressVerification>,
+}
+
+/// One address of a row, with the row-level `same_domain` evidence (G-04).
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AddressVerification {
+    pub address: String,
+    /// Includes `error` and `unverified` — this list is per address, not an
+    /// aggregate, so the UI can explain a mixed row.
+    pub status: String,
+    pub flags: Vec<String>,
+    pub checked_at: i64,
+    pub stale: bool,
+    /// The address domain and this row's website share an eTLD+1. Derived per
+    /// row and never stored: the same `info@foo.com` can belong to a business
+    /// whose site is `bar.com`.
+    pub same_domain: bool,
 }
 
 /// One "job saw this place" pair, attached to a page for the task column.
@@ -2230,6 +2641,68 @@ fn build_where(filter: &BusinessFilter, values: &mut Vec<Value>) -> String {
     if filter.collected_since > 0 {
         clauses.push("collected_at >= ?".into());
         values.push(Value::Integer(filter.collected_since));
+    }
+
+    // G-04: existence predicates, never a re-implementation of the summary
+    // precedence (`valid > risky > unknown > invalid`). Each one is equivalent
+    // to one bucket of that summary — see the equivalence notes in
+    // `docs/email-verification-plan-2026-10.md` §8.2 and the test
+    // `filter_matches_summary_for_every_row`.
+    let fresh = "v.expires_at > ?";
+    let now = || Value::Integer(now_i64());
+    match filter.verify.as_str() {
+        "valid" => {
+            clauses.push(format!(
+                "EXISTS (SELECT 1 FROM json_each(businesses.emails) e
+                           JOIN email_verifications v ON v.address = lower(trim(e.value))
+                          WHERE {} AND v.status = 'valid')",
+                fresh
+            ));
+            values.push(now());
+        }
+        "usable" => {
+            clauses.push(format!(
+                "EXISTS (SELECT 1 FROM json_each(businesses.emails) e
+                           JOIN email_verifications v ON v.address = lower(trim(e.value))
+                          WHERE {} AND v.status IN ('valid', 'risky'))",
+                fresh
+            ));
+            values.push(now());
+        }
+        "invalid" => {
+            clauses.push(format!(
+                "EXISTS (SELECT 1 FROM json_each(businesses.emails) e
+                           JOIN email_verifications v ON v.address = lower(trim(e.value))
+                          WHERE {} AND v.status = 'invalid')",
+                fresh
+            ));
+            values.push(now());
+            clauses.push(format!(
+                "NOT EXISTS (SELECT 1 FROM json_each(businesses.emails) e
+                               JOIN email_verifications v ON v.address = lower(trim(e.value))
+                              WHERE {} AND v.status IN ('valid', 'risky', 'unknown'))",
+                fresh
+            ));
+            values.push(now());
+        }
+        "unverified" => {
+            // "Has an address" is part of the definition: a row with no email
+            // is not unverified, it is out of scope, and counting it here would
+            // fill the view with rows this feature cannot act on.
+            clauses.push(
+                "EXISTS (SELECT 1 FROM json_each(businesses.emails)
+                          WHERE trim(json_each.value) <> '')"
+                    .into(),
+            );
+            clauses.push(format!(
+                "NOT EXISTS (SELECT 1 FROM json_each(businesses.emails) e
+                               JOIN email_verifications v ON v.address = lower(trim(e.value))
+                              WHERE {})",
+                fresh
+            ));
+            values.push(now());
+        }
+        _ => {}
     }
 
     if clauses.is_empty() {
@@ -2414,6 +2887,7 @@ pub fn query_businesses(
     }
 
     let job_refs = load_job_refs(conn, &out)?;
+    let verify_refs = load_verify_refs(conn, &out)?;
     Ok(BusinessPage {
         rows: out,
         total,
@@ -2423,6 +2897,7 @@ pub fn query_businesses(
         with_phone,
         types,
         job_refs,
+        verify_refs,
     })
 }
 
@@ -2453,6 +2928,46 @@ fn load_job_refs(conn: &Connection, rows: &[Business]) -> Result<Vec<BusinessJob
         })
     })?;
     mapped.collect()
+}
+
+/// Email-verification sidecar for one page of rows (G-04).
+///
+/// One chunked query for the whole page — a page holds at most `page_size × 5`
+/// addresses and every lookup is a primary-key equality, so the cost is
+/// negligible next to the page query itself. `same_domain` is derived here
+/// rather than stored: it depends on the *row's* website, not on the address.
+fn load_verify_refs(conn: &Connection, rows: &[Business]) -> Result<Vec<BusinessVerificationRef>> {
+    if rows.is_empty() {
+        return Ok(Vec::new());
+    }
+    let per_row: Vec<Vec<String>> = rows
+        .iter()
+        .map(|row| crate::email_verify::normalize_all(&row.emails))
+        .collect();
+    let mut all: Vec<String> = per_row.iter().flatten().cloned().collect();
+    all.sort_unstable();
+    all.dedup();
+
+    let now = now_i64();
+    let records: std::collections::HashMap<String, AddressRecord> =
+        verification_records(conn, &all)?
+            .into_iter()
+            .map(|record| (record.address.clone(), record))
+            .collect();
+
+    Ok(rows
+        .iter()
+        .zip(per_row.iter())
+        .map(|(row, addresses)| {
+            crate::email_verify::build_ref(
+                &row.place_id,
+                addresses,
+                &records,
+                now,
+                &row.website,
+            )
+        })
+        .collect())
 }
 
 /// A second, read-only connection for long reads (P2-12).
@@ -4543,5 +5058,336 @@ mod tests {
         let ids: Vec<String> = seeded.iter().map(|row| row.place_id.clone()).collect();
         let loaded = businesses_by_ids(&conn, &ids).expect("chunked");
         assert_eq!(loaded.len(), 450);
+    }
+
+    // ===== G-04: email verification cache =====
+
+    fn verified(address: &str, status: &str, expires_at: i64) -> AddressRecord {
+        AddressRecord {
+            address: address.to_string(),
+            status: status.to_string(),
+            flags: Vec::new(),
+            mx_host: String::new(),
+            checked_at: 1_000,
+            expires_at,
+            last_error: String::new(),
+        }
+    }
+
+    fn seed_emails(conn: &Connection, rows: &[(&str, &[&str])]) {
+        for (place_id, emails) in rows {
+            let json = serde_json::to_string(emails).expect("json");
+            conn.execute(
+                "INSERT INTO businesses (place_id, name, types, emails, email_status)
+                 VALUES (?1, ?1, '[]', ?2, '')",
+                rusqlite::params![place_id, json],
+            )
+            .expect("seed row");
+        }
+    }
+
+    /// The migration must reach an installed v6 database, not only a fresh one
+    /// (a `CREATE TABLE` added to `migrate_v0_to_v1` would never run there).
+    #[test]
+    fn migrate_v6_to_v7_creates_verification_tables() {
+        let conn = Connection::open_in_memory().expect("open");
+        for migration in &MIGRATIONS[..6] {
+            migration(&conn).expect("older migration");
+        }
+        conn.execute_batch("PRAGMA user_version = 6;").expect("stamp");
+
+        init_schema(&conn).expect("migrate");
+
+        let version: i32 = conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .expect("version");
+        assert_eq!(version, LATEST_SCHEMA_VERSION);
+        for table in ["email_verifications", "email_domain_checks"] {
+            let count: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?1",
+                    [table],
+                    |row| row.get(0),
+                )
+                .expect("sqlite_master");
+            assert_eq!(count, 1, "{} must exist after the migration", table);
+        }
+
+        // A fresh database ends in the same state.
+        let fresh = setup();
+        let fresh_version: i32 = fresh
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .expect("version");
+        assert_eq!(fresh_version, LATEST_SCHEMA_VERSION);
+    }
+
+    /// §3.4: a network blip must not erase a verdict that has not expired yet —
+    /// but it must still record why the retry failed.
+    #[test]
+    fn upsert_never_downgrades_fresh_status_to_error() {
+        let conn = setup();
+        let now = 10_000;
+        upsert_verification(&conn, &verified("a@x.com", "valid", now + 5_000), now)
+            .expect("first write");
+
+        let mut failure = verified("a@x.com", "error", 0);
+        failure.last_error = "timeout".to_string();
+        upsert_verification(&conn, &failure, now).expect("failed retry");
+
+        let records = verification_records(&conn, &["a@x.com".to_string()]).expect("read");
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].status, "valid", "a fresh verdict survives an error");
+        assert_eq!(records[0].expires_at, now + 5_000);
+        assert_eq!(records[0].last_error, "timeout", "the failure is still recorded");
+    }
+
+    #[test]
+    fn expired_record_is_replaced_by_error() {
+        let conn = setup();
+        let now = 10_000;
+        upsert_verification(&conn, &verified("a@x.com", "valid", now - 1), now).expect("first");
+        let mut failure = verified("a@x.com", "error", 0);
+        failure.last_error = "network".to_string();
+        upsert_verification(&conn, &failure, now).expect("failed retry");
+
+        let records = verification_records(&conn, &["a@x.com".to_string()]).expect("read");
+        assert_eq!(records[0].status, "error");
+        assert_eq!(records[0].expires_at, 0, "an error is never fresh");
+    }
+
+    /// A success clears the previous failure: otherwise a recovered address
+    /// keeps exporting `error(timeout)` forever.
+    #[test]
+    fn a_successful_write_clears_the_previous_error() {
+        let conn = setup();
+        let now = 10_000;
+        let mut failure = verified("a@x.com", "error", 0);
+        failure.last_error = "timeout".to_string();
+        upsert_verification(&conn, &failure, now).expect("failure");
+        upsert_verification(&conn, &verified("a@x.com", "valid", now + 1), now).expect("success");
+
+        let records = verification_records(&conn, &["a@x.com".to_string()]).expect("read");
+        assert_eq!(records[0].status, "valid");
+        assert!(records[0].last_error.is_empty());
+    }
+
+    #[test]
+    fn verify_scope_dedupes_and_normalizes() {
+        let conn = setup();
+        seed_emails(
+            &conn,
+            &[
+                ("p1", &["Info@Dental.com", "info@dental.com"]),
+                ("p2", &["INFO@dental.com", "sales@dental.com"]),
+                ("p3", &[]),
+            ],
+        );
+
+        let scope = verify_scope(&conn, None, None, 100, 0).expect("scope");
+        assert_eq!(scope.rows, 2, "the row with no address is out of scope");
+        assert_eq!(scope.addresses_total, 2);
+        assert_eq!(
+            scope.addresses,
+            vec!["info@dental.com".to_string(), "sales@dental.com".to_string()]
+        );
+    }
+
+    #[test]
+    fn verify_scope_respects_limit() {
+        let conn = setup();
+        seed_emails(&conn, &[("p1", &["a@x.com", "b@x.com", "c@x.com"])]);
+
+        let scope = verify_scope(&conn, None, None, 2, 0).expect("scope");
+        // `limit + 1` is the contract: one over the cap is how the caller knows
+        // the scope is too large.
+        assert_eq!(scope.addresses.len(), 3);
+        assert_eq!(scope.addresses_total, 3);
+        assert_eq!(scope.cached, 0, "an oversized scope does not count the cache");
+    }
+
+    #[test]
+    fn verify_scope_counts_only_fresh_verdicts_as_cached() {
+        let conn = setup();
+        let now = 10_000;
+        seed_emails(&conn, &[("p1", &["a@x.com", "b@x.com"])]);
+        upsert_verification(&conn, &verified("a@x.com", "valid", now + 1), now).expect("fresh");
+        upsert_verification(&conn, &verified("b@x.com", "valid", now - 1), now).expect("stale");
+
+        let scope = verify_scope(&conn, None, None, 100, now).expect("scope");
+        assert_eq!(scope.cached, 1);
+    }
+
+    /// §8.2: the SQL predicates must agree with the Rust aggregation for every
+    /// row — this is the test that keeps the two implementations from drifting.
+    #[test]
+    fn filter_matches_summary_for_every_row() {
+        use crate::email_verify;
+
+        let conn = setup();
+        // The filter predicates compare against the wall clock, so the fixture
+        // has to be anchored there too (a fixed epoch would read as expired).
+        let now = now_i64();
+        seed_emails(
+            &conn,
+            &[
+                ("mixed", &["a@x.com", "b@x.com"]),
+                ("risky", &["c@x.com"]),
+                ("unknown", &["d@x.com"]),
+                ("invalid", &["e@x.com"]),
+                ("expired", &["f@x.com"]),
+                ("never", &["g@x.com"]),
+                ("empty", &[]),
+            ],
+        );
+        for (address, status, expires) in [
+            ("a@x.com", "valid", now + 5_000),
+            ("b@x.com", "invalid", now + 5_000),
+            ("c@x.com", "risky", now + 5_000),
+            ("d@x.com", "unknown", now + 5_000),
+            ("e@x.com", "invalid", now + 5_000),
+            ("f@x.com", "valid", now - 5_000),
+        ] {
+            upsert_verification(&conn, &verified(address, status, expires), now).expect("write");
+        }
+
+        let page = query_businesses(
+            &conn,
+            &BusinessFilter::default(),
+            &BusinessSort::default(),
+            1,
+            50,
+            None,
+        )
+        .expect("page");
+        let by_place: std::collections::HashMap<&str, &str> = page
+            .verify_refs
+            .iter()
+            .map(|reference| (reference.place_id.as_str(), reference.status.as_str()))
+            .collect();
+
+        for (filter, expected) in [
+            ("valid", vec!["mixed"]),
+            ("usable", vec!["mixed", "risky"]),
+            ("invalid", vec!["invalid"]),
+            ("unverified", vec!["expired", "never"]),
+        ] {
+            let mut matched: Vec<String> = query_businesses(
+                &conn,
+                &BusinessFilter {
+                    verify: filter.to_string(),
+                    ..Default::default()
+                },
+                &BusinessSort::default(),
+                1,
+                50,
+                None,
+            )
+            .expect("filtered")
+            .rows
+            .iter()
+            .map(|row| row.place_id.clone())
+            .collect();
+            matched.sort();
+            let mut expected = expected;
+            expected.sort();
+            assert_eq!(matched, expected, "filter {}", filter);
+        }
+
+        // …and the aggregation those predicates mirror.
+        assert_eq!(by_place["mixed"], "valid");
+        assert_eq!(by_place["risky"], "risky");
+        assert_eq!(by_place["unknown"], "unknown");
+        assert_eq!(by_place["invalid"], "invalid");
+        assert_eq!(by_place["expired"], "unverified");
+        assert_eq!(by_place["never"], "unverified");
+        assert_eq!(by_place["empty"], email_verify::STATUS_NONE);
+    }
+
+    /// `unverified` must not become a list of every row without an address.
+    #[test]
+    fn filter_unverified_requires_emails() {
+        let conn = setup();
+        seed_emails(&conn, &[("with", &["a@x.com"]), ("empty", &[])]);
+
+        let rows = query_businesses(
+            &conn,
+            &BusinessFilter {
+                verify: "unverified".to_string(),
+                ..Default::default()
+            },
+            &BusinessSort::default(),
+            1,
+            50,
+            None,
+        )
+        .expect("filtered")
+        .rows;
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].place_id, "with");
+    }
+
+    #[test]
+    fn clear_drops_the_verification_cache() {
+        let conn = setup();
+        let now = 10_000;
+        seed_emails(&conn, &[("p1", &["a@x.com"])]);
+        upsert_verification(&conn, &verified("a@x.com", "valid", now + 1), now).expect("write");
+        upsert_domain_check(
+            &conn,
+            &DomainCheck {
+                domain: "x.com".to_string(),
+                status: "mx".to_string(),
+                mx_host: "mx.x.com".to_string(),
+                checked_at: now,
+                expires_at: now + 1,
+                last_error: String::new(),
+            },
+        )
+        .expect("domain");
+
+        clear_verification_cache(&conn).expect("clear");
+        let addresses: i64 = conn
+            .query_row("SELECT COUNT(*) FROM email_verifications", [], |row| row.get(0))
+            .expect("count");
+        let domains: i64 = conn
+            .query_row("SELECT COUNT(*) FROM email_domain_checks", [], |row| row.get(0))
+            .expect("count");
+        assert_eq!(addresses, 0);
+        assert_eq!(domains, 0);
+    }
+
+    /// §2.1: verification never writes `email_status` — that column is the
+    /// miner's idempotency marker, and mixing the two verdicts would make the
+    /// miner skip rows it never visited.
+    #[test]
+    fn email_status_is_never_touched_by_verification() {
+        let conn = setup();
+        let now = 10_000;
+        seed_emails(&conn, &[("p1", &["a@x.com"])]);
+        conn.execute(
+            "UPDATE businesses SET email_status = 'found' WHERE place_id = 'p1'",
+            [],
+        )
+        .expect("mark mined");
+
+        upsert_verification(&conn, &verified("a@x.com", "invalid", now + 1), now).expect("write");
+        let _ = query_businesses(
+            &conn,
+            &BusinessFilter::default(),
+            &BusinessSort::default(),
+            1,
+            50,
+            None,
+        )
+        .expect("page");
+
+        let status: String = conn
+            .query_row(
+                "SELECT email_status FROM businesses WHERE place_id = 'p1'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("status");
+        assert_eq!(status, "found");
     }
 }

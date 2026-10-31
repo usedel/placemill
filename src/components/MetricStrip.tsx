@@ -26,7 +26,9 @@ export default function MetricStrip({
 
   return (
     <div className="metrics">
-      <div className="metric">
+      {/* The collected count is the figure the panel exists to report, so it
+          takes twice the room and the only display-size type on the panel. */}
+      <div className="metric is-hero">
         <div className="metric-value">
           {total.toLocaleString(tag)}
           {bump > 0 && (

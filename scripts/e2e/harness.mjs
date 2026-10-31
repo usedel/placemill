@@ -194,17 +194,27 @@ export async function launchApp({ waitForPanel = true } = {}) {
   if (!waitForPanel) return;
 
   const deadline = Date.now() + LAUNCH_TIMEOUT_MS;
+  // `seen` is diagnostics only: an empty array means the CDP endpoint never
+  // answered, a non-empty one means it answered but no target matched
+  // `isPanelTarget`. Without it a launch failure gives nothing to work with.
+  let seen = [];
+  let lastError = null;
   while (Date.now() < deadline) {
     try {
       const res = await fetch(`${CDP_BASE}/json/list`);
-      const targets = await res.json();
-      if (targets.some(isPanelTarget)) return;
-    } catch {
-      /* CDP not up yet */
+      seen = await res.json();
+      if (seen.some(isPanelTarget)) return;
+      lastError = null;
+    } catch (error) {
+      lastError = error?.message || String(error);
     }
     await sleep(500);
   }
-  throw new Error('app did not expose a panel target in time');
+  throw new Error(
+    'app did not expose a panel target in time. ' +
+      `saw: ${JSON.stringify(seen.map((t) => `${t.type} ${t.url}`))}` +
+      (lastError ? ` lastError: ${JSON.stringify(lastError)}` : ''),
+  );
 }
 
 export async function stopApp() {

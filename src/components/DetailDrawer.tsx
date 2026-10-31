@@ -27,8 +27,11 @@ import type { Business } from '../types/business';
 import type { Review } from '../types/review';
 import { useI18n } from '../i18n';
 import { linkLabel, safeHttpUrl } from '../lib/url';
+import { emailStatusKey, socialIcon } from '../lib/contacts';
 import { typeLabel } from '../lib/text';
 import { paneBusyMessageKey } from '../lib/busy';
+import { drawerWidth } from '../design/breakpoints';
+import SectionLabel from './ui/SectionLabel';
 
 const { Text, Link } = Typography;
 
@@ -55,6 +58,12 @@ interface Props {
   /** Reports the reviews fetch to the panel (C-01): while it runs the maps pane
    * is owned by the fetch thread, so the toolbar's pane actions must disable. */
   onReviewsBusyChange?: (busy: boolean) => void;
+  /**
+   * The panel's own width. The drawer used to read `window.innerWidth` itself,
+   * which meant two sources for the same number and a drawer that could still
+   * overflow at the narrow end.
+   */
+  panelWidth: number;
 }
 
 /** True when the event target is a text field, where arrows must edit, not navigate. */
@@ -80,6 +89,7 @@ export default function DetailDrawer({
   locateBlocked = false,
   mapBusyName = null,
   onReviewsBusyChange,
+  panelWidth,
 }: Props) {
   const { t, tag } = useI18n();
 
@@ -87,10 +97,14 @@ export default function DetailDrawer({
   // link; anything else is shown as inert text so `javascript:` can never run.
   const websiteUrl = safeHttpUrl(business?.website);
   const websiteLabel = linkLabel(business?.website, websiteUrl);
+  // The page the miner found the address on is scraped as well, so it gets the
+  // same treatment: a link only when the scheme is http(s).
+  const emailSourceUrl = safeHttpUrl(business?.email_source_url);
 
-  // A fixed 400px drawer covers the panel at its narrow widths (26% of 1440px
-  // is ~374px), so it shrinks with the panel instead of spilling onto the map.
-  const width = Math.max(260, Math.min(400, window.innerWidth - 24));
+  // A fixed 400px drawer covers the panel at its narrow widths, so it shrinks
+  // with the panel instead of spilling onto the map — and goes full width once
+  // the panel is compact enough that 16px of chrome would cost a column.
+  const width = drawerWidth(panelWidth);
 
   // UI-05: the arrows walk the result set while the drawer is open. The bounds
   // disable the buttons (no wrap-around), and a text field keeps its arrows.
@@ -270,7 +284,7 @@ export default function DetailDrawer({
           <div className="detail-title">
             <span>{business.name}</span>
             {business.rating > 0 && (
-              <span className="rating-cell" style={{ fontSize: 12 }}>
+              <span className="rating-cell">
                 <StarFilled />
                 {business.rating.toFixed(1)}
               </span>
@@ -343,7 +357,7 @@ export default function DetailDrawer({
             )}
           </div>
 
-          <Descriptions column={1} size="small" colon={false} bordered>
+          <Descriptions column={1} size="small" colon={false} className="detail-facts">
             <Descriptions.Item label={t('detail.reviews')}>
               {business.reviews_total > 0
                 ? business.reviews_total.toLocaleString(tag)
@@ -386,7 +400,6 @@ export default function DetailDrawer({
                   {business.types.map((type) => (
                     <Tag
                       key={type}
-                      color="blue"
                       className="detail-type-tag"
                       role="button"
                       tabIndex={0}
@@ -411,10 +424,72 @@ export default function DetailDrawer({
               )}
             </Descriptions.Item>
             <Descriptions.Item label="place_id">
-              <Text type="secondary" style={{ fontSize: 11 }} copyable>
+              <Text type="secondary" className="cell-mono" copyable>
                 {business.place_id}
               </Text>
             </Descriptions.Item>
+          </Descriptions>
+
+          {/* M7: the mined contacts themselves. The table's glyph only says
+              *whether* a row has one; this is the only place that says *which*
+              — and why a row that has none has none. A never-mined row keeps
+              the section and says so, because silence reads as a bug. */}
+          <SectionLabel className="is-flush">{t('detail.contactsTitle')}</SectionLabel>
+          <Descriptions column={1} size="small" colon={false} className="detail-facts detail-contacts">
+            <Descriptions.Item label={t('table.email')}>
+              {business.emails.length > 0 ? (
+                <Space direction="vertical" size={2}>
+                  {business.emails.map((email) => (
+                    <Text key={email} copyable={{ text: email }} className="cell-mono">
+                      {email}
+                    </Text>
+                  ))}
+                </Space>
+              ) : (
+                <Text type="secondary">{t(emailStatusKey(business.email_status))}</Text>
+              )}
+            </Descriptions.Item>
+            {business.socials.length > 0 && (
+              <Descriptions.Item label={t('table.socials')}>
+                <div className="detail-socials">
+                  {business.socials.map((url) => {
+                    const href = safeHttpUrl(url);
+                    const label = linkLabel(url, href);
+                    // R-24: same rule as the table — the icon stays, the link
+                    // only when the URL has an http(s) scheme.
+                    const content = (
+                      <span className="detail-social-label">
+                        {socialIcon(url)}
+                        {label}
+                      </span>
+                    );
+                    return href ? (
+                      <Link key={url} href={href} target="_blank">
+                        {content}
+                      </Link>
+                    ) : (
+                      <span key={url}>{content}</span>
+                    );
+                  })}
+                </div>
+              </Descriptions.Item>
+            )}
+            {business.email_source_url && (
+              <Descriptions.Item label={t('detail.emailSource')}>
+                {emailSourceUrl ? (
+                  <Link href={emailSourceUrl} target="_blank">
+                    {linkLabel(business.email_source_url, emailSourceUrl)}
+                  </Link>
+                ) : (
+                  <Text>{business.email_source_url}</Text>
+                )}
+              </Descriptions.Item>
+            )}
+            {business.mined_at > 0 && (
+              <Descriptions.Item label={t('detail.minedAt')}>
+                <Text type="secondary">{new Date(business.mined_at).toLocaleString(tag)}</Text>
+              </Descriptions.Item>
+            )}
           </Descriptions>
 
           {/* Tier-2 detail enrichment: only rendered when the runner has
@@ -424,10 +499,8 @@ export default function DetailDrawer({
             business.reviews_per_rating.length > 0 ||
             business.photos.length > 0) && (
             <>
-              <div style={{ margin: '12px 0 4px' }}>
-                <Text strong>{t('detail.enrichedTitle')}</Text>
-              </div>
-              <Descriptions column={1} size="small" colon={false} bordered>
+              <SectionLabel>{t('detail.enrichedTitle')}</SectionLabel>
+              <Descriptions column={1} size="small" colon={false} className="detail-facts">
                 {business.plus_code && (
                   <Descriptions.Item label={t('detail.plusCode')}>
                     <Text copyable>{business.plus_code}</Text>
@@ -465,15 +538,10 @@ export default function DetailDrawer({
 
           {business.place_id && (
             <div>
-              <div
-                style={{
-                  display: 'flex',
-                  justifyContent: 'space-between',
-                  alignItems: 'center',
-                  marginBottom: 8,
-                }}
-              >
-                <Text strong>{t('detail.reviewsTitle', { count: reviews.length })}</Text>
+              <div className="detail-section-head">
+                <SectionLabel className="is-flush">
+                  {t('detail.reviewsTitle', { count: reviews.length })}
+                </SectionLabel>
                 <Space size={4}>
                   <Tooltip
                     title={
@@ -516,50 +584,33 @@ export default function DetailDrawer({
               ) : reviews.length === 0 ? (
                 <Text type="secondary">{t('detail.noReviews')}</Text>
               ) : (
-                <Space direction="vertical" size={12} style={{ width: '100%' }}>
+                <div className="detail-reviews">
                   {reviews.map((review) => (
                     <div key={review.review_id} className="detail-review">
-                      <div
-                        style={{
-                          display: 'flex',
-                          justifyContent: 'space-between',
-                          alignItems: 'center',
-                        }}
-                      >
-                        <Text strong style={{ fontSize: 13 }}>
+                      <div className="detail-review-head">
+                        <span className="detail-review-author">
                           {review.author || t('common.dash')}
-                        </Text>
+                        </span>
                         {review.stars > 0 && (
-                          <span className="rating-cell" style={{ fontSize: 12 }}>
+                          <span className="rating-cell detail-review-stars">
                             <StarFilled />
                             {review.stars}
                           </span>
                         )}
                       </div>
                       {review.relative_time && (
-                        <Text type="secondary" style={{ fontSize: 12 }}>
-                          {review.relative_time}
-                        </Text>
+                        <span className="detail-review-time">{review.relative_time}</span>
                       )}
-                      {review.text && <div style={{ fontSize: 13 }}>{review.text}</div>}
+                      {review.text && <div className="detail-review-body">{review.text}</div>}
                       {review.owner_reply && (
-                        <div
-                          style={{
-                            marginTop: 6,
-                            padding: '6px 8px',
-                            background: 'rgba(128, 128, 128, 0.08)',
-                            borderRadius: 6,
-                          }}
-                        >
-                          <Text type="secondary" style={{ fontSize: 12 }}>
-                            {t('detail.ownerReply')}
-                          </Text>
-                          <div style={{ fontSize: 12 }}>{review.owner_reply}</div>
+                        <div className="detail-review-reply">
+                          <span className="detail-review-time">{t('detail.ownerReply')}</span>
+                          <div>{review.owner_reply}</div>
                         </div>
                       )}
                     </div>
                   ))}
-                </Space>
+                </div>
               )}
             </div>
           )}

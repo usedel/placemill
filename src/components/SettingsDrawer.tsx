@@ -1,5 +1,4 @@
 import { useEffect, useRef, useState } from 'react';
-import type { ReactNode } from 'react';
 import {
   App as AntdApp,
   Button,
@@ -34,6 +33,10 @@ import {
   type ThemeMode,
 } from '../settings/types';
 import { DEFAULT_SPLIT } from './SplitHandle';
+import { drawerWidth } from '../design/breakpoints';
+import FieldRow from './ui/FieldRow';
+import HintText from './ui/HintText';
+import SectionLabel from './ui/SectionLabel';
 
 interface Props {
   open: boolean;
@@ -52,15 +55,6 @@ interface Props {
 
 /** How long the map-level selects stay locked after a switch (page reload). */
 const MAP_SWITCH_LOCK_MS = 1500;
-
-function Row({ label, children }: { label: string; children: ReactNode }) {
-  return (
-    <div className="settings-row">
-      <span className="settings-label">{label}</span>
-      <div className="settings-control">{children}</div>
-    </div>
-  );
-}
 
 /** i18n key of a speed preset's label. */
 function speedLabelKey(
@@ -260,7 +254,7 @@ export default function SettingsDrawer({
 
   const generalTab = (
     <>
-      <Row label={t('settings.language')}>
+      <FieldRow control label={t('settings.language')}>
         <Select
           size="small"
           style={{ width: 140 }}
@@ -268,9 +262,9 @@ export default function SettingsDrawer({
           onChange={(value) => apply({ language: value })}
           options={LOCALES.map((code) => ({ value: code, label: LOCALE_LABEL[code] }))}
         />
-      </Row>
+      </FieldRow>
 
-      <Row label={t('settings.theme')}>
+      <FieldRow control label={t('settings.theme')}>
         <Segmented
           size="small"
           value={settings.theme}
@@ -281,16 +275,16 @@ export default function SettingsDrawer({
             { value: 'dark', label: t('settings.themeDark') },
           ]}
         />
-      </Row>
+      </FieldRow>
       {settings.theme === 'system' && (
-        <div className="settings-hint">
+        <HintText>
           {t('settings.themeEffective', {
             theme: t(systemDark ? 'settings.themeDark' : 'settings.themeLight'),
           })}
-        </div>
+        </HintText>
       )}
 
-      <Row label={t('settings.pageSize')}>
+      <FieldRow control label={t('settings.pageSize')}>
         <Select
           size="small"
           style={{ width: 90 }}
@@ -298,9 +292,9 @@ export default function SettingsDrawer({
           onChange={(value) => apply({ pageSize: value })}
           options={PAGE_SIZE_OPTIONS.map((size) => ({ value: size, label: size }))}
         />
-      </Row>
+      </FieldRow>
 
-      <Row label={t('settings.rememberSplit')}>
+      <FieldRow control label={t('settings.rememberSplit')}>
         <Switch
           size="small"
           checked={settings.rememberSplit}
@@ -314,17 +308,15 @@ export default function SettingsDrawer({
         >
           {t('settings.resetSplit')}
         </Button>
-      </Row>
+      </FieldRow>
 
-      <div className="settings-section-title settings-section-title--spaced">
-        {t('settings.groupUpdates')}
-      </div>
+      <SectionLabel className="settings-section-title--spaced">{t('settings.groupUpdates')}</SectionLabel>
 
-      <Row label={t('update.currentVersion')}>
+      <FieldRow control label={t('update.currentVersion')}>
         <span className="settings-version">v{appVersion || t('common.dash')}</span>
-      </Row>
+      </FieldRow>
 
-      <Row label={t('update.checkButton')}>
+      <FieldRow control label={t('update.checkButton')}>
         <Button
           size="small"
           icon={<SyncOutlined />}
@@ -333,14 +325,14 @@ export default function SettingsDrawer({
         >
           {checkingUpdates ? t('update.checking') : t('update.checkButton')}
         </Button>
-      </Row>
+      </FieldRow>
     </>
   );
 
   const mapTab = (
     <>
-      {busy && <div className="settings-hint">{t('settings.mapLocaleBusy')}</div>}
-      <Row label={t('settings.mapLanguage')}>
+      {busy && <HintText>{t('settings.mapLocaleBusy')}</HintText>}
+      <FieldRow control label={t('settings.mapLanguage')}>
         <Select
           size="small"
           style={{ width: 140 }}
@@ -350,9 +342,9 @@ export default function SettingsDrawer({
           onChange={(value) => applyMapLocale({ mapLanguage: value })}
           options={MAP_LANGUAGES.map((item) => ({ value: item.value, label: item.label }))}
         />
-      </Row>
+      </FieldRow>
 
-      <Row label={t('settings.mapRegion')}>
+      <FieldRow control label={t('settings.mapRegion')}>
         <Select
           size="small"
           style={{ width: 140 }}
@@ -362,13 +354,13 @@ export default function SettingsDrawer({
           onChange={(value) => applyMapLocale({ mapRegion: value })}
           options={MAP_REGIONS.map((code) => ({ value: code, label: regionLabel(code) }))}
         />
-      </Row>
+      </FieldRow>
     </>
   );
 
   const collectTab = (
     <>
-      <Row label={t('settings.scrollSpeed')}>
+      <FieldRow control label={t('settings.scrollSpeed')}>
         <Radio.Group
           className="settings-radio-col"
           value={speedMode}
@@ -381,19 +373,19 @@ export default function SettingsDrawer({
             { value: 'custom', label: t('settings.speedCustom') },
           ]}
         />
-      </Row>
+      </FieldRow>
       {/* UI-08: the radio shows the mode; the summary states the effective
           interval — the numbers that actually govern the scroll loop. */}
-      <div className="settings-hint">
+      <HintText>
         {t('settings.speedSummary', {
           preset: t(speedMode === 'custom' ? 'settings.speedCustom' : speedLabelKey(speedMode)),
           min: settings.scrollMinMs,
           max: settings.scrollMaxMs,
         })}
-      </div>
+      </HintText>
 
       {speedMode === 'custom' && (
-        <Row label={t('settings.scrollCustom')}>
+        <FieldRow control label={t('settings.scrollCustom')}>
           <InputNumber
             size="small"
             style={{ width: 78 }}
@@ -419,42 +411,42 @@ export default function SettingsDrawer({
             onBlur={commitRange}
             onPressEnter={commitRange}
           />
-        </Row>
+        </FieldRow>
       )}
 
       {speedMode === 'fast' && (
-        <div className="settings-hint settings-hint--warn">{t('settings.speedFastHint')}</div>
+        <HintText tone="warn">{t('settings.speedFastHint')}</HintText>
       )}
 
-      <Row label={t('settings.jitter')}>
+      <FieldRow control label={t('settings.jitter')}>
         <Switch
           size="small"
           checked={settings.jitter}
           onChange={(checked) => apply({ jitter: checked })}
         />
-      </Row>
+      </FieldRow>
 
       {!settings.jitter && (
-        <div className="settings-hint settings-hint--warn">{t('settings.jitterHint')}</div>
+        <HintText tone="warn">{t('settings.jitterHint')}</HintText>
       )}
 
-      <Row label={t('settings.onlyWithPhone')}>
+      <FieldRow control label={t('settings.onlyWithPhone')}>
         <Switch
           size="small"
           checked={settings.onlyWithPhone}
           onChange={(checked) => apply({ onlyWithPhone: checked })}
         />
-      </Row>
+      </FieldRow>
 
       {settings.onlyWithPhone && (
-        <div className="settings-hint">{t('settings.onlyWithPhoneHint')}</div>
+        <HintText>{t('settings.onlyWithPhoneHint')}</HintText>
       )}
     </>
   );
 
   const exportTab = (
     <>
-      <Row label={t('settings.exportFormat')}>
+      <FieldRow control label={t('settings.exportFormat')}>
         <Select
           size="small"
           style={{ width: 110 }}
@@ -467,11 +459,11 @@ export default function SettingsDrawer({
             { value: 'jsonl', label: 'JSONL' },
           ]}
         />
-      </Row>
+      </FieldRow>
 
       {/* M10 / G-11: column-name presets. Renaming only helps import wizards;
           unknown columns keep their default names, so no data is ever lost. */}
-      <Row label={t('settings.exportPreset')}>
+      <FieldRow control label={t('settings.exportPreset')}>
         <Select
           size="small"
           style={{ width: 110 }}
@@ -483,10 +475,10 @@ export default function SettingsDrawer({
             { value: 'pipedrive', label: 'Pipedrive' },
           ]}
         />
-      </Row>
-      <div className="settings-hint">{t('settings.exportPresetHint')}</div>
+      </FieldRow>
+      <HintText>{t('settings.exportPresetHint')}</HintText>
 
-      <Row label={t('settings.fileNameTemplate')}>
+      <FieldRow control label={t('settings.fileNameTemplate')}>
         <Input
           size="small"
           style={{ width: 160 }}
@@ -496,10 +488,10 @@ export default function SettingsDrawer({
           onBlur={commitTemplate}
           onPressEnter={commitTemplate}
         />
-      </Row>
-      <div className="settings-hint">{t('settings.fileNameHint')}</div>
+      </FieldRow>
+      <HintText>{t('settings.fileNameHint')}</HintText>
 
-      <Row label={t('settings.exportDir')}>
+      <FieldRow control label={t('settings.exportDir')}>
         <Tooltip title={settings.exportDir || undefined} placement="topRight">
           <span className="settings-path">
             {settings.exportDir || t('settings.exportDirUnset')}
@@ -513,9 +505,9 @@ export default function SettingsDrawer({
             {t('settings.exportDirClear')}
           </Button>
         )}
-      </Row>
+      </FieldRow>
 
-      <Row label={t('settings.exportSaveMode')}>
+      <FieldRow control label={t('settings.exportSaveMode')}>
         <Segmented
           size="small"
           disabled={!settings.exportDir}
@@ -526,35 +518,35 @@ export default function SettingsDrawer({
             { value: 'auto', label: t('settings.exportSaveAuto') },
           ]}
         />
-      </Row>
-      <div className="settings-hint">
+      </FieldRow>
+      <HintText>
         {settings.exportSaveMode === 'auto'
           ? t('settings.exportSaveAutoHint')
           : t('settings.exportSaveAskHint')}
-      </div>
+      </HintText>
 
-      <Row label={t('settings.openExportFolder')}>
+      <FieldRow control label={t('settings.openExportFolder')}>
         <Switch
           size="small"
           checked={settings.openExportFolder}
           onChange={(checked) => apply({ openExportFolder: checked })}
         />
-      </Row>
+      </FieldRow>
 
-      <Row label={t('settings.csvBom')}>
+      <FieldRow control label={t('settings.csvBom')}>
         <Switch
           size="small"
           checked={settings.csvBom}
           onChange={(checked) => apply({ csvBom: checked })}
         />
-      </Row>
-      <div className="settings-hint">{t('settings.csvBomHint')}</div>
+      </FieldRow>
+      <HintText>{t('settings.csvBomHint')}</HintText>
     </>
   );
 
   const advancedTab = (
     <>
-      <Row label={t('settings.maxScrolls')}>
+      <FieldRow control label={t('settings.maxScrolls')}>
         <InputNumber
           size="small"
           style={{ width: 90 }}
@@ -566,8 +558,8 @@ export default function SettingsDrawer({
             if (value !== null) apply({ maxScrolls: value });
           }}
         />
-      </Row>
-      <Row label={t('settings.stopAfterIdle')}>
+      </FieldRow>
+      <FieldRow control label={t('settings.stopAfterIdle')}>
         <InputNumber
           size="small"
           style={{ width: 90 }}
@@ -579,8 +571,8 @@ export default function SettingsDrawer({
             if (value !== null) apply({ stopAfterIdle: value });
           }}
         />
-      </Row>
-      <Row label={t('settings.logLevel')}>
+      </FieldRow>
+      <FieldRow control label={t('settings.logLevel')}>
         <Select
           size="small"
           style={{ width: 110 }}
@@ -592,8 +584,8 @@ export default function SettingsDrawer({
             { value: 'verbose', label: t('settings.logVerbose') },
           ]}
         />
-      </Row>
-      <Row label={t('settings.duplicateStrategy')}>
+      </FieldRow>
+      <FieldRow control label={t('settings.duplicateStrategy')}>
         <Select
           size="small"
           style={{ width: 130 }}
@@ -604,8 +596,8 @@ export default function SettingsDrawer({
             { value: 'update', label: t('settings.duplicateUpdate') },
           ]}
         />
-      </Row>
-      <div className="settings-hint">{t('settings.duplicateHint')}</div>
+      </FieldRow>
+      <HintText>{t('settings.duplicateHint')}</HintText>
 
       <div className="settings-footer">
         <Popconfirm
@@ -626,7 +618,7 @@ export default function SettingsDrawer({
     <Drawer
       open={open}
       onClose={onClose}
-      width={Math.max(240, Math.min(420, panelWidth - 16))}
+      width={drawerWidth(panelWidth, 420)}
       title={t('settings.title')}
     >
       <Tabs
