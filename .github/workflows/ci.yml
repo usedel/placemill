@@ -43,8 +43,23 @@ jobs:
         with:
           workspaces: src-tauri -> target
 
+      # `dead_code`, `unused_imports` and unused variables are warnings by
+      # default, so a dead helper can sit on main forever: nobody reads the log
+      # of a green build. `count_reviews` in db.rs was exactly that — it outlived
+      # the feature that was supposed to call it and only a test still referenced
+      # it. Warnings are errors here, so the compiler enforces what a code-review
+      # convention can only recommend.
+      # Cargo caps lints for non-workspace dependencies, so this stays about us.
       - name: Check the backend
+        env:
+          RUSTFLAGS: "-D warnings"
         run: cargo check --manifest-path src-tauri/Cargo.toml --all-targets
 
+      # P2-8: this includes the query gate `queries_stay_responsive_at_20k_rows`
+      # (20k rows, filter + sort + paginate, bound calibrated for debug builds).
+      # The 300 ms / 100k release benchmark stays `#[ignore]` and is run on
+      # demand: cargo test --release --lib queries_stay_under_300ms -- --ignored
       - name: Run backend tests
+        env:
+          RUSTFLAGS: "-D warnings"
         run: cargo test --manifest-path src-tauri/Cargo.toml
